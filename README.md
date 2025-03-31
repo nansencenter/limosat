@@ -1,5 +1,7 @@
 [![Tests](https://github.com/nansencenter/arktalas_ice_drift_experiments/actions/workflows/test.yaml/badge.svg?branch=limosat)](https://github.com/nansencenter/arktalas_ice_drift_experiments/actions/workflows/test.yaml)
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.15111936.svg)](https://doi.org/10.5281/zenodo.15111936)
+
 # limosat - Lagrangian Ice Motion from Satellites
 
 limosat is an open source, highly configurable algorithm for calculating sea ice drift from remote sensing imagery. It processes satellite images like so:
@@ -11,7 +13,7 @@ limosat is an open source, highly configurable algorithm for calculating sea ice
 
 ## Citation
 
-Sean Minhui Tashi Chua and Anton Korosov. (In preparation). "Lagrangian Ice Motion from Satellites". To be submitted.
+Chua, S. M. T., & Korosov, A. (2025). limosat - Lagrangian Ice Motion from Satellites (v0.1.0). Zenodo. https://doi.org/10.5281/zenodo.15111936
 
 ## Repository Structure
 ```
