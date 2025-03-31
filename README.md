@@ -1,6 +1,4 @@
-[![Tests](https://github.com/nansencenter/arktalas_ice_drift_experiments/actions/workflows/test.yaml/badge.svg?branch=limosat)](https://github.com/nansencenter/arktalas_ice_drift_experiments/actions/workflows/test.yaml)
-
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.15111936.svg)](https://doi.org/10.5281/zenodo.15111936)
+[![Tests](https://github.com/nansencenter/arktalas_ice_drift_experiments/actions/workflows/test.yaml/badge.svg?branch=limosat)](https://github.com/nansencenter/arktalas_ice_drift_experiments/actions/workflows/test.yaml) [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.15111936.svg)](https://doi.org/10.5281/zenodo.15111936)
 
 # limosat - Lagrangian Ice Motion from Satellites
 
