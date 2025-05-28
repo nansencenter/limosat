@@ -30,12 +30,13 @@ from skimage.transform import AffineTransform
 from nansat import Nansat, NSR
 
 # Constants for commonly used values
+MAX_DRIFT_SPEED_M_PER_DAY = 10000
 WINDOW_SIZE = 64
 BORDER_SIZE = 256
 STRIDE = 10
 OCTAVE = 8
 MIN_CORRELATION = 0.35
-TEMPLATE_SIZE = 16  # Half size
+TEMPLATE_SIZE = 16
 TEMPORAL_WINDOW = 4
 
 class ImageProcessor:
@@ -53,7 +54,9 @@ class ImageProcessor:
                  insitu_points=None,
                  persist_updates=False,
                  persist_interval=100,
+                 pruning_interval = 25,
                  temporal_window=TEMPORAL_WINDOW,
+                 max_drift_speed_m_per_day=MAX_DRIFT_SPEED_M_PER_DAY,
                  window_size=WINDOW_SIZE,
                  border_size=BORDER_SIZE,
                  stride=STRIDE,
@@ -66,6 +69,7 @@ class ImageProcessor:
         self.matcher = matcher
         self.persist_updates = persist_updates
         self.persist_interval = persist_interval
+        self.pruning_interval = pruning_interval
         self._last_persisted_id = 0
         self.min_correlation = min_correlation
         self.use_interpolation = use_interpolation
@@ -74,6 +78,7 @@ class ImageProcessor:
         self.window_size = window_size
         self.border_size = border_size
         self.temporal_window = temporal_window
+        self.max_drift_speed_m_per_day = max_drift_speed_m_per_day
         self.stride = stride
         self.octave = octave
         
@@ -116,8 +121,24 @@ class ImageProcessor:
 
         img = Image(filename)
         points_last = self.points.last()
-        points_poly = points_last.in_poly(img)
-        points_poly = points_last[(img.date - points_last['time']) < pd.Timedelta(days=self.temporal_window)]
+        
+        # Max drift over the full temporal window
+        max_possible_drift = self.max_drift_speed_m_per_day * self.temporal_window 
+        
+        # Buffer needed is the minimum of max possible drift and the matcher's limit
+        buffer_distance = min(max_possible_drift, self.matcher.spatial_distance_max)
+
+        logger.info(f"Using buffer distance: {buffer_distance/1000.0:.2f} km "
+                    f"(Min of {max_possible_drift/1000.0:.1f}km theoretical max drift over {self.temporal_window} days "
+                    f"and {self.matcher.spatial_distance_max/1000.0:.1f}km spatial match limit)")
+    
+        # Filter for points within the buffered polygon and time threshold
+        buffered_image_poly = img.poly.buffer(buffer_distance)
+        time_threshold = img.date - pd.Timedelta(days=self.temporal_window)
+        points_poly = points_last[
+            points_last.within(buffered_image_poly) &
+            (points_last['time'] >= time_threshold)
+        ]
  
         if len(points_poly) == 0:
             logger.info("No overlapping points found")
@@ -129,7 +150,6 @@ class ImageProcessor:
                 logger.info("Insufficient match quality, skipping point matching")
                 points_final = Keypoints()
             else:
-                # Better to have a fixed dataframe structure than to check for columns each time
                 if 'interpolated' in points_final.columns:
                     interp_count = points_final['interpolated'].sum()
                     total_count = len(points_final)
@@ -138,14 +158,92 @@ class ImageProcessor:
 
         # Process new points, including any validation points
         self._process_new_points(points_final, img, image_id, basename)
+    
+        if image_id > 0 and image_id % self.pruning_interval == 0 and self.templates.trajectory_id.size > 0:
+            logger.info(f"Performing periodic template pruning (every {self.pruning_interval} images)...")
+            try:
+                # Time-based Mask
+                current_time_np = img.date.to_numpy()
+                time_threshold_prune = current_time_np - np.timedelta64(self.temporal_window, 'D')
+                keep_mask_time = (self.templates['time'] >= time_threshold_prune)#.compute()
 
-        # Delegate persistence if enabled
+                # Activity-based Mask
+                active_traj_ids = set(self.points.loc[self.points['is_last'] == 1, 'trajectory_id'].unique())
+                keep_mask_active = np.isin(self.templates['trajectory_id'].values, list(active_traj_ids))
+
+                # Combine Masks (Keep if Recent AND Active)
+                final_keep_mask = keep_mask_time & keep_mask_active
+
+                # Apply Pruning 
+                if not final_keep_mask.all():
+                    num_before = self.templates.trajectory_id.size
+                    # Filter using the computed boolean mask
+                    self.templates = self.templates.where(final_keep_mask, drop=True)
+                    num_after = self.templates.trajectory_id.size
+                    logger.info(f"Pruning complete: Kept {num_after} templates / Removed {num_before - num_after} templates (were old OR inactive).")
+                else:
+                    logger.info("Pruning check: All templates recent or active.")
+
+            except Exception as e:
+                # Basic catch-all for unexpected errors during pruning
+                logger.error(f"Error during template pruning: {e}", exc_info=True)
+                logger.warning("Skipping template pruning for this interval due to error.")
+
+
         if self.persist_updates:
-            images_since_persist = self.points.last_image_id - self._last_persisted_id
+            # Calculate images since last *successful* persistence
+            current_points_image_id = 0
+            if isinstance(self.points, Keypoints):
+                current_points_image_id = self.points.last_image_id
+            elif isinstance(self.points, gpd.GeoDataFrame) and 'image_id' in self.points.columns and not self.points.empty:
+                current_points_image_id = self.points['image_id'].max()
+
+            images_since_persist = current_points_image_id - self._last_persisted_id
+
             if images_since_persist >= self.persist_interval:
-                self.db.save(self.points, self.templates, self.insitu_points)
-                self._last_persisted_id = self.points.last_image_id
-                logger.info(f"Batch persistence completed after {images_since_persist} images")
+                logger.info(f"Initiating periodic persistence and point pruning (interval: {self.persist_interval} images)...")
+                current_last_image_id = current_points_image_id
+
+                # --- Get Point Memory BEFORE save/prune ---
+                mem_points_before_mib = self.points.memory_usage(deep=True).sum() / (1024 * 1024) if not self.points.empty else 0
+
+                try:
+                    save_successful = self.db.save(
+                        self.points,
+                        self.templates,
+                        self._last_persisted_id,
+                        self.insitu_points
+                    )
+
+                    if save_successful:
+                        # Log DB save size using the pre-prune count
+                        points_delta_count = len(self.points[self.points['image_id'] > self._last_persisted_id])
+                        logger.info(f"Database persistence successful for {points_delta_count} new/updated points.")
+                        num_before_prune = len(self.points)
+
+                        # --- Prune points using the EXISTING time_threshold ---
+                        # Keep only points that are the latest AND within the temporal window
+                        keep_mask_points = (self.points['is_last'] == 1) & \
+                                           (self.points['time'] >= time_threshold) # Use existing time_threshold
+
+                        points_to_keep = self.points[keep_mask_points].copy()
+                        self.points = Keypoints._from_gdf(points_to_keep)
+
+                        # --- Get Point Memory AFTER prune ---
+                        num_after_prune = len(self.points)
+                        mem_points_after_mib = self.points.memory_usage(deep=True).sum() / (1024 * 1024) if not self.points.empty else 0
+
+                        logger.info(
+                            f"In-memory points pruned (active AND recent): {num_before_prune} -> {num_after_prune} "
+                            f"({mem_points_after_mib:.1f} MiB). Memory reduced from {mem_points_before_mib:.1f} MiB."
+                        )
+
+                        self._last_persisted_id = current_last_image_id
+                    else:
+                        logger.warning("Database save operation reported failure. Skipping in-memory point pruning.")
+                except Exception as e:
+                    logger.error(f"Error during persistence or pruning: {e}", exc_info=True)
+                    logger.warning("Skipping in-memory point pruning for this interval due to error. Database state may not be current.")
 
     @log_execution_time
     def _process_new_points(self, points_final, img, image_id, basename):
@@ -201,12 +299,13 @@ class ImageProcessor:
                 template_final_idx,
                 self.points
             )
-
+      
     @log_execution_time
     def _match_existing_points(self, points_poly, img, image_id):
         """
         Match points from previous image to current one, with optional interpolation,
-        then apply pattern matching and filter by correlation.
+        then apply pattern matching and filter by correlation. This version uses the
+        empirically correct trajectory_id assignment and robust descriptor filtering.
         """
         # Detect gridded keypoints, compute descriptors and create Keypoints object
         coords_grid = self.keypoint_detector.detect_gridded_points(
@@ -214,6 +313,11 @@ class ImageProcessor:
             stride=self.stride,
             border_size=self.border_size
         )
+
+        # Error handling: Check if coords_grid is empty
+        if not coords_grid:
+            logger.warning("No gridded keypoints detected. Skipping matching for this image.")
+            return None
 
         keypoints, descriptors = compute_descriptors(
             coords_grid,
@@ -223,16 +327,21 @@ class ImageProcessor:
             normalize=False
         )
 
+        # Error handling: Check if descriptor computation failed for grid
+        if keypoints is None or descriptors is None:
+             logger.warning("Failed to compute descriptors for grid points. Skipping matching.")
+             return None
+
         points_grid = Keypoints.create(keypoints, descriptors, img, image_id=image_id)
 
         # Match and filter points using the matcher
         points_fg1, points_fg2 = self.matcher.match_with_grid(points_poly, points_grid)
 
-        if points_fg1 is None or points_fg2 is None:
-            # this has not occured in practice so far
-            logger.info("Insufficient match quality, skipping point matching")
-            return None
+        if points_fg1 is None or points_fg2 is None or points_fg1.empty or points_fg2.empty:
+            logger.info("Insufficient match quality or no matches found, skipping point matching step.")
+            return Keypoints()
 
+        # Assign trajectory IDs to matched points
         points_matched = points_fg2.copy()
         points_matched['trajectory_id'] = points_fg1.trajectory_id.values
         points_matched['interpolated'] = 0
@@ -248,31 +357,43 @@ class ImageProcessor:
                 self.model,
                 octave=self.octave
             )
+            if points_combined is None or points_combined.empty:
+                 logger.warning("Interpolation resulted in no valid points. Proceeding with only matched points.")
+                 points_combined = points_matched # Fall back to only matched points
         else:
+            # Handle logging messages for why interpolation wasn't run
             if not self.use_interpolation:
                 logger.info("Interpolation disabled, using only matched points")
             elif len(points_fg1) >= len(points_poly):
-                # this has not occured in practice so far
                 logger.info("All points matched, no interpolation needed")
             points_combined = points_matched
 
+        # Check if points_combined is empty before proceeding
+        if points_combined.empty:
+             logger.info("No matched or interpolated points remaining before template check.")
+             return Keypoints()
+
         all_traj_ids = points_combined.trajectory_id.values
+        # Ensure points_orig correctly references points_poly using trajectory IDs
         points_orig = points_poly[points_poly.trajectory_id.isin(all_traj_ids)]
 
+        # Filter out points that don't have templates
         available_traj_ids = self.templates.trajectory_id.values
         has_template_mask = np.isin(all_traj_ids, available_traj_ids)
-
-        # Filter out points that don't have templates, this happens rarely but is important
         if not np.all(has_template_mask):
             missing_count = np.sum(~has_template_mask)
             logger.info(f"Filtering out {missing_count} points that don't have templates")
             points_combined = points_combined[has_template_mask].copy()
+            if points_combined.empty:
+                 logger.info("No points remaining after template availability filter.")
+                 return Keypoints()
+            # Update IDs and points_orig after filtering
             all_traj_ids = points_combined.trajectory_id.values
             points_orig = points_poly[points_poly.trajectory_id.isin(all_traj_ids)]
 
-        # Perform pattern matching 
+        # Perform pattern matching
         templates_all = self.templates.sel(trajectory_id=all_traj_ids)
-        keypoints_corrected, corr_values = pattern_matching(
+        keypoints_corrected_xy, keypoints_corrected_rc, corr_values = pattern_matching(
             points_combined,
             img,
             templates_all,
@@ -282,34 +403,90 @@ class ImageProcessor:
         # Remove points below the correlation threshold
         points_combined['corr'] = corr_values
         valid_mask = corr_values >= self.min_correlation
+        # Ensure we handle the case where NO points pass the correlation threshold
+        if not np.any(valid_mask):
+             logger.info(f"No points passed the correlation threshold of {self.min_correlation}. Returning empty.")
+             return Keypoints()
+
         valid_points = points_combined[valid_mask].copy()
+        valid_corrected_rc = keypoints_corrected_rc[valid_mask]
+        # Assign geometry using the index from valid_points to align correctly
         valid_points = valid_points.assign(
             geometry=gpd.points_from_xy(
-                keypoints_corrected[valid_mask, 0],
-                keypoints_corrected[valid_mask, 1]
+                keypoints_corrected_xy[valid_mask, 0], # Use same mask on corrected coords
+                keypoints_corrected_xy[valid_mask, 1]
             )
         )
 
         logger.info(f"Pattern matching kept {len(valid_points)}/{len(points_combined)} points based on correlation threshold of {self.min_correlation}")
 
-        # Recalculate descriptors for the valid pattern matching results over the threshold (both matched and interpolated)
-        keypoints_list = []
-        for _, row in valid_points.iterrows():
-            x, y = row.geometry.x, row.geometry.y
-            keypoints_list.append(cv2.KeyPoint(x, y, size=WINDOW_SIZE, angle=img.angle, octave=self.octave))
-        
-        raw_kps, new_descriptors = compute_descriptors(
-            keypoints_list,
-            img,
-            self.model,
-            polarisation='dual_polarisation',
-            normalize=False
-        )
+        # Prepare KeyPoints for descriptor computation for currently valid points
+        if not valid_points.empty:
+            keypoints_list = [
+                cv2.KeyPoint(px_c, px_r, size=WINDOW_SIZE, angle=img.angle, octave=self.octave)
+                # Iterate directly through the corrected pixel coordinates from pattern_matching
+                for px_c, px_r in valid_corrected_rc
+            ]
+            # Recompute descriptors
+            raw_kps, new_descriptors = compute_descriptors(
+                keypoints_list,
+                img,
+                self.model,
+                polarisation='dual_polarisation',
+                normalize=False
+            )
+        else:
+            new_descriptors = None
+
+        # Filter points based on successful descriptor computation
+        original_count = len(valid_points)
+        removed_count = 0
+
         if new_descriptors is not None:
-            valid_points['descriptors'] = list(new_descriptors)
-        
-        new_templates, new_template_idx = extract_templates(valid_points, img, hs=TEMPLATE_SIZE)
-        self.templates = update_templates(self.templates, new_templates, new_template_idx, valid_points)
+            # Ensure descriptor count matches point count
+            if len(new_descriptors) != len(valid_points):
+                 logger.info(f"Descriptor count mismatch after re-computation! "
+                              f"Expected {len(valid_points)}, got {len(new_descriptors)}. Removing points.")
+                 removed_count = original_count
+                 valid_points = valid_points.iloc[0:0].copy() # Discard points due to ambiguity
+            else:
+                valid_points['descriptors'] = list(new_descriptors)
+                # Define the validity check (isinstance check handles None implicitly if compute_descriptors returned a list with Nones)
+                valid_mask_desc = valid_points['descriptors'].apply(lambda d: isinstance(d, np.ndarray))
+
+                # Apply the filter if any descriptors are invalid
+                if not valid_mask_desc.all():
+                    valid_points = valid_points[valid_mask_desc].copy() # Filter and copy
+                    removed_count = original_count - len(valid_points)
+        else:
+            # Descriptor computation failed entirely (returned None) or was skipped
+            if original_count > 0:
+                logger.warning("Descriptor re-computation failed or was skipped; removing remaining points.")
+                removed_count = original_count
+                valid_points = valid_points.iloc[0:0].copy()
+
+        # Log the result of filtering
+        if removed_count > 0:
+            logger.info(f"Final filtering removed {removed_count} points "
+                        f"due to invalid/None descriptors after re-computation attempts. "
+                        f"Returning {len(valid_points)} points.")
+        elif original_count > 0: # Log success only if we started with points and removed none
+             logger.debug("Final descriptor check passed, all points kept.")
+
+        # Update templates ONLY for the points that survived the descriptor check
+        if not valid_points.empty:
+            new_templates, new_template_idx = extract_templates(valid_points, img, hs=TEMPLATE_SIZE)
+            # Check if extract_templates returned valid indices matching remaining points
+            if len(new_template_idx) == len(valid_points):
+                 self.templates = update_templates(self.templates, new_templates, new_template_idx, valid_points)
+                 logger.debug(f"Updated templates for {len(valid_points)} points after descriptor check.")
+            else:
+                 logger.warning(f"Template extraction index mismatch. Expected {len(valid_points)} indices, "
+                                f"got {len(new_template_idx)}. Skipping template update.")
+        else:
+            logger.info("No valid points remain after descriptor check to update templates.")
+
+        logger.debug(f"Points returned after final descriptor check: {len(valid_points)}")
 
         return valid_points
 
@@ -1255,6 +1432,7 @@ def pattern_matching(points, img, templates, points_fg1, band='s0_HV', hs=16, bo
     Returns:
         tuple: A tuple containing:
             - corrected_positions_xy (numpy.ndarray): Array of corrected (x, y) positions.
+            - corrected_positions_colsrows (numpy.ndarray): Array of corrected pixel coordinates.
             - correlation_values (numpy.ndarray): Array of correlation scores for each match.
     """
     mtype = cv2.TM_CCOEFF_NORMED
@@ -1367,4 +1545,4 @@ def pattern_matching(points, img, templates, points_fg1, band='s0_HV', hs=16, bo
     logger.info(f"Correlation stats - Mean: {np.mean(correlation_values):.4f}, "
                 f"Min: {np.min(correlation_values):.4f}")
 
-    return corrected_positions_xy, correlation_values
+    return corrected_positions_xy, corrected_colsrows, correlation_values
