@@ -496,8 +496,17 @@ class ImageProcessor:
             images_since_persist = self.points.last_image_id - self._last_persisted_id
             if images_since_persist > 0:
                 logger.info(f"Performing final persistence for remaining {images_since_persist} images")
-                self.db.save(self.points, self.templates, self.insitu_points)
-                self._last_persisted_id = self.points.last_image_id
+                save_successful = self.db.save(
+                    points=self.points,
+                    templates=self.templates,
+                    last_persisted_id=self._last_persisted_id,
+                    insitu_points=self.insitu_points
+                )
+                if save_successful:
+                    self._last_persisted_id = self.points.last_image_id
+                    logger.info(f"Final persistence completed. Last persisted ID set to {self._last_persisted_id}")
+                else:
+                    logger.error("Final persistence FAILED. _last_persisted_id not updated.")
 
 class Image(Nansat):
     """
