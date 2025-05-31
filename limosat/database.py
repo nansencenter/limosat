@@ -13,8 +13,10 @@ Class and methods for persisting keypoints and templates
 import os
 import json
 import numpy as np
-from sqlalchemy import Float, Text, DateTime
-from .utils import logger
+import pandas as pd 
+import xarray as xr 
+from sqlalchemy import create_engine, text, Float, Text, DateTime, MetaData 
+from .utils import logger, log_execution_time 
 
 class DriftDatabase:
     """
@@ -40,39 +42,88 @@ class DriftDatabase:
             'descriptors': Text(),
             'angle': Float(),
             'corr': Float(),
-            'time': DateTime(timezone=True),
+            'time': DateTime(timezone=False),
             'interpolated': Float()
         }
 
         logger.info(f"Initialized database for: {self.run_name}")
+        
+    @log_execution_time
+    def save(self, points, templates, last_persisted_id, insitu_points=None):
+        if points.empty:
+             logger.info("No points to save.")
+             if templates is not None and templates.trajectory_id.size > 0 and self.zarr_path: # Corrected template empty check
+                 try:
+                      logger.info("Saving empty points state, but saving templates...")
+                      templates.to_dataset(name="template_data").to_zarr(self.zarr_path, mode="w") # Original template save
+                      logger.info(f"Successfully persisted {templates.trajectory_id.size} templates (with 0 new points).")
+                      return True
+                 except Exception as e:
+                      logger.error(f"Failed to save templates even with no points: {e}", exc_info=True)
+                      return False
+             return True
 
-    def save(self, points, templates, insitu_points=None):
-        """
-        Save both points and templates as a single atomic operation.
 
-        Args:
-            points: The keypoints to persist.
-            templates: The templates to persist.
-            insitu_points: Optional validation points.
+        try:
+            # --- 1. Prepare Points Delta ---
+            points_image_id_series = points['image_id'].astype(float)
+            last_persisted_id_float = float(last_persisted_id)
+            mask_series = points_image_id_series > last_persisted_id_float
+            points_delta = points.loc[mask_series].copy()
 
-        Returns:
-            bool: True if the save operation was successful
-        """
-        # Persist points to PostgreSQL
-        points_out = points.copy().set_crs('EPSG:3413')
-        points_out['descriptors'] = points_out['descriptors'].apply(self._serialize_descriptors)
-        points_out.to_postgis(self.run_name, self.engine, if_exists='replace', dtype=self.dtype)
+            if points_delta.empty:
+                logger.info("No new points detected since last save.")
+                if templates is not None and templates.trajectory_id.size > 0 and self.zarr_path: # Corrected template empty check
+                    logger.info("Saving templates only (no new points).")
+                    templates.to_dataset(name="template_data").to_zarr(self.zarr_path, mode="w") # Original template save
+                    return True
+                return True
 
-        # Persist templates to Zarr
-        templates.to_dataset(name="template_data").to_zarr(self.zarr_path, mode="w")
+            logger.info(f"Processing {len(points_delta)} new/updated points for persistence.")
+            points_delta = points_delta.set_crs('EPSG:3413') # Your original handling
+            if 'descriptors' in points_delta.columns:
+                 points_delta['descriptors'] = points_delta['descriptors'].apply(self._serialize_descriptors)
 
-        # Save validation metadata if provided
-        if insitu_points is not None:
-            self._save_validation_metadata(insitu_points)
+            with self.engine.connect() as connection:
+                with connection.begin():
+                    updated_traj_ids = points_delta['trajectory_id'].unique().tolist()
+                    updated_traj_ids = [int(tid) for tid in updated_traj_ids if pd.notna(tid)]
 
-        logger.info(f"Successfully persisted {len(points)} points and associated templates")
-        return True
+                    if updated_traj_ids:
+                        update_sql = text(f"""
+                            UPDATE {self.run_name}
+                            SET is_last = 0
+                            WHERE is_last = 1 AND trajectory_id = ANY(:traj_ids)
+                        """)
+                        result = connection.execute(update_sql, {"traj_ids": updated_traj_ids})
+                        logger.debug(f"Updated is_last=0 for {result.rowcount} previous points in DB.")
 
+                    points_delta.to_postgis(
+                        self.run_name,
+                        connection,
+                        if_exists='append',
+                        index=False,
+                        dtype=self.dtype
+                    )
+                    logger.debug(f"Appended {len(points_delta)} points to database.")
+
+            if templates is not None and templates.trajectory_id.size > 0: # Corrected template empty check
+                templates_to_save = templates.copy()
+                if hasattr(templates_to_save, 'encoding') and 'chunks' in templates_to_save.encoding:
+                    del templates_to_save.encoding['chunks']
+                templates_to_save.to_dataset(name="template_data").to_zarr(self.zarr_path, mode="w")
+                logger.debug("Saved templates to Zarr (overwrite mode).")
+
+            if insitu_points is not None:
+                self._save_validation_metadata(insitu_points)
+
+            logger.info(f"Successfully appended {len(points_delta)} points and saved templates.")
+            return True
+
+        except Exception as e:
+            logger.error(f"Database save/append operation failed: {e}", exc_info=True)
+            return False
+        
     def _serialize_descriptors(self, descriptor_list):
         """
         Serialize a list of numpy arrays (descriptors) into a JSON string.
