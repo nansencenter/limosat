@@ -14,8 +14,7 @@ import os
 import json
 import numpy as np
 import pandas as pd 
-import xarray as xr 
-from sqlalchemy import create_engine, text, Float, Text, DateTime, MetaData 
+from sqlalchemy import text, Float, Text, DateTime
 from .utils import logger, log_execution_time 
 
 class DriftDatabase:
@@ -45,8 +44,6 @@ class DriftDatabase:
             'time': DateTime(timezone=False),
             'interpolated': Float()
         }
-
-        logger.info(f"Initialized database for: {self.run_name}")
         
     @log_execution_time
     def save(self, points, templates, last_persisted_id, insitu_points=None):
@@ -135,6 +132,7 @@ class DriftDatabase:
             str: JSON string representation of the descriptors
         """
         return json.dumps(np.array(descriptor_list).tolist())
+    
 
     def _save_validation_metadata(self, insitu_points):
         """
@@ -157,3 +155,9 @@ class DriftDatabase:
 
         validation_data.to_file(output_file, driver='GeoJSON')
         logger.info(f"Saved validation metadata to {output_file}")
+
+    def deserialize_descriptors(self, json_string):
+        """
+        Deserialize a JSON string back into a numpy array of descriptors.
+        """
+        return np.array(json.loads(json_string), dtype=np.uint8)
