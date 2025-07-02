@@ -15,8 +15,6 @@ import logging
 from datetime import datetime
 import functools
 import time
-import json
-import numpy as np
 import re
 import pandas as pd
 

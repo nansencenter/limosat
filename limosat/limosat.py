@@ -23,21 +23,26 @@ import geopandas as gpd
 import xarray as xr
 import cv2
 import cartopy.crs as ccrs
-from shapely.geometry import Polygon
+from shapely.geometry import Polygon, MultiPoint
 from matplotlib import pyplot as plt
 from skimage.util import view_as_windows
 from skimage.transform import AffineTransform
 from nansat import Nansat, NSR
 
 # Constants for commonly used values
-MAX_DRIFT_SPEED_M_PER_DAY = 10000
+CANDIDATE_SEARCH_MAX_DAILY_DRIFT_M_PER_DAY = 10000
 WINDOW_SIZE = 64
-BORDER_SIZE = 256
+BORDER_SIZE = 128
 STRIDE = 10
 OCTAVE = 8
 MIN_CORRELATION = 0.35
-TEMPLATE_SIZE = 16
+TEMPLATE_SIZE = 16  # Half size
 TEMPORAL_WINDOW = 4
+DESCRIPTOR_SIZE = 32
+RESPONSE_THRESHOLD = 0
+MAX_INTERPOLATION_TIME_GAP_HOURS = 24
+BORDER_MATCHED = 16
+BORDER_INTERPOLATED = 32
 
 class ImageProcessor:
     """
@@ -56,13 +61,20 @@ class ImageProcessor:
                  persist_interval=100,
                  pruning_interval = 25,
                  temporal_window=TEMPORAL_WINDOW,
-                 max_drift_speed_m_per_day=MAX_DRIFT_SPEED_M_PER_DAY,
+                 candidate_search_max_daily_drift_m=CANDIDATE_SEARCH_MAX_DAILY_DRIFT_M_PER_DAY,
+                 descriptor_size=DESCRIPTOR_SIZE,
                  window_size=WINDOW_SIZE,
                  border_size=BORDER_SIZE,
+                 border_matched=BORDER_MATCHED,
+                 border_interpolated=BORDER_INTERPOLATED,
                  stride=STRIDE,
                  octave=OCTAVE,
                  min_correlation=MIN_CORRELATION,
-                 use_interpolation=True):
+                 response_threshold=RESPONSE_THRESHOLD,
+                 use_interpolation=True,
+                 max_interpolation_time_gap_hours= MAX_INTERPOLATION_TIME_GAP_HOURS,
+                 return_insitu_points_on_completion=False
+                ):
         self.points = points
         self.templates = templates
         self.model = model
@@ -72,18 +84,31 @@ class ImageProcessor:
         self.pruning_interval = pruning_interval
         self._last_persisted_id = 0
         self.min_correlation = min_correlation
+        self.response_threshold = response_threshold
         self.use_interpolation = use_interpolation
         self.run_name = run_name
         self.insitu_points = insitu_points
         self.window_size = window_size
         self.border_size = border_size
+        self.border_matched = border_matched
+        self.border_interpolated = border_interpolated
+        self.descriptor_size = descriptor_size
         self.temporal_window = temporal_window
-        self.max_drift_speed_m_per_day = max_drift_speed_m_per_day
+        self.candidate_search_max_daily_drift_m = candidate_search_max_daily_drift_m
         self.stride = stride
         self.octave = octave
+        self.max_interpolation_time_gap_hours = max_interpolation_time_gap_hours
+        self.return_insitu_points_on_completion = return_insitu_points_on_completion
         
         # Initialize the KeypointDetector
-        self.keypoint_detector = KeypointDetector(model=model, octave=self.octave)
+        self.keypoint_detector = KeypointDetector(model=model)
+
+        # Initialize trajectory_id column in insitu_points if in validation mode
+        if self.insitu_points is not None:
+            if 'trajectory_id' not in self.insitu_points.columns:
+                self.insitu_points['trajectory_id'] = pd.NA
+                self.insitu_points['trajectory_id'] = self.insitu_points['trajectory_id'].astype(pd.Int64Dtype())
+            logger.info("Validation mode: 'trajectory_id' column ensured in self.insitu_points.")
 
         # Create DriftDatabase instance if persistence is enabled
         if persist_updates:
@@ -101,7 +126,7 @@ class ImageProcessor:
         Process a single image and update internal points/templates.
         
         This method modifies the internal state of the processor by updating
-        self.points and self.templates. It does not return these objects.
+        self.points and self.templates.
         
         Parameters:
         -----------
@@ -119,27 +144,34 @@ class ImageProcessor:
 
         logger.info(f"Processing image {image_id}: {basename}")
 
+        # Create Nansat Image object from file
         img = Image(filename)
-        points_last = self.points.last()
         
-        # Max drift over the full temporal window
-        max_possible_drift = self.max_drift_speed_m_per_day * self.temporal_window 
-        
-        # Buffer needed is the minimum of max possible drift and the matcher's limit
+        # Calculate buffer to capture points drifting INTO image
+        max_possible_drift = self.candidate_search_max_daily_drift_m * self.temporal_window 
         buffer_distance = min(max_possible_drift, self.matcher.spatial_distance_max)
-
-        logger.info(f"Using buffer distance: {buffer_distance/1000.0:.2f} km "
+        logger.debug(f"Using buffer distance: {buffer_distance/1000.0:.2f} km "
                     f"(Min of {max_possible_drift/1000.0:.1f}km theoretical max drift over {self.temporal_window} days "
                     f"and {self.matcher.spatial_distance_max/1000.0:.1f}km spatial match limit)")
     
-        # Filter for points within the buffered polygon and time threshold
+        # Filter for active points within the buffered polygon and time threshold
         buffered_image_poly = img.poly.buffer(buffer_distance)
         time_threshold = img.date - pd.Timedelta(days=self.temporal_window)
+        points_last = self.points.last()
         points_poly = points_last[
             points_last.within(buffered_image_poly) &
             (points_last['time'] >= time_threshold)
         ]
- 
+
+        # this is to prevent memory errors for rare instances with many overlapping active points
+        CANDIDATE_POINT_LIMIT = 40000
+        if len(points_poly) > CANDIDATE_POINT_LIMIT:
+            logger.info(
+                f"Candidate points ({len(points_poly)}) exceed limit. "
+                f"Taking a random sample of {CANDIDATE_POINT_LIMIT} points"
+            )
+            points_poly = points_poly.sample(n=CANDIDATE_POINT_LIMIT, random_state=42)
+
         if len(points_poly) == 0:
             logger.info("No overlapping points found")
             points_final = Keypoints()
@@ -154,13 +186,13 @@ class ImageProcessor:
                     interp_count = points_final['interpolated'].sum()
                     total_count = len(points_final)
                     if interp_count > 0:
-                        logger.info(f"Interpolation stats: {interp_count}/{total_count} points ({interp_count/total_count:.1%}) were interpolated")
+                        logger.debug(f"Interpolation stats: {interp_count}/{total_count} points ({interp_count/total_count:.1%}) were interpolated")
 
-        # Process new points, including any validation points
+        # Process new points
         self._process_new_points(points_final, img, image_id, basename)
-    
+
+        # Template pruning
         if image_id > 0 and image_id % self.pruning_interval == 0 and self.templates.trajectory_id.size > 0:
-            logger.info(f"Performing periodic template pruning (every {self.pruning_interval} images)...")
             try:
                 # Time-based Mask
                 current_time_np = img.date.to_numpy()
@@ -180,33 +212,21 @@ class ImageProcessor:
                     # Filter using the computed boolean mask
                     self.templates = self.templates.where(final_keep_mask, drop=True)
                     num_after = self.templates.trajectory_id.size
-                    logger.info(f"Pruning complete: Kept {num_after} templates / Removed {num_before - num_after} templates (were old OR inactive).")
+                    logger.debug(f"Pruning complete: Kept {num_after} templates / Removed {num_before - num_after} templates (were old OR inactive).")
                 else:
-                    logger.info("Pruning check: All templates recent or active.")
+                    logger.debug("Pruning check: All templates recent or active.")
 
             except Exception as e:
                 # Basic catch-all for unexpected errors during pruning
                 logger.error(f"Error during template pruning: {e}", exc_info=True)
                 logger.warning("Skipping template pruning for this interval due to error.")
 
-
+        # Persist database every X images
         if self.persist_updates:
-            # Calculate images since last *successful* persistence
-            current_points_image_id = 0
-            if isinstance(self.points, Keypoints):
-                current_points_image_id = self.points.last_image_id
-            elif isinstance(self.points, gpd.GeoDataFrame) and 'image_id' in self.points.columns and not self.points.empty:
-                current_points_image_id = self.points['image_id'].max()
-
+            current_points_image_id = self.points.last_image_id
             images_since_persist = current_points_image_id - self._last_persisted_id
-
             if images_since_persist >= self.persist_interval:
-                logger.info(f"Initiating periodic persistence and point pruning (interval: {self.persist_interval} images)...")
                 current_last_image_id = current_points_image_id
-
-                # --- Get Point Memory BEFORE save/prune ---
-                mem_points_before_mib = self.points.memory_usage(deep=True).sum() / (1024 * 1024) if not self.points.empty else 0
-
                 try:
                     save_successful = self.db.save(
                         self.points,
@@ -216,28 +236,18 @@ class ImageProcessor:
                     )
 
                     if save_successful:
-                        # Log DB save size using the pre-prune count
+                        # Prune points
                         points_delta_count = len(self.points[self.points['image_id'] > self._last_persisted_id])
                         logger.info(f"Database persistence successful for {points_delta_count} new/updated points.")
                         num_before_prune = len(self.points)
-
-                        # --- Prune points using the EXISTING time_threshold ---
-                        # Keep only points that are the latest AND within the temporal window
                         keep_mask_points = (self.points['is_last'] == 1) & \
                                            (self.points['time'] >= time_threshold) # Use existing time_threshold
-
                         points_to_keep = self.points[keep_mask_points].copy()
                         self.points = Keypoints._from_gdf(points_to_keep)
-
-                        # --- Get Point Memory AFTER prune ---
                         num_after_prune = len(self.points)
-                        mem_points_after_mib = self.points.memory_usage(deep=True).sum() / (1024 * 1024) if not self.points.empty else 0
-
-                        logger.info(
-                            f"In-memory points pruned (active AND recent): {num_before_prune} -> {num_after_prune} "
-                            f"({mem_points_after_mib:.1f} MiB). Memory reduced from {mem_points_before_mib:.1f} MiB."
+                        logger.debug(
+                            f"In-memory points pruned: {num_before_prune} -> {num_after_prune} "
                         )
-
                         self._last_persisted_id = current_last_image_id
                     else:
                         logger.warning("Database save operation reported failure. Skipping in-memory point pruning.")
@@ -248,41 +258,62 @@ class ImageProcessor:
     @log_execution_time
     def _process_new_points(self, points_final, img, image_id, basename):
         """Process new points, including validation data, and update templates."""
-        # Use KeypointDetector instead of standalone function
         coords_new = self.keypoint_detector.detect_new_keypoints(
             points=points_final,
             img=img,
             window_size=self.window_size,
-            border_size=self.border_size
+            border_size=self.border_size,
+            response_threshold=self.response_threshold,
+            octave=self.octave
         )
-        logger.info(f"Detected {len(coords_new)} new keypoints from image {image_id}")
+        logger.debug(f"Detected {len(coords_new)} new keypoints from image {image_id}")
 
         if self.insitu_points is not None:
             matching_insitu_points = self.insitu_points.loc[
-                self.insitu_points['image_filepath'].apply(os.path.basename).isin([basename])
+                self.insitu_points['image_filepath'].isin([basename])
             ]
 
             if len(matching_insitu_points) > 0:
                 logger.info(f"Found {len(matching_insitu_points)} matching buoy observations in image {basename}")
-                # Use KeypointDetector instead of standalone function
-                buoy_kps = self.keypoint_detector.keypoint_from_point(matching_insitu_points, img=img)
+                buoy_kps = self.keypoint_detector.keypoint_from_point(matching_insitu_points, self.descriptor_size, octave=self.octave,img=img, response_threshold=self.response_threshold)
+                if buoy_kps is None:
+                    logger.error("keypoint_from_point returned None unexpectedly!")
+                    buoy_kps = []
                 coords_new = coords_new + buoy_kps
                 logger.info(f"Added {len(buoy_kps)} buoy keypoints to detection set")
 
-        keypoints, descriptors = compute_descriptors(
+        keypoints_coords_arr, descriptors_arr, surviving_tags = compute_descriptors(
             coords_new,
             img,
             self.model,
-            polarisation='dual_polarisation',
-            normalize=False
+            polarisation=1, 
+            normalize=False 
         )
 
-        if keypoints is not None:
-            points_new = Keypoints.create(keypoints, descriptors, img, image_id)
-            self.points = self.points.append(points_new)
-            logger.info(f"Added {len(points_new)} new points (total: {len(self.points)})")
+        if keypoints_coords_arr is not None and descriptors_arr is not None:
+            points_new = Keypoints.create(keypoints_coords_arr, descriptors_arr, img, image_id)
+            
+            current_self_points_len = len(self.points)
+            self.points = self.points.append(points_new) # This assigns final trajectory_ids to the points_new portion
+            
+            appended_points_gdf = self.points.iloc[current_self_points_len:]
+            logger.info(f"Added {len(appended_points_gdf)} new points (total: {len(self.points)})")
 
-            templates_new, template_new_idx = extract_templates(points_new, img, hs=TEMPLATE_SIZE)
+            # Link insitu_points to final trajectory_ids using surviving_tags
+            if self.insitu_points is not None and surviving_tags is not None and not appended_points_gdf.empty:
+                appended_points_gdf_reset = appended_points_gdf.reset_index(drop=True)
+                
+                if len(surviving_tags) == len(appended_points_gdf_reset):
+                    for i, original_df_idx_tag in enumerate(surviving_tags):
+                        if original_df_idx_tag is not None: # Check if the tag is an actual index
+                            final_tid = appended_points_gdf_reset.iloc[i]['trajectory_id']
+                            self.insitu_points.loc[original_df_idx_tag, 'trajectory_id'] = final_tid
+                            logger.debug(f"Linked insitu_point (original index {original_df_idx_tag}) to trajectory_id {final_tid}")
+                else:
+                    logger.warning(f"Mismatch between surviving_tags ({len(surviving_tags)}) and "
+                                   f"appended_points_gdf_reset ({len(appended_points_gdf_reset)}). Skipping insitu linking for this batch.")
+
+            templates_new, template_new_idx = extract_templates(appended_points_gdf, img, band=1, hs=TEMPLATE_SIZE)
             self.templates = append_templates(
                 self.templates,
                 templates_new,
@@ -292,14 +323,14 @@ class ImageProcessor:
 
         if len(points_final) > 0:
             self.points = self.points.update(points_final)
-            templates_final, template_final_idx = extract_templates(points_final, img, hs=TEMPLATE_SIZE)
+            templates_final, template_final_idx = extract_templates(points_final, img, band=1, hs=TEMPLATE_SIZE)
             self.templates = update_templates(
                 self.templates,
                 templates_final,
                 template_final_idx,
                 self.points
-            )
-      
+             )
+            
     @log_execution_time
     def _match_existing_points(self, points_poly, img, image_id):
         """
@@ -311,30 +342,30 @@ class ImageProcessor:
         coords_grid = self.keypoint_detector.detect_gridded_points(
             img,
             stride=self.stride,
-            border_size=self.border_size
+            border_size=self.border_size,
+            size=self.descriptor_size,
+            octave=self.octave,
         )
 
-        # Error handling: Check if coords_grid is empty
         if not coords_grid:
             logger.warning("No gridded keypoints detected. Skipping matching for this image.")
             return None
 
-        keypoints, descriptors = compute_descriptors(
+        keypoints_coords_arr_grid, descriptors_grid, _surviving_tags_grid = compute_descriptors(
             coords_grid,
             img,
             self.model,
-            polarisation='dual_polarisation',
+            polarisation=1,
             normalize=False
         )
 
-        # Error handling: Check if descriptor computation failed for grid
-        if keypoints is None or descriptors is None:
+        if keypoints_coords_arr_grid is None or descriptors_grid is None:
              logger.warning("Failed to compute descriptors for grid points. Skipping matching.")
              return None
 
-        points_grid = Keypoints.create(keypoints, descriptors, img, image_id=image_id)
+        points_grid = Keypoints.create(keypoints_coords_arr_grid, descriptors_grid, img, image_id=image_id)
 
-        # Match and filter points using the matcher
+        # Match and filter points
         points_fg1, points_fg2 = self.matcher.match_with_grid(points_poly, points_grid)
 
         if points_fg1 is None or points_fg2 is None or points_fg1.empty or points_fg2.empty:
@@ -349,14 +380,13 @@ class ImageProcessor:
         # Interpolate drift
         if self.use_interpolation and len(points_fg1) < len(points_poly):
             points_combined = interpolate_drift(
-                points_poly,
-                points_grid,
-                points_fg1,
-                points_matched,
-                img,
-                self.model,
-                octave=self.octave
-            )
+                points_poly=points_poly,
+                points_fg1=points_fg1,
+                points_fg2=points_matched,
+                img=img,
+                max_interpolation_time_gap_hours=self.max_interpolation_time_gap_hours,
+                model_type=AffineTransform,
+                )
             if points_combined is None or points_combined.empty:
                  logger.warning("Interpolation resulted in no valid points. Proceeding with only matched points.")
                  points_combined = points_matched # Fall back to only matched points
@@ -372,32 +402,48 @@ class ImageProcessor:
         if points_combined.empty:
              logger.info("No matched or interpolated points remaining before template check.")
              return Keypoints()
-
+        
+        # Get initial trajectory IDs and corresponding original points
         all_traj_ids = points_combined.trajectory_id.values
-        # Ensure points_orig correctly references points_poly using trajectory IDs
         points_orig = points_poly[points_poly.trajectory_id.isin(all_traj_ids)]
 
         # Filter out points that don't have templates
         available_traj_ids = self.templates.trajectory_id.values
         has_template_mask = np.isin(all_traj_ids, available_traj_ids)
+
         if not np.all(has_template_mask):
             missing_count = np.sum(~has_template_mask)
-            logger.info(f"Filtering out {missing_count} points that don't have templates")
+            logger.debug(f"Filtering out {missing_count} points that don't have templates")
+            
+            # Filter points_combined
             points_combined = points_combined[has_template_mask].copy()
+            
             if points_combined.empty:
-                 logger.info("No points remaining after template availability filter.")
+                 logger.debug("No points remaining after template availability filter.")
                  return Keypoints()
-            # Update IDs and points_orig after filtering
-            all_traj_ids = points_combined.trajectory_id.values
-            points_orig = points_poly[points_poly.trajectory_id.isin(all_traj_ids)]
+
+            # Synchronise points_orig with the filtered points_combined
+            all_traj_ids = points_combined.trajectory_id.values 
+            points_orig = points_poly[points_poly.trajectory_id.isin(all_traj_ids)] 
 
         # Perform pattern matching
-        templates_all = self.templates.sel(trajectory_id=all_traj_ids)
+        templates_all = self.templates.sel(trajectory_id=all_traj_ids) 
+        
+        if not (len(points_combined) == len(points_orig) == len(templates_all.trajectory_id)):
+            logger.error(f"Length mismatch before pattern_matching! "
+                         f"points_combined: {len(points_combined)}, "
+                         f"points_orig: {len(points_orig)}, "
+                         f"templates_all: {len(templates_all.trajectory_id)}")
+            return Keypoints() 
+
         keypoints_corrected_xy, keypoints_corrected_rc, corr_values = pattern_matching(
             points_combined,
             img,
             templates_all,
-            points_orig
+            points_orig,
+            border_matched=self.border_matched,
+            border_interpolated=self.border_interpolated,
+            band=1
         )
 
         # Remove points below the correlation threshold
@@ -405,7 +451,7 @@ class ImageProcessor:
         valid_mask = corr_values >= self.min_correlation
         # Ensure we handle the case where NO points pass the correlation threshold
         if not np.any(valid_mask):
-             logger.info(f"No points passed the correlation threshold of {self.min_correlation}. Returning empty.")
+             logger.debug(f"No points passed the correlation threshold of {self.min_correlation}. Returning empty.")
              return Keypoints()
 
         valid_points = points_combined[valid_mask].copy()
@@ -413,7 +459,7 @@ class ImageProcessor:
         # Assign geometry using the index from valid_points to align correctly
         valid_points = valid_points.assign(
             geometry=gpd.points_from_xy(
-                keypoints_corrected_xy[valid_mask, 0], # Use same mask on corrected coords
+                keypoints_corrected_xy[valid_mask, 0],
                 keypoints_corrected_xy[valid_mask, 1]
             )
         )
@@ -422,18 +468,18 @@ class ImageProcessor:
 
         # Prepare KeyPoints for descriptor computation for currently valid points
         if not valid_points.empty:
-            keypoints_list = [
-                cv2.KeyPoint(px_c, px_r, size=WINDOW_SIZE, angle=img.angle, octave=self.octave)
-                # Iterate directly through the corrected pixel coordinates from pattern_matching
+            keypoints_list_with_tags_recompute = [
+                # Create (cv2.KeyPoint, None) tuples as tags are not relevant here for linking insitu
+                (cv2.KeyPoint(px_c, px_r, size=self.descriptor_size, angle=img.angle, octave=self.octave), None)
                 for px_c, px_r in valid_corrected_rc
             ]
             # Recompute descriptors
-            raw_kps, new_descriptors = compute_descriptors(
-                keypoints_list,
+            _raw_kps_recomputed, new_descriptors, _surviving_tags_recomputed = compute_descriptors(
+                keypoints_list_with_tags_recompute, # Pass list of tuples
                 img,
                 self.model,
-                polarisation='dual_polarisation',
-                normalize=False
+                polarisation=1, 
+                normalize=False 
             )
         else:
             new_descriptors = None
@@ -445,7 +491,7 @@ class ImageProcessor:
         if new_descriptors is not None:
             # Ensure descriptor count matches point count
             if len(new_descriptors) != len(valid_points):
-                 logger.info(f"Descriptor count mismatch after re-computation! "
+                 logger.debug(f"Descriptor count mismatch after re-computation! "
                               f"Expected {len(valid_points)}, got {len(new_descriptors)}. Removing points.")
                  removed_count = original_count
                  valid_points = valid_points.iloc[0:0].copy() # Discard points due to ambiguity
@@ -467,7 +513,7 @@ class ImageProcessor:
 
         # Log the result of filtering
         if removed_count > 0:
-            logger.info(f"Final filtering removed {removed_count} points "
+            logger.debug(f"Final filtering removed {removed_count} points "
                         f"due to invalid/None descriptors after re-computation attempts. "
                         f"Returning {len(valid_points)} points.")
         elif original_count > 0: # Log success only if we started with points and removed none
@@ -475,7 +521,7 @@ class ImageProcessor:
 
         # Update templates ONLY for the points that survived the descriptor check
         if not valid_points.empty:
-            new_templates, new_template_idx = extract_templates(valid_points, img, hs=TEMPLATE_SIZE)
+            new_templates, new_template_idx = extract_templates(valid_points, img, hs=TEMPLATE_SIZE, band=1)
             # Check if extract_templates returned valid indices matching remaining points
             if len(new_template_idx) == len(valid_points):
                  self.templates = update_templates(self.templates, new_templates, new_template_idx, valid_points)
@@ -590,8 +636,8 @@ class Image(Nansat):
         # Assuming standard corner order: 0:UL, 1:UR, 2:LR, 3:LL
         # A common ordering for Polygon is clockwise: UL, UR, LR, LL
         coords = np.vstack([
-            corners_nx_meters[[0, 1, 2, 3]],
-            corners_ny_meters[[0, 1, 2, 3]]
+        corners_nx_meters[[0, 2, 3, 1]],
+        corners_ny_meters[[0, 2, 3, 1]]
         ]).T
 
         # Create and return the polygon
@@ -600,7 +646,6 @@ class Image(Nansat):
         return poly
         
 class Keypoints(gpd.GeoDataFrame):
-    # _metadata = ['srs'] + gpd.GeoDataFrame._metadata
     srs = NSR(3413)
 
     def __init__(self, *args, **kwargs):
@@ -618,6 +663,8 @@ class Keypoints(gpd.GeoDataFrame):
                 'interpolated': []
             }
             super().__init__(empty_data)
+            if 'time' in self.columns:
+                self['time'] = pd.to_datetime(self['time'], errors='coerce')
         else:
             # Initialize with provided data
             super().__init__(*args, **kwargs)
@@ -726,7 +773,7 @@ class KeypointDetector:
     including new keypoint detection and gridded detection.
     """
 
-    def __init__(self, model, octave=OCTAVE):
+    def __init__(self, model):
         """
         Initialize the keypoint detector.
 
@@ -735,18 +782,25 @@ class KeypointDetector:
             octave (int): The octave value for keypoints
         """
         self.model = model
-        self.octave = octave
-
+        self.pc = ccrs.PlateCarree()
+        central_longitude = -45
+        true_scale_latitude = 70
+        self.nps = ccrs.NorthPolarStereo(
+            central_longitude=central_longitude,
+            true_scale_latitude=true_scale_latitude
+        )
+        
     @log_execution_time
     def detect_new_keypoints(
         self,
         points,
         img,
-        window_size=WINDOW_SIZE,
-        border_size=BORDER_SIZE,
+        octave,
+        window_size,
+        border_size,
+        response_threshold,
         step=None,
         adjust_keypoint_angle=True,
-        band_name="s0_HV",
     ):
         """
         Detect new keypoints in an image avoiding areas with existing keypoints.
@@ -758,12 +812,13 @@ class KeypointDetector:
             border_size (int): Border to exclude
             step (int): Step size between windows
             adjust_keypoint_angle (bool): Whether to adjust keypoint angles
-            band_name (str): Image band to use
 
         Returns:
-            list: Detected keypoints
+            list: List of tuples (cv2.KeyPoint, None)
         """
-        img0 = img[band_name]
+        img0 = img[1]
+        landmask = img[2]
+        img0[landmask == 2] = 0
         img0[np.isnan(img0)] = 0
         if step is None:
             step = window_size
@@ -814,6 +869,8 @@ class KeypointDetector:
                 window = windows[i, j]
                 # Detect keypoints in the window
                 kps = self.model.detect(window, None)
+                # Filter keypoints based on response
+                kps = [kp for kp in kps if kp.response > response_threshold]
                 if len(kps) != 0:
                     kp_best = max(kps, key=lambda kp: kp.response)
                     # Adjust keypoint coordinates to the original image coordinates
@@ -821,30 +878,31 @@ class KeypointDetector:
                     y_offset = y_start
                     kp_best.pt = (kp_best.pt[0] + x_offset, kp_best.pt[1] + y_offset)
                     if adjust_keypoint_angle:
+                        # combine img and feature angle
                         kp_best.angle = img.angle
-                    kp_best.octave = self.octave
-                    keypoints.append(kp_best)
+                    kp_best.octave = octave
+                    keypoints.append((kp_best, None)) # Append tuple with None as tag
 
         # Filter keypoints to remove ones too close to the image edges
-        filtered_keypoints = [
-            kp
-            for kp in keypoints
+        filtered_keypoints_with_tags = [
+            item
+            for item in keypoints
             if (
-                border_size <= kp.pt[0] <= img0.shape[1] - border_size
-                and border_size <= kp.pt[1] <= img0.shape[0] - border_size
+                border_size <= item[0].pt[0] <= img0.shape[1] - border_size
+                and border_size <= item[0].pt[1] <= img0.shape[0] - border_size
             )
         ]
 
-        return filtered_keypoints
+        return filtered_keypoints_with_tags
 
     @log_execution_time
     def detect_gridded_points(
         self,
         img,
-        stride=STRIDE,
-        size=WINDOW_SIZE,
-        border_size=BORDER_SIZE,
-        band_name="s0_HV",
+        stride,
+        size,
+        octave,
+        border_size,
     ):
         """
         Generate gridded points over the input image.
@@ -854,73 +912,135 @@ class KeypointDetector:
             stride (int): Distance between grid points
             size (int): Size of keypoints
             border_size (int): Border to exclude
-            band_name (str): Image band to use
 
         Returns:
-            list: Grid of keypoints
+            list: List of tuples (cv2.KeyPoint, None)
         """
         # Get image data and replace NaNs with zero
-        img0 = img[band_name]
+        img0 = img[1]
         img0[np.isnan(img0)] = 0
 
         # Generate grid keypoints
         keypoints = []
         for r in range(0, img0.shape[0], stride):
             for c in range(0, img0.shape[1], stride):
-                keypoints.append(
-                    cv2.KeyPoint(r, c, size=size, octave=self.octave, angle=img.angle)
-                )
+                kp = cv2.KeyPoint(r, c, size=size, octave=octave, angle=img.angle)
+                keypoints.append((kp, None)) # Append tuple with None as tag
 
         # Filter keypoints within image borders
-        filtered_keypoints = [
-            kp
-            for kp in keypoints
+        filtered_keypoints_with_tags = [
+            item
+            for item in keypoints
             if (
-                border_size <= kp.pt[0] <= img0.shape[1] - border_size
-                and border_size <= kp.pt[1] <= img0.shape[0] - border_size
+                border_size <= item[0].pt[0] <= img0.shape[1] - border_size
+                and border_size <= item[0].pt[1] <= img0.shape[0] - border_size
             )
         ]
 
-        return filtered_keypoints
+        return filtered_keypoints_with_tags
 
-    def keypoint_from_point(self, points, img):
+    def get_pixel_coords(self, nansat_obj, geom_x, geom_y):
+        # helper function for keypoint_from_point
+        x_arr, y_arr = np.atleast_1d(geom_x), np.atleast_1d(geom_y)
+        source_crs_cartopy = ccrs.CRS(nansat_obj.srs.ExportToProj4())
+        geographic_crs_cartopy = ccrs.PlateCarree()
+        lon_lat_alt_array = geographic_crs_cartopy.transform_points(source_crs_cartopy, x_arr, y_arr)
+        cols, rows = nansat_obj.transform_points(lon_lat_alt_array[:, 0], lon_lat_alt_array[:, 1], DstToSrc=1)
+        if cols.size > 0 and np.isfinite(cols[0]) and np.isfinite(rows[0]):
+            return int(round(cols[0])), int(round(rows[0])) # Return rounded integer coords
+    
+    def keypoint_from_point(
+            self, # KeypointDetector instance
+            points_gdf_for_current_image, # GDF of buoy points for *this* image
+            descriptor_size, # Passed by ImageProcessor, for cv2.KeyPoint.size & descriptor area check
+            octave,          # Passed by ImageProcessor, for cv2.KeyPoint.octave
+            img,              # Nansat image object for the current image
+            response_threshold
+        ):
         """
-        Generate keypoints from specific geographic points.
-
-        Parameters:
-            points (GeoDataFrame): Points with geometry
-            img (Image): Image to place keypoints in
-
-        Returns:
-            list: Keypoints
+        Dynamically finds the best ORB feature near each buoy point using a method similar to detect_new_keypoints
+        Returns list of tuples: (cv2.KeyPoint, original_df_index)
         """
-        keypoints = []
-        pc = ccrs.PlateCarree()
-        nps = ccrs.NorthPolarStereo(central_longitude=-45, true_scale_latitude=70)
-        for _, point in points.iterrows():
-            x, y = np.atleast_1d(point.geometry.x), np.atleast_1d(point.geometry.y)
-            lon, lat, _ = pc.transform_points(nps, x, y).T
-            cols, rows = img.transform_points(lon, lat, DstToSrc=1)
-            kp = cv2.KeyPoint(
-                round(cols[0]),
-                round(rows[0]),
-                size=WINDOW_SIZE,
-                octave=self.octave,
-                angle=img.angle,
-            )
-            keypoints.append(kp)
-        return keypoints
+        # this is the window it searches
+        patch_size_for_detection = 32
+        keypoints_with_indices = []
+        orb_model = self.model
+        img_band_data = img[1]
+        img_height, img_width = img_band_data.shape
+
+        for original_idx, point_row in points_gdf_for_current_image.iterrows():
+            buoy_geom = point_row.geometry
+            if buoy_geom is None:
+                continue
+
+            try:
+                buoy_col_px_float, buoy_row_px_float = self.get_pixel_coords(img, buoy_geom.x, buoy_geom.y)
+                if buoy_col_px_float is None:
+                    continue
+
+                patch_half = patch_size_for_detection // 2
+                r0 = max(0, int(round(buoy_row_px_float)) - patch_half)
+                r1 = min(img_height, int(round(buoy_row_px_float)) + patch_half + (patch_size_for_detection % 2))
+                c0 = max(0, int(round(buoy_col_px_float)) - patch_half)
+                c1 = min(img_width, int(round(buoy_col_px_float)) + patch_half + (patch_size_for_detection % 2))
+
+                if not ((r1 - r0) >= patch_size_for_detection * 0.8 and \
+                        (c1 - c0) >= patch_size_for_detection * 0.8):
+                    continue 
+
+                patch = img_band_data[r0:r1, c0:c1]
+                if patch.size == 0:
+                    continue
+                
+                kps_in_patch = orb_model.detect(patch, None)
+                
+                best_kp_in_patch = None
+                max_response_found = -1.0 
+
+                if kps_in_patch:
+                    for kp_candidate in kps_in_patch:
+                        if kp_candidate.response >= response_threshold:
+                            if kp_candidate.response > max_response_found:
+                                max_response_found = kp_candidate.response
+                                best_kp_in_patch = kp_candidate
+                
+                if best_kp_in_patch is not None:
+                    kp_final_c = c0 + best_kp_in_patch.pt[0]
+                    kp_final_r = r0 + best_kp_in_patch.pt[1]
+
+                    # Boundary check for the keypoint for subsequent descriptor computation
+                    orb_desc_computation_half_patch = int(descriptor_size / 2) 
+
+                    if not (orb_desc_computation_half_patch <= kp_final_c < img_width - orb_desc_computation_half_patch and \
+                            orb_desc_computation_half_patch <= kp_final_r < img_height - orb_desc_computation_half_patch):
+                        continue 
+
+                    final_kp_to_add = cv2.KeyPoint(
+                        x=float(kp_final_c),
+                        y=float(kp_final_r),
+                        size=float(descriptor_size), 
+                        octave=int(octave),
+                        angle=float(img.angle),
+                        response=float(best_kp_in_patch.response)
+                    )
+                    keypoints_with_indices.append((final_kp_to_add, point_row.name))
+                
+            except Exception as e:
+                print(f"Error processing point original_idx {original_idx} (input index {point_row.name}): {e}")
+                pass 
+                
+        return keypoints_with_indices
 
 class Matcher:
     def __init__(self,
                  # General matching parameters
                  norm=cv2.NORM_HAMMING2,
-                 descriptor_distance_max=130,
+                 descriptor_distance_max=120,
                  spatial_distance_max=100000,
 
                  # Homography estimation parameters
                  model=AffineTransform,
-                 model_threshold=13000,
+                 model_threshold=10000,
                  use_model_estimation=True,
                  estimation_method="USAC_MAGSAC",
 
@@ -943,7 +1063,7 @@ class Matcher:
         # Store the method name and get its value
         if estimation_method.upper() == "DEGENSAC":
             self.estimation_method_name = "DEGENSAC"
-            self.estimation_method = None  # pydegensac will be used
+            self.estimation_method = None
         else:
             self.estimation_method_name = estimation_method
             self.estimation_method = getattr(cv2, estimation_method)
@@ -982,15 +1102,18 @@ class Matcher:
         x0 = np.vstack(points_poly['descriptors'].values)
         x1 = np.vstack(points_grid['descriptors'].values)
 
-        # Try crosscheck matcher first
+        # Match
         matches = self.match_with_crosscheck(x0, x1)
+
+        # Filter
         rc_idx0, rc_idx1, residuals = self.filter(matches, pos0, pos1)
 
         # If filter returned None or we don't have enough matches, try Lowe's ratio test
         if rc_idx0 is None or (rc_idx0.size / pos0.shape[0] < 0.1):
             matches = self.match_with_lowe_ratio(matches, x0, x1, pos0, pos1)
             rc_idx0, rc_idx1, residuals = self.filter(matches, pos0, pos1)
-
+            if rc_idx0 is not None:
+                logger.debug(f"After Lowe's ratio test, number of matches: {rc_idx0.size}")
             # If we still don't have valid matches, return None
             if rc_idx0 is None:
                 return None, None
@@ -1014,112 +1137,104 @@ class Matcher:
         return list(matches)
 
     @log_execution_time
-    def match_with_lowe_ratio(self, matches_bf, x0, x1, pos0, pos1):
+    def match_with_lowe_ratio(self, matches_bf_initial, x0, x1, pos0, pos1):
         """
-        Applies Lowe's ratio test to filter matches and extend them.
-
-        Parameters:
-            matches_bf (list): Matches from brute force matching.
-            x0 (ndarray): Descriptors from the first image.
-            x1 (ndarray): Descriptors from the second image.
-            pos0 (ndarray): Keypoint positions in the first image.
-            pos1 (ndarray): Keypoint positions in the second image.
-
-        Returns:
-            list: Extended list of matches after Lowe's ratio test.
+        Applies a Lowe's ratio-like test using k=4 neighbors to find additional matches.
+        Relies on the subsequent self.filter call for descriptor and spatial distance filtering.
         """
-        # Initialize the FLANN-based matcher
-        index_params = dict(algorithm=6,  # FLANN_INDEX_LSH
-                            table_number=12,  # 12 hash tables
-                            key_size=20,  # 20-bit keys
-                            multi_probe_level=2)  # 2 levels of multi-probing
-        search_params = {}  # or pass an empty dictionary
+        index_params = dict(algorithm=6, table_number=12, key_size=20, multi_probe_level=2)
+        search_params = {}
         knn_matcher = cv2.FlannBasedMatcher(index_params, search_params)
 
-        # Match descriptors using KNN
-        all_matches = knn_matcher.knnMatch(x0, x1, k=4)
+        # Get k=4 nearest neighbors for each descriptor in x0 from x1
+        all_knn_matches = knn_matcher.knnMatch(x0, x1, k=4)
 
-        # Apply ratio test as per Lowe's paper
-        # Extend with max drift test and max descriptor distance test
-        matches = []
-        # this compare multiple matches to each other and only keeps the best one by using several filters in geographic and descriptor distance
-        for mmm in all_matches:
-            for midx, m in enumerate(mmm[:-1]):
-                d = norm(pos0[m.queryIdx] - pos1[m.trainIdx])
-                if d < self.spatial_distance_max and m.distance < self.descriptor_distance_max and m.distance < self.lowe_ratio * mmm[midx+1].distance:
-                    matches.append(m)
+        new_matches_from_lowe_variant = []
+
+        for mmm in all_knn_matches: 
+            if len(mmm) < 2: # Need at least two matches to perform a ratio test
+                continue
+
+            # Iterate through the first k-1 candidates (m_candidate)
+            # and compare each to its immediate successor (m_next)
+            for midx, m_candidate in enumerate(mmm[:-1]):
+                m_next = mmm[midx+1] # The DMatch object to compare against
+
+                # Apply the Lowe's ratio test
+                if m_candidate.distance < self.lowe_ratio * m_next.distance:
+                    new_matches_from_lowe_variant.append(m_candidate)
                     break
-        matches_bf_queryIdx = [m.queryIdx for m in matches_bf]
-        for m in matches:
-            # loop over new matches and adds new matches only if they are not found in the BF matching
-            if m.queryIdx not in matches_bf_queryIdx:
-                matches_bf.append(m)
-        logger.info(f"Number of matches after Lowe's ratio test: {len(matches_bf)}")
-        return matches_bf
+        
+        # Combine initial crosscheck matches with the new ones from the Lowe's variant
+        combined_matches = list(matches_bf_initial) # Start with a copy
+        existing_query_indices_from_bf = {m.queryIdx for m in matches_bf_initial}
+
+        for m_lowe in new_matches_from_lowe_variant:
+            if m_lowe.queryIdx not in existing_query_indices_from_bf:
+                combined_matches.append(m_lowe)
+        
+        return combined_matches
 
     @log_execution_time
     def filter(self, matches, pos0, pos1):
-        """
-        Filters matches based on descriptor distance, spatial distance, and model estimation.
-
-        Parameters:
-        matches (list): Raw matches from a matching algorithm.
-        pos0 (ndarray): Keypoint positions in the first image.
-        pos1 (ndarray): Keypoint positions in the second image.
-
-        Returns:
-        tuple: Indices of filtered matches and residuals if model estimation is used.
-                Returns (None, None, None) if estimation fails due to insufficient matches.
-        """
-        descriptor_distance = np.array([m.distance for m in matches])
-        bf_idx0 = np.array([m.queryIdx for m in matches])
-        bf_idx1 = np.array([m.trainIdx for m in matches])
-        logger.info(f'Matching: Number of matches: {bf_idx0.size}')
-        if self.plot: self.plot_quiver(pos0[bf_idx0], pos1[bf_idx1], descriptor_distance)
+        bf_idx0 = np.array([m.queryIdx for m in matches]) # Indices into pos0 for ALL 'matches'
+        bf_idx1 = np.array([m.trainIdx for m in matches]) # Indices into pos1 for ALL 'matches'
+        logger.debug(f'Matching: Number of matches: {bf_idx0.size}')
 
         # Filter by descriptor distance
-        gpi0 = np.nonzero(descriptor_distance < self.descriptor_distance_max)
-        dd_idx0 = bf_idx0[gpi0]
-        dd_idx1 = bf_idx1[gpi0]
-        logger.info(f'Distance: Number of matches: {dd_idx0.size}')
-        if self.plot: self.plot_quiver(pos0[dd_idx0], pos1[dd_idx1], descriptor_distance[gpi0])
-
+        # descriptor_distance is already calculated for ALL 'matches' (initial crosscheck)
+        descriptor_distance = np.array([m.distance for m in matches])
+        gpi0_desc_filter_mask = descriptor_distance < self.descriptor_distance_max 
+        dd_idx0 = bf_idx0[gpi0_desc_filter_mask] # Indices of points passing descriptor distance filter
+        dd_idx1 = bf_idx1[gpi0_desc_filter_mask]
+        logger.debug(f'Distance: Number of matches: {dd_idx0.size}')
+        if dd_idx0.size == 0: # No points passed descriptor distance filter
+            if not self.use_model_estimation: return dd_idx0, dd_idx1, None
+            return None, None, None
+        
         # Filter by spatial distance
-        gpi1 = np.hypot(pos1[dd_idx1, 0] - pos0[dd_idx0, 0], pos1[dd_idx1, 1] - pos0[dd_idx0, 1]) < self.spatial_distance_max
-        md_idx0 = dd_idx0[gpi1]
-        md_idx1 = dd_idx1[gpi1]
-        logger.info(f'Spatial: Number of matches: {md_idx0.size}')
-        if self.plot: self.plot_quiver(pos0[md_idx0], pos1[md_idx1], descriptor_distance[gpi0][gpi1])
+        # Calculate spatial distances ONLY for those that passed the descriptor distance filter
+        current_spatial_distances = np.hypot(pos1[dd_idx1, 0] - pos0[dd_idx0, 0], 
+                                            pos1[dd_idx1, 1] - pos0[dd_idx0, 1])
+        gpi1_spatial_filter_mask = current_spatial_distances < self.spatial_distance_max # Mask relative to dd_idx arrays
+        md_idx0 = dd_idx0[gpi1_spatial_filter_mask] # Indices of points passing spatial (and descriptor) filter
+        md_idx1 = dd_idx1[gpi1_spatial_filter_mask]
 
         if not self.use_model_estimation:
-            return md_idx0, md_idx1, None
+            return md_idx0, md_idx1, None # md_idx0, md_idx1 are the final indices if no model estimation
 
-        # Check if we have enough points for homography
-        if md_idx0.size < 4:
+        # Filter by homography
+        if md_idx0.size < 4: # Check if enough points for homography
             logger.warning("Warning: Insufficient matches for model estimation (minimum 4 required)")
             return None, None, None
-
         try:
-            # Log the estimation method name
-
+            # H, inliers is your gpi2, applied to md_idx0/md_idx1
+            # The `inliers` mask returned by findHomography is relative to the points fed into it (pos0[md_idx0], pos1[md_idx1])
             if self.estimation_method_name.upper() == "DEGENSAC":
                 import pydegensac
-                H, inliers = pydegensac.findHomography(pos0[md_idx0], pos1[md_idx1], self.model_threshold)
+                H, inliers_mask_homography_relative = pydegensac.findHomography(pos0[md_idx0], pos1[md_idx1], self.model_threshold)
             else:
-                H, inliers = cv2.findHomography(pos0[md_idx0], pos1[md_idx1], self.estimation_method, self.model_threshold)
+                H, inliers_mask_homography_relative = cv2.findHomography(pos0[md_idx0], pos1[md_idx1], 
+                                                                        self.estimation_method, self.model_threshold)
 
             if H is None:
                 logger.warning("Warning: Model estimation failed")
                 return None, None, None
+            
+            inliers_mask_homography_relative = inliers_mask_homography_relative.ravel().astype(bool)
 
-            model = self.model(H)
-            gpi2 = np.nonzero(inliers)[0]
-            rc_idx0 = md_idx0[gpi2]
-            rc_idx1 = md_idx1[gpi2]
+            # Points KEPT by homography
+            # these are indices into the original pos0/pos1 arrays
+            rc_idx0 = md_idx0[inliers_mask_homography_relative]
+            rc_idx1 = md_idx1[inliers_mask_homography_relative]
+                
+            model = self.model(H) # Assuming self.model is AffineTransform class
             residuals = model.residuals(pos0[rc_idx0], pos1[rc_idx1])
             logger.info(f'{self.estimation_method_name}: Number of matches: {rc_idx0.size}')
-            if self.plot:
+            
+            if self.plot: # Your existing plot call
                 self.plot_quiver(pos0[rc_idx0], pos1[rc_idx1], residuals)
+                
             return rc_idx0, rc_idx1, residuals
 
         except cv2.error as e:
@@ -1128,135 +1243,174 @@ class Matcher:
         except Exception as e:
             logger.error(f"Warning: Unexpected error during model estimation: {str(e)}")
             return None, None, None
-
+        
 @log_execution_time
-def interpolate_drift(points_poly, points_grid, points_fg1, points_fg2, img, model, octave=8, model_type=AffineTransform):
-    """
-    Interpolate positions for unmatched points using vectorized filtering.
-    Descriptors are NOT computed here; they are recomputed after pattern matching.
-
-    Parameters:
-    -----------
-    points_poly : GeoDataFrame
-        Original points from the previous image.
-    points_grid : GeoDataFrame
-        Grid points detected in the current image.
-    points_fg1 : GeoDataFrame
-        Matched points subset from points_poly.
-    points_fg2 : GeoDataFrame
-        Matched points subset from points_grid.
-    img : Image
-        The current image object.
-    model : cv2.Feature2D
-        Passed but not used for descriptor computation here.
-    octave : int
-        Octave for potential keypoint creation (used by Keypoints.create indirectly).
-    model_type : class
-        Transformation model class (e.g., AffineTransform).
-
-    Returns:
-    --------
-    GeoDataFrame
-        Combined GeoDataFrame with matched and interpolated points.
-        Interpolated points have None in 'descriptors' column initially.
-    """
+def interpolate_drift(points_poly, points_fg1, points_fg2, img, 
+                                        max_interpolation_time_gap_hours,
+                                        model_type=AffineTransform,
+                                        max_interpolation_speed_m_per_day=50000,
+                                        max_anchor_distance_km=20.0 
+                                        ):
     points_result = points_fg2.copy()
-    if 'interpolated' not in points_result.columns:
-        points_result['interpolated'] = 0
+    points_result['interpolated'] = 0 
 
-    # Early exit if no interpolation needed
-    if len(points_fg1) >= len(points_poly):
-        logger.info("All points matched, no interpolation needed")
+    MIN_SAMPLES_FOR_AFFINE = 10
+    
+    if len(points_fg1) < MIN_SAMPLES_FOR_AFFINE: 
+        if len(points_fg1) == 0 and (points_poly.empty or len(points_fg1) == len(points_poly)):
+             logger.info("interpolate_drift: No valid anchor points for ATM. Skipping interpolation.")
+        else:
+             logger.info(f"interpolate_drift: Not enough matched points ({len(points_fg1)}) for ATM. Min: {MIN_SAMPLES_FOR_AFFINE}. Skipping.")
         return points_result
 
-    # Estimate Transformation
-    pos0 = np.column_stack((points_poly.geometry.x, points_poly.geometry.y))
-    pos1 = np.column_stack((points_grid.geometry.x, points_grid.geometry.y))
-    rc_idx0_from_fg1 = points_poly.index.get_indexer(points_fg1.index)
-    rc_idx1_from_fg2 = points_grid.index.get_indexer(points_fg2.index)
-    atm = model_type()
-    atm.estimate(pos0[rc_idx0_from_fg1], pos1[rc_idx1_from_fg2])
+    try:
+        src_pts_for_atm_geodf = points_poly.loc[points_fg1.index]
+        if src_pts_for_atm_geodf.geometry.isna().any() or points_fg2.geometry.isna().any():
+            logger.error("interpolate_drift: NaN geometry in ATM anchor points. Skipping.")
+            return points_result
 
-    # Identify Unmatched Points Valid for Interpolation
-    matched_ids = set(points_fg1.index)
-    unmatched_mask = ~points_poly.index.isin(matched_ids)
-    unmatched_points = points_poly[unmatched_mask]
-
-    # Filter unmatched points to those within the target image bounds (no buffer)
-    img_poly_no_buffer = img.poly
-    unmatched_within_image_mask = unmatched_points.within(img_poly_no_buffer)
-    unmatched_points_for_interp = unmatched_points[unmatched_within_image_mask]
-
-    # Early exit if no suitable points found
-    if unmatched_points_for_interp.empty:
-        logger.info("No suitable unmatched points found within image area for interpolation.")
+        pos0_atm = np.array(list(src_pts_for_atm_geodf.geometry.apply(lambda p: p.coords[0])))
+        pos1_atm = np.array(list(points_fg2.geometry.apply(lambda p: p.coords[0])))
+        
+        atm = model_type()
+        if not atm.estimate(pos0_atm, pos1_atm):
+            logger.warning("interpolate_drift: Affine transformation estimation failed.")
+            return points_result
+    except Exception as e:
+        logger.error(f"interpolate_drift: Error during ATM estimation: {e}", exc_info=True)
         return points_result
 
-    logger.info(f"Found {len(unmatched_points_for_interp)} unmatched points within image area for interpolation")
+    unmatched_mask = ~points_poly.index.isin(points_fg1.index)
+    unmatched_points_current_stage = points_poly[unmatched_mask].copy() 
 
-    # Apply Transformation and Convert to Pixel Coords
-    pos0_to_interp = np.column_stack((unmatched_points_for_interp.geometry.x,
-                                      unmatched_points_for_interp.geometry.y))
-    interpolated_pos_geo = atm(pos0_to_interp)
-    cols, rows = img.transform_points(interpolated_pos_geo[:, 0], interpolated_pos_geo[:, 1], DstToSrc=1, dst_srs=NSR(3413))
+    if unmatched_points_current_stage.empty:
+        logger.debug("interpolate_drift: No unmatched points to consider for interpolation.")
+        return points_result
 
-    # Vectorized Filtering of Pixel Coordinates
-    height, width = img['s0_HV'].shape
-    border = 16
+    try:
+        unmatched_points_current_stage = unmatched_points_current_stage[unmatched_points_current_stage.within(img.poly)]
+    except Exception as e_bounds:
+        logger.warning(f"interpolate_drift: Error checking image bounds: {e_bounds}. Proceeding unfiltered.")
 
-    valid_col_mask = (cols >= border) & (cols < width - border)
-    valid_row_mask = (rows >= border) & (rows < height - border)
-    valid_pixel_mask = valid_col_mask & valid_row_mask
+    if unmatched_points_current_stage.empty:
+        logger.debug("interpolate_drift: No unmatched points within image bounds."); return points_result
 
-    # Select valid pixel coordinates and corresponding original trajectory IDs
-    valid_kp_coords_pixel_np = np.column_stack((cols[valid_pixel_mask], rows[valid_pixel_mask]))
-    final_interpolated_points = unmatched_points_for_interp[valid_pixel_mask]
-    interpolated_trajectory_ids = final_interpolated_points.trajectory_id.values
+    current_img_time_naive = img.date.tz_localize(None) if img.date.tzinfo else img.date
+    unmatched_times_naive = unmatched_points_current_stage['time'].dt.tz_localize(None) 
+    time_gap_mask = (current_img_time_naive - unmatched_times_naive).dt.total_seconds() <= (max_interpolation_time_gap_hours * 3600)
+    unmatched_points_current_stage = unmatched_points_current_stage[time_gap_mask]
+    
+    logger.debug(f"interpolate_drift: {len(unmatched_points_current_stage)} unmatched points after bounds & time gap filters.")
+    if unmatched_points_current_stage.empty: return points_result
 
-    # Check for potential mismatch and handle by truncation
-    num_interpolated = len(valid_kp_coords_pixel_np)
-    if len(interpolated_trajectory_ids) != num_interpolated:
-        # This hasn't occured in practice yet
-        logger.warning(f"Interpolated coordinate/ID count mismatch after filtering: {num_interpolated} coords vs {len(interpolated_trajectory_ids)} IDs. Truncating.")
-        count = min(len(interpolated_trajectory_ids), num_interpolated)
-        interpolated_trajectory_ids = interpolated_trajectory_ids[:count]
-        valid_kp_coords_pixel_np = valid_kp_coords_pixel_np[:count]
-        num_interpolated = count # Update count after truncation
-
-    # Create Keypoints Object for Interpolated Points
-    if num_interpolated > 0:
-        interpolated_keypoints = Keypoints.create(
-            valid_kp_coords_pixel_np,    # Nx2 pixel coordinate array
-            [None] * num_interpolated,   # Placeholder for descriptors
-            img,
-            points_result['image_id'].iloc[0] # Use image_id from matched points
-        )
-
-        # Update trajectory IDs and interpolation flag
-        interpolated_keypoints['trajectory_id'] = interpolated_trajectory_ids
-        interpolated_keypoints['interpolated'] = 1
-
-        # Combine and Return
-        points_final = pd.concat([points_result, interpolated_keypoints], ignore_index=True)
-        logger.info(f"Successfully interpolated {len(interpolated_keypoints)} points")
+    max_anchor_distance_meters = max_anchor_distance_km * 1000.0
+    if not src_pts_for_atm_geodf.geometry.empty and len(src_pts_for_atm_geodf.geometry) >= 3:
+        try:
+            anchor_cloud_multipoint = MultiPoint(src_pts_for_atm_geodf.geometry.tolist())
+            convex_hull_of_anchors = anchor_cloud_multipoint.convex_hull
+            distances_to_hull_edge = unmatched_points_current_stage.geometry.distance(convex_hull_of_anchors)
+            near_anchor_hull_mask = distances_to_hull_edge <= max_anchor_distance_meters
+            
+            num_discarded = len(unmatched_points_current_stage) - np.sum(near_anchor_hull_mask)
+            unmatched_points_current_stage = unmatched_points_current_stage[near_anchor_hull_mask]
+            if num_discarded > 0:
+                 logger.debug(f"interpolate_drift: Discarded {num_discarded} points far from anchor hull.")
+        except Exception as e_hull: # Catches errors from MultiPoint, convex_hull, or distance
+            logger.warning(f"interpolate_drift: Error during hull processing or distance calc: {e_hull}. Skipping filter.")
     else:
-        # If truncation resulted in zero points, just return the original matched points
-        logger.warning("Interpolation resulted in zero valid points after mismatch handling.")
-        points_final = points_result
+        logger.debug(f"interpolate_drift: Not enough anchors ({len(src_pts_for_atm_geodf.geometry)}) for hull filter.")
 
-    return points_final
+    if unmatched_points_current_stage.empty:
+        logger.debug("interpolate_drift: No points remaining after anchor distance filter."); return points_result
+        
+    pos0_to_interp = np.column_stack((unmatched_points_current_stage.geometry.x, unmatched_points_current_stage.geometry.y))
+    interpolated_pos_geo_coords_np = atm(pos0_to_interp)
+
+    prev_times_series = unmatched_points_current_stage['time']
+    prev_geoms_series = unmatched_points_current_stage.geometry
+    prev_times_for_calc_naive = prev_times_series.dt.tz_localize(None)
+    time_diff_seconds_series = (current_img_time_naive - prev_times_for_calc_naive).dt.total_seconds()
+    time_diff_days_series = pd.Series(time_diff_seconds_series / (24.0 * 60.0 * 60.0), index=unmatched_points_current_stage.index)
+    
+    new_interpolated_geoms_series = gpd.GeoSeries(
+        gpd.points_from_xy(interpolated_pos_geo_coords_np[:,0], interpolated_pos_geo_coords_np[:,1]),
+        crs=prev_geoms_series.crs, index=unmatched_points_current_stage.index)
+    
+    displacements_m_series = prev_geoms_series.distance(new_interpolated_geoms_series)
+    speeds_m_per_day_series = pd.Series(np.nan, index=unmatched_points_current_stage.index)
+    valid_time_diff_mask = time_diff_days_series > 1e-9
+    if valid_time_diff_mask.any():
+        speeds_m_per_day_series.loc[valid_time_diff_mask] = \
+            displacements_m_series[valid_time_diff_mask] / time_diff_days_series[valid_time_diff_mask]
+
+    speed_filter_mask_series = (speeds_m_per_day_series <= max_interpolation_speed_m_per_day) & speeds_m_per_day_series.notna()
+    unmatched_points_after_velocity_filter = unmatched_points_current_stage[speed_filter_mask_series]
+    interpolated_pos_geo_coords_after_velocity_filter_np = interpolated_pos_geo_coords_np[speed_filter_mask_series.values] 
+
+    num_discarded_speed = len(unmatched_points_current_stage) - len(unmatched_points_after_velocity_filter)
+    if num_discarded_speed > 0:
+        logger.debug(f"Post-interp velocity check: Discarded {num_discarded_speed} points.")
+    if unmatched_points_after_velocity_filter.empty:
+        logger.debug("interpolate_drift: No points remaining after velocity check."); return points_result
+        
+    points_final_interpolated = Keypoints()
+    if not unmatched_points_after_velocity_filter.empty:
+        cols_final_pixel, rows_final_pixel = img.transform_points(
+            interpolated_pos_geo_coords_after_velocity_filter_np[:, 0], 
+            interpolated_pos_geo_coords_after_velocity_filter_np[:, 1], 
+            DstToSrc=1, dst_srs=img.srs
+        )
+        
+        height, width = img[1].shape 
+
+        border = 16
+        pixel_valid_mask_np = (cols_final_pixel >= border) & (cols_final_pixel < width - border) & \
+                              (rows_final_pixel >= border) & (rows_final_pixel < height - border) & \
+                              np.isfinite(cols_final_pixel) & np.isfinite(rows_final_pixel)
+
+        final_valid_metadata_df = unmatched_points_after_velocity_filter[pixel_valid_mask_np]
+        final_valid_pixel_coords_np = np.column_stack((cols_final_pixel[pixel_valid_mask_np], rows_final_pixel[pixel_valid_mask_np]))
+        final_valid_geo_coords_np = interpolated_pos_geo_coords_after_velocity_filter_np[pixel_valid_mask_np]
+        
+        if not final_valid_metadata_df.empty:
+            base_image_id_val = points_result['image_id'].iloc[0]
+            points_final_interpolated = Keypoints.create(
+                final_valid_pixel_coords_np, 
+                [None] * len(final_valid_metadata_df), img, base_image_id_val 
+            )
+            points_final_interpolated['trajectory_id'] = final_valid_metadata_df.trajectory_id.values
+            points_final_interpolated['interpolated'] = 1
+            points_final_interpolated.geometry = gpd.points_from_xy(
+                 final_valid_geo_coords_np[:,0], final_valid_geo_coords_np[:,1], crs=points_poly.crs
+            )
+            logger.info(f"Successfully interpolated and kept {len(points_final_interpolated)} points.")
+        else:
+            logger.info("interpolate_drift: No points passed final pixel boundary checks.")
+    
+    if not points_final_interpolated.empty:
+        points_final_combined_df = pd.concat(
+            [points_result, points_final_interpolated], ignore_index=True, sort=False 
+        )
+        current_crs = points_poly.crs
+        if isinstance(points_final_combined_df, gpd.GeoDataFrame):
+            combined_gdf = points_final_combined_df.set_crs(current_crs, allow_override=True)
+        else:
+            combined_gdf = gpd.GeoDataFrame(points_final_combined_df, geometry='geometry', crs=current_crs)
+        return Keypoints._from_gdf(combined_gdf)
+    else:
+        return points_result
 
 @log_execution_time
-def compute_descriptors(keypoints, img, model, polarisation='s0_HV', normalize=True):
+def compute_descriptors(keypoints_with_tags, img, model, polarisation='s0_HV', normalize=True):
     """
     Compute descriptors for given keypoints in an image using a specified model.
 
     Parameters:
-        keypoints (list): List of keypoints to compute descriptors for.
+        keypoints_with_tags (list): List of tuples (cv2.KeyPoint, Optional[tag]) to compute descriptors for.
         img (dict): Dictionary containing image bands. Must include 's0_HH' and 's0_HV' if dual polarisation is used.
         model (object): Descriptor model with a `compute` method (e.g., OpenCV's SIFT or ORB).
-        band_name (str, optional):
-            - 's0_HH' or 's0_HV' for single polarisation.
+        polarisation (str, optional):
+            - 's0_HH' or 's0_HV' or INT for band number for single polarisation.
             - 'dual_polarisation' to compute descriptors for both 's0_HH' and 's0_HV'.
             Defaults to 's0_HV'.
 
@@ -1270,44 +1424,113 @@ def compute_descriptors(keypoints, img, model, polarisation='s0_HV', normalize=T
                 - Array of normalized descriptors for single polarisation.
                 - If dual polarisation is used, descriptors from both bands are horizontally stacked.
                 - Returns None if descriptor computation fails for any band.
+            - surviving_tags (list or None):
+                - List of tags corresponding to the keypoints that survived descriptor computation.
+                - Returns None if descriptor computation fails.
     """
+    if not keypoints_with_tags:
+        return None, None, None
+
+    # Extract raw cv2.KeyPoint objects for model.compute
+    raw_cv2_kps = [item[0] for item in keypoints_with_tags]
+
+    # Helper to find original tags for surviving keypoints
+    def get_tags_for_survivors(original_kps_with_tags_list, surviving_cv2_kps_list):
+        ordered_survivor_tags = []
+        # Create a temporary list of original (kp, tag) tuples to manage matches
+        # This helps if surviving_cv2_kps_list is not in the same order or is a subset
+        temp_originals = list(original_kps_with_tags_list)
+        
+        for surv_kp in surviving_cv2_kps_list:
+            found_match = False
+            for i, (orig_kp, orig_tag) in enumerate(temp_originals):
+                # Compare points using a small tolerance
+                if np.allclose(surv_kp.pt, orig_kp.pt, atol=0.5):
+                    ordered_survivor_tags.append(orig_tag)
+                    temp_originals.pop(i) # Remove found match to avoid re-matching
+                    found_match = True
+                    break
+            if not found_match:
+                # This case implies a surviving keypoint from model.compute() did not match any original input keypoint
+                # based on .pt comparison, or its .pt was significantly altered.
+                logger.warning(f"compute_descriptors: Could not find original tag for a surviving keypoint at {surv_kp.pt}. Appending None as tag.")
+                ordered_survivor_tags.append(None)
+        
+        if len(ordered_survivor_tags) != len(surviving_cv2_kps_list):
+             logger.error(f"compute_descriptors: Tag mapping length mismatch. Survivors: {len(surviving_cv2_kps_list)}, Tags found: {len(ordered_survivor_tags)}")
+             # This is a critical issue, potentially return all Nones or raise
+             return [None] * len(surviving_cv2_kps_list) # Fallback
+        return ordered_survivor_tags
 
     if polarisation == 'dual_polarisation':
-        # Compute descriptors for 's0_HH'
         img_hh = img['s0_HH'].copy()
         img_hh[np.isnan(img_hh)] = 0
-        keypoints_output_hh, descriptors_hh = model.compute(img_hh, keypoints)
-        if descriptors_hh is None:
-            return None, None
-        rawkeypoints = np.array([kp.pt for kp in keypoints_output_hh])
+        keypoints_output_hh, descriptors_hh = model.compute(img_hh, raw_cv2_kps) # Pass raw kps
+        if descriptors_hh is None or not keypoints_output_hh: # Check if keypoints_output_hh is empty
+            return None, None, None
+        
+        rawkeypoints_coords = np.array([kp.pt for kp in keypoints_output_hh])
         if normalize:
             descriptors_hh = descriptors_hh - descriptors_hh.mean(axis=1, keepdims=True)
 
         # Compute descriptors for 's0_HV'
+        # For HV, we need to compute descriptors for the SAME keypoints that survived HH.
+        # So, we pass keypoints_output_hh to the second compute call.
         img_hv = img['s0_HV'].copy()
         img_hv[np.isnan(img_hv)] = 0
-        _, descriptors_hv = model.compute(img_hv, keypoints)
+        # keypoints_output_hv should ideally be the same as keypoints_output_hh if all succeed for HV.
+        # If model.compute filters keypoints, this ensures consistency.
+        keypoints_output_hv, descriptors_hv = model.compute(img_hv, keypoints_output_hh)
         if descriptors_hv is None:
-            return None, None
+            return None, None, None # Return three values
+        
+        # The keypoints_output_hh are the survivors from the HH pass.
+        # Now compute HV descriptors for *these specific survivors*.
+        img_hv = img['s0_HV'].copy()
+        img_hv[np.isnan(img_hv)] = 0
+        # Pass keypoints_output_hh (survivors from HH) to HV computation
+        # _ (ignored returned keypoints for HV), descriptors_hv
+        # model.compute should ideally not filter keypoints_output_hh further if it's just computing descriptors.
+        # If it does, it means some of keypoints_output_hh didn't get an HV descriptor.
+        keypoints_output_hv_check, descriptors_hv = model.compute(img_hv, keypoints_output_hh) 
+
+        if descriptors_hv is None:
+            return None, None, None # Failed to get HV descriptors for the HH survivors
+
+        # Critical check: Ensure descriptors_hv corresponds to keypoints_output_hh
+        # If model.compute for HV somehow returned fewer keypoints than keypoints_output_hh,
+        # we have a mismatch. For now, assume it returns descriptors for all inputs if successful.
+        if len(descriptors_hh) != len(descriptors_hv):
+            logger.error(f"Dual-pol descriptor length mismatch: HH ({len(descriptors_hh)}), HV ({len(descriptors_hv)}) "
+                         f"for {len(keypoints_output_hh)} input HH survivors. This indicates an issue.")
+            return None, None, None
+
+
         if normalize:
+            descriptors_hh = descriptors_hh - descriptors_hh.mean(axis=1, keepdims=True)
             descriptors_hv = descriptors_hv - descriptors_hv.mean(axis=1, keepdims=True)
 
-        # Stack descriptors horizontally
         descriptors = np.hstack([descriptors_hh, descriptors_hv])
+        
+        # Get tags for the keypoints that survived the HH pass (keypoints_output_hh)
+        surviving_tags = get_tags_for_survivors(keypoints_with_tags, keypoints_output_hh)
+        
+        return rawkeypoints_coords, descriptors, surviving_tags
 
-        return rawkeypoints, descriptors
-
-    else:
-        # Single Polarisation Processing
+    else: # Single band processing
         img_band = img[polarisation].copy()
         img_band[np.isnan(img_band)] = 0
-        keypoints_output, descriptors = model.compute(img_band, keypoints)
-        if descriptors is None:
-            return None, None
-        rawkeypoints = np.array([kp.pt for kp in keypoints_output])
+        keypoints_output, descriptors = model.compute(img_band, raw_cv2_kps)
+        if descriptors is None or not keypoints_output:
+            return None, None, None
+            
+        rawkeypoints_coords = np.array([kp.pt for kp in keypoints_output])
         if normalize:
             descriptors = descriptors - descriptors.mean(axis=1, keepdims=True)
-        return rawkeypoints, descriptors
+            
+        surviving_tags = get_tags_for_survivors(keypoints_with_tags, keypoints_output)
+        
+        return rawkeypoints_coords, descriptors, surviving_tags
 
 @log_execution_time
 def extract_templates(points, img, band='s0_HV', hs=TEMPLATE_SIZE):
@@ -1387,12 +1610,13 @@ def append_templates(templates, templates_new, template_new_idx, points, templat
             dims=("trajectory_id", "height", "width"),
             coords={
                 "trajectory_id": new_trajectory_ids,
+                "time": ("trajectory_id", points['time'].iloc[template_new_idx[is_new]].values),
                 "height": np.arange(height),
                 "width": np.arange(width),
             },
         )
         # Append new templates
-        logger.info(f"Adding {new_data.shape[0]} new templates")
+        logger.debug(f"Adding {new_data.shape[0]} new templates")
         templates = xr.concat([templates, new_data], dim="trajectory_id")
     return templates
 
@@ -1419,139 +1643,217 @@ def update_templates(templates, templates_new, template_new_idx, points):
     if np.any(is_existing):
         update_templates_array = templates_new[is_existing]
         update_trajectory_ids = trajectory_ids[is_existing]
-        logger.info(f"Updating {update_trajectory_ids.shape[0]} templates")
-        # Update existing templates
+        logger.debug(f"Updating {update_trajectory_ids.shape[0]} templates")
+        current_time = points['time'].iloc[template_new_idx[is_existing]].iloc[0] # Get time from points df
+        templates['time'].loc[dict(trajectory_id=update_trajectory_ids)] = current_time
+        # Then update the template data itself
         templates.loc[dict(trajectory_id=update_trajectory_ids)] = update_templates_array
     return templates
 
 @log_execution_time
-def pattern_matching(points, img, templates, points_fg1, band='s0_HV', hs=16, border=16):
+def pattern_matching(
+    points: gpd.GeoDataFrame,
+    img,                                 
+    templates: xr.DataArray,             
+    points_fg1: gpd.GeoDataFrame,         
+    band: str = 's0_HV',
+    hs: int = 16,
+    border_matched: int = 16,
+    border_interpolated: int = 32
+):
     """
-    Perform pattern matching on a single image band with template rotation search
+    Perform pattern matching on a single image band with template rotation search.
+    Uses 'points_fg1' to get the angle of the point in the PREVIOUS frame.
+    Uses a larger search border for points marked as 'interpolated' (flag in 'points' GDF).
 
     Parameters:
-        points: GeoDataFrame containing point geometries.
-        img: Image object with band data and transformation methods.
-        templates: Collection of templates corresponding to each point.
-        points_fg1: DataFrame with angle information for each point.
-        band (str): The image band to use for matching (default 's0_HV').
-        hs (int): Half-size of the template.
-        border (int): Border size added to the search window.
+        points (gpd.GeoDataFrame): Current estimated point locations. Must contain 'trajectory_id' and 'interpolated' flag.
+        img (Image): Current image object.
+        templates (xr.DataArray): Templates indexed by trajectory_id.
+        points_fg1 (gpd.GeoDataFrame): Points from the previous frame, containing 'trajectory_id' and 'angle'.
+        band (str): Image band for matching.
+        hs (int): Template half-size.
+        border_matched (int): Default search border padding.
+        border_interpolated (int): Larger search border padding for interpolated points.
 
     Returns:
-        tuple: A tuple containing:
-            - corrected_positions_xy (numpy.ndarray): Array of corrected (x, y) positions.
-            - corrected_positions_colsrows (numpy.ndarray): Array of corrected pixel coordinates.
-            - correlation_values (numpy.ndarray): Array of correlation scores for each match.
+        tuple: (corrected_positions_xy, corrected_positions_colsrows, correlation_values)
     """
     mtype = cv2.TM_CCOEFF_NORMED
+    image_band_data = img[band]
 
-    pc = ccrs.PlateCarree()
-    nps = ccrs.NorthPolarStereo(central_longitude=-45, true_scale_latitude=70)
-    x, y = points.geometry.x.values, points.geometry.y.values
-    
-    if points.crs == img.srs:
-        colsrows = np.array(img.transform_points(x, y, DstToSrc=1)).T
-    else:
-        lon, lat, _ = pc.transform_points(nps, x, y).T
-        colsrows = np.array(img.transform_points(lon, lat, DstToSrc=1)).T
-    image_1 = img[band]
+    pc_crs_pm = ccrs.PlateCarree()
+    nps_crs_pm = ccrs.NorthPolarStereo(central_longitude=-45, true_scale_latitude=70)
 
-    # Define rotation angles to test as a simple list
+    try:
+        # Get pixel coordinates for the *current* estimated positions in 'points'
+        x_proj_all = points.geometry.x.values
+        y_proj_all = points.geometry.y.values
+        transformed_to_geo_all = pc_crs_pm.transform_points(nps_crs_pm, x_proj_all, y_proj_all)
+        lons_all = transformed_to_geo_all[:, 0]
+        lats_all = transformed_to_geo_all[:, 1]
+        cols_all, rows_all = img.transform_points(lons_all, lats_all, DstToSrc=1)
+        valid_transform_mask = np.isfinite(cols_all) & np.isfinite(rows_all)
+        if not np.all(valid_transform_mask):
+            logger.warning(f"Pattern Matching: {np.sum(~valid_transform_mask)} points had non-finite pixel coords.")
+    except Exception as e_transform_all:
+        logger.error(f"Pattern Matching: Error during bulk coordinate transformation for current points: {e_transform_all}")
+        n_pts = len(points)
+        return np.full((n_pts, 2), np.nan), np.full((n_pts, 2), np.nan), np.full(n_pts, -1.0)
+
+    colsrows = np.column_stack((cols_all, rows_all)) # Pixel coords for 'points'
+
     rotation_angles = [0, -15, 15, -30, 30]
-    
-    # Correlation threshold for early exit
-    correlation_threshold = 0.65
+    early_exit_correlation_threshold = 0.65 # If a rotation gives this, stop searching more rotations
 
-    # Prepare all arguments for processing keypoints
-    all_args = [
-        (i, (colsrows[i][0], colsrows[i][1]),
-         points_fg1['angle'].iloc[i] - img.angle,
-         templates[i])
-        for i in range(len(colsrows))
-    ]
+    results_list = []
 
-    results = []
+    prev_angle_map = {}
+    if points_fg1 is not None and not points_fg1.empty and 'trajectory_id' in points_fg1.columns and 'angle' in points_fg1.columns:
+        unique_prev_states = points_fg1.drop_duplicates(subset=['trajectory_id'], keep='first')
+        prev_angle_map = pd.Series(unique_prev_states.angle.values, index=unique_prev_states.trajectory_id).to_dict()
 
-    for args in all_args:
-        i, (c1, r1), angle_diff, template = args
 
-        # Check dimensions first (quick failure)
-        c1_int, r1_int = int(c1), int(r1)
-        sub_img = image_1[r1_int-hs-border : r1_int+hs+1+border, c1_int-hs-border : c1_int+hs+1+border]
+    for i in range(len(points)):
+        point_row = points.iloc[i] # This is from 'points' (current estimates)
+        current_tid = point_row.trajectory_id
 
-        if template.shape != (hs * 2 + 1, hs * 2 + 1) or \
-           sub_img.shape != (hs * 2 + 1 + border * 2, hs * 2 + 1 + border * 2):
-            results.append(([0, 0], 0.0, 0.0))
+        c1_initial, r1_initial = colsrows[i, 0], colsrows[i, 1]
+
+        if not valid_transform_mask[i]:
+            results_list.append((([0, 0], -1.0, 0.0)))
             continue
 
-        template_np = template.to_numpy().astype(np.uint8)
+        # Determine the effective border size for this point
+        current_border = border_matched
+        # Use a larger border if the point is interpolated
+        if 'interpolated' in point_row and point_row['interpolated'] == 1:
+            current_border = border_interpolated
 
-        # Variables to track best match
-        best_corr = -1
-        best_dc = 0
-        best_dr = 0
-        best_rotation = 0.0
+        # Get the previous angle for this trajectory_id from the map created from points_fg1
+        angle_prev_for_tid = prev_angle_map.get(current_tid, None)
 
-        # Process each rotation angle in sequence
-        for angle_offset in rotation_angles:
-            # Calculate the actual rotation angle
-            rotation_angle = angle_diff + angle_offset
+        angle_diff = angle_prev_for_tid - img.angle
+
+        try:
+            # Select template based on current_tid
+
+            template_data_array = templates.sel(trajectory_id=current_tid)
+            # Ensure it's not an empty selection and convert to NumPy
+            if template_data_array.trajectory_id.size == 0: # Check if selection is empty
+                 raise KeyError(f"Template for TID {current_tid} resulted in empty selection.")
+            template_np = template_data_array.data.astype(np.uint8)
+        except KeyError:
+            # logger.warning(f"Pattern Matching: Template not found for TID {current_tid}. Skipping.")
+            results_list.append((([0, 0], -1.0, 0.0)))
+            continue
+        
+        if template_np.shape != (hs * 2 + 1, hs * 2 + 1):
+            # logger.warning(f"Pattern Matching: Template for TID {current_tid} has unexpected shape {template_np.shape}. Expected ({hs*2+1}, {hs*2+1}). Skipping.")
+            results_list.append( ([0, 0], -1.0, 0.0) )
+            continue
+
+        r1_int, c1_int = int(r1_initial), int(c1_initial)
+        # Use current_border to define search sub-image
+        r_start_search = r1_int - hs - current_border
+        r_end_search = r1_int + hs + 1 + current_border
+        c_start_search = c1_int - hs - current_border
+        c_end_search = c1_int + hs + 1 + current_border
+
+        # Check if search window is within image bounds
+        if not (r_start_search >= 0 and r_end_search <= image_band_data.shape[0] and \
+                c_start_search >= 0 and c_end_search <= image_band_data.shape[1]):
+            results_list.append((([0, 0], -1.0, 0.0)))
+            continue
             
-            # Early exit if we already found a good enough match
-            if best_corr >= correlation_threshold:
-                break
+        sub_img = image_band_data[r_start_search:r_end_search, c_start_search:c_end_search]
+
+        # Expected shape of sub_img uses current_border
+        expected_sub_img_shape = (hs * 2 + 1 + current_border * 2, hs * 2 + 1 + current_border * 2)
+        if sub_img.shape != expected_sub_img_shape:
+            logger.warning(f"Pattern Matching: Extracted sub_img for TID {current_tid} has shape {sub_img.shape}, expected {expected_sub_img_shape}. Skipping.")
+            results_list.append((([0, 0], -1.0, 0.0)))
+            continue
+
+        best_corr_for_point = -1.0 # Initialize with a value lower than any possible correlation
+        best_dc_for_point = 0
+        best_dr_for_point = 0
+        best_rotation_offset_for_point = 0.0
+
+        for angle_offset in rotation_angles:
+            current_rotation_to_apply = angle_diff + angle_offset
+            
+            if best_corr_for_point >= early_exit_correlation_threshold and angle_offset != 0 : # check 0 rot first
+                break 
                 
-            # Special case for no rotation (angle_offset = 0)
-            if angle_offset == 0:
-                # Use the original template without rotation
-                result = cv2.matchTemplate(sub_img, template_np, mtype)
+            if abs(current_rotation_to_apply) < 1e-3:
+                rotated_template = template_np
+                result_match = cv2.matchTemplate(sub_img, rotated_template, mtype)
             else:
-                # Rotate the template
-                h, w = template_np.shape
-                center = (w // 2, h // 2)
-                M = cv2.getRotationMatrix2D(center, rotation_angle, 1.0)
-                rotated_template = cv2.warpAffine(template_np, M, (w, h))
-                mask = (rotated_template > 0).astype(np.uint8)
-                result = cv2.matchTemplate(sub_img, rotated_template, mtype, mask=mask)
-                
-                        # Find the maximum correlation and its position
-            mccr, mccc = np.unravel_index(result.argmax(), result.shape)
-            mcc = result[mccr, mccc]
+                h_t, w_t = template_np.shape
+                center_t = (w_t // 2, h_t // 2)
+                M = cv2.getRotationMatrix2D(center_t, current_rotation_to_apply, 1.0)
+                rotated_template = cv2.warpAffine(template_np, M, (w_t, h_t))
+                # Create mask for rotated template to handle empty areas after rotation
+                mask = (rotated_template > 0).astype(np.uint8) # Simple mask, assumes 0 is background
+                if np.sum(mask) < (0.5 * h_t * w_t): # If less than 50% of template is valid after rotation
+                    continue # Skip this rotation if too much of template is lost
+                result_match = cv2.matchTemplate(sub_img, rotated_template, mtype, mask=mask)
+            
+            _, current_max_corr, _, max_loc_in_result = cv2.minMaxLoc(result_match)
 
-            # Update best match if this is better
-            if mcc > best_corr:
-                best_corr = mcc
-                best_dc = mccc - border
-                best_dr = mccr - border
-                best_rotation = angle_offset
-                
-            # Fast exit for high correlation during first (no rotation) check
-            if angle_offset == 0 and mcc > correlation_threshold:
-                break
+            if current_max_corr > best_corr_for_point:
+                best_corr_for_point = current_max_corr
+                # Correction is from center of search window to center of matched template
+                best_dc_for_point = (max_loc_in_result[0] + hs) - (hs + current_border)
+                best_dr_for_point = (max_loc_in_result[1] + hs) - (hs + current_border)
+                best_rotation_offset_for_point = m_offset # Store the offset that gave the best result
+            
+            if angle_offset == 0 and best_corr_for_point >= early_exit_correlation_threshold:
+                break # Early exit if non-rotated version is already good enough
 
-        results.append(([best_dc, best_dr], best_corr, best_rotation))
+        results_list.append( (([best_dc_for_point, best_dr_for_point], best_corr_for_point, best_rotation_offset_for_point)) )
 
     # Unpack results
-    corrections, correlation_values, rotation_found = zip(*results)
-    corrections = np.array(corrections)
-    correlation_values = np.array(correlation_values)
+    if not results_list: # Should not happen if len(points) > 0
+        n_pts = len(points)
+        return np.full((n_pts, 2), np.nan), np.full((n_pts, 2), np.nan), np.full(n_pts, -1.0)
 
-    # Calculate corrected positions
-    corrected_colsrows = corrections + colsrows
-    x_corr, y_corr = img.transform_points(
-        corrected_colsrows[:, 0], corrected_colsrows[:, 1],
-        DstToSrc=0, dst_srs=NSR(3413)
-    )
+    corrections_rc_list, correlation_values_list, rotation_found_list = zip(*results_list)
+    
+    corrections_rc_np = np.array(corrections_rc_list) # Nx2 array of (dc, dr) pixel corrections
+    correlation_values_np = np.array(correlation_values_list)
+    rotation_offset_found_np = np.array(rotation_found_list)
 
-    corrected_positions_xy = np.column_stack((x_corr, y_corr))
+    # Initial pixel coordinates (before correction)
+    initial_colsrows_np = colsrows # This is from all points passed to the function
+
+    # Corrected pixel positions (col, row)
+    corrected_colsrows_np = initial_colsrows_np + corrections_rc_np
+
+    # Convert corrected pixel positions back to projected XY coordinates
+    try:
+        x_corr_proj, y_corr_proj = img.transform_points(
+            corrected_colsrows_np[:, 0], corrected_colsrows_np[:, 1],
+            DstToSrc=0, dst_srs=img.srs
+        )
+        corrected_positions_xy_np = np.column_stack((x_corr_proj, y_corr_proj))
+    except Exception as e_final_transform:
+        logger.error(f"Pattern Matching: Error transforming corrected pixel coords to projected: {e_final_transform}")
+        # Fill with NaNs if final transform fails
+        corrected_positions_xy_np = np.full((len(points), 2), np.nan)
+
 
     # Log statistics
-    rotation_array = np.array(rotation_found)
-    logger.info(f"Rotation stats - Mean: {np.mean(rotation_array):.2f}°, "
-                f"Std: {np.std(rotation_array):.2f}°, "
-                f"Max: {np.max(np.abs(rotation_array)):.2f}°")
-    logger.info(f"Correlation stats - Mean: {np.mean(correlation_values):.4f}, "
-                f"Min: {np.min(correlation_values):.4f}")
+    valid_correlations_for_stats = correlation_values_np[np.isfinite(correlation_values_np) & (correlation_values_np > -1.0)]
+    if len(valid_correlations_for_stats) > 0:
+        matched_mask_for_stats = np.isfinite(correlation_values_np) & (correlation_values_np > -1.0)
+        rotation_stats = rotation_offset_found_np[matched_mask_for_stats] # Use only for matched points
+        logger.debug(f"Rotation Offset Stats (for matched) - Mean: {np.mean(rotation_stats):.2f}°, "
+                    f"Std: {np.std(rotation_stats):.2f}°")
+        logger.debug(f"Correlation Stats (for matched) - Mean: {np.mean(valid_correlations_for_stats):.4f}, "
+                    f"Min: {np.min(valid_correlations_for_stats):.4f}, Max: {np.max(valid_correlations_for_stats):.4f}")
+    else:
+        logger.info("Pattern Matching: No valid correlations found to report stats.")
 
-    return corrected_positions_xy, corrected_colsrows, correlation_values
+    return corrected_positions_xy_np, corrected_colsrows_np, correlation_values_np

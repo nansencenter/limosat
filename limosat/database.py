@@ -14,7 +14,7 @@ import os
 import json
 import numpy as np
 import pandas as pd 
-from sqlalchemy import text, Float, Text, DateTime
+from sqlalchemy import text, Float, Text, DateTime, inspect
 from .utils import logger, log_execution_time 
 
 class DriftDatabase:
@@ -49,10 +49,10 @@ class DriftDatabase:
     def save(self, points, templates, last_persisted_id, insitu_points=None):
         if points.empty:
              logger.info("No points to save.")
-             if templates is not None and templates.trajectory_id.size > 0 and self.zarr_path: # Corrected template empty check
+             if templates is not None and templates.trajectory_id.size > 0 and self.zarr_path:
                  try:
                       logger.info("Saving empty points state, but saving templates...")
-                      templates.to_dataset(name="template_data").to_zarr(self.zarr_path, mode="w") # Original template save
+                      templates.to_dataset(name="template_data").to_zarr(self.zarr_path, mode="w")
                       logger.info(f"Successfully persisted {templates.trajectory_id.size} templates (with 0 new points).")
                       return True
                  except Exception as e:
@@ -70,14 +70,14 @@ class DriftDatabase:
 
             if points_delta.empty:
                 logger.info("No new points detected since last save.")
-                if templates is not None and templates.trajectory_id.size > 0 and self.zarr_path: # Corrected template empty check
+                if templates is not None and templates.trajectory_id.size > 0 and self.zarr_path:
                     logger.info("Saving templates only (no new points).")
-                    templates.to_dataset(name="template_data").to_zarr(self.zarr_path, mode="w") # Original template save
+                    templates.to_dataset(name="template_data").to_zarr(self.zarr_path, mode="w") 
                     return True
                 return True
 
             logger.info(f"Processing {len(points_delta)} new/updated points for persistence.")
-            points_delta = points_delta.set_crs('EPSG:3413') # Your original handling
+            points_delta = points_delta.set_crs('EPSG:3413')
             if 'descriptors' in points_delta.columns:
                  points_delta['descriptors'] = points_delta['descriptors'].apply(self._serialize_descriptors)
 
@@ -86,7 +86,8 @@ class DriftDatabase:
                     updated_traj_ids = points_delta['trajectory_id'].unique().tolist()
                     updated_traj_ids = [int(tid) for tid in updated_traj_ids if pd.notna(tid)]
 
-                    if updated_traj_ids:
+                    inspector = inspect(connection.engine) # Use the engine from the connection
+                    if updated_traj_ids and inspector.has_table(self.run_name, schema=connection.dialect.default_schema_name):
                         update_sql = text(f"""
                             UPDATE {self.run_name}
                             SET is_last = 0
@@ -94,6 +95,9 @@ class DriftDatabase:
                         """)
                         result = connection.execute(update_sql, {"traj_ids": updated_traj_ids})
                         logger.debug(f"Updated is_last=0 for {result.rowcount} previous points in DB.")
+                    elif updated_traj_ids:
+                        # This condition is met on the very first save operation for this run_name
+                        logger.debug(f"Table '{self.run_name}' does not exist yet or is empty. Skipping initial 'is_last' update.")
 
                     points_delta.to_postgis(
                         self.run_name,
@@ -104,7 +108,7 @@ class DriftDatabase:
                     )
                     logger.debug(f"Appended {len(points_delta)} points to database.")
 
-            if templates is not None and templates.trajectory_id.size > 0: # Corrected template empty check
+            if templates is not None and templates.trajectory_id.size > 0:
                 templates_to_save = templates.copy()
                 if hasattr(templates_to_save, 'encoding') and 'chunks' in templates_to_save.encoding:
                     del templates_to_save.encoding['chunks']
@@ -156,7 +160,8 @@ class DriftDatabase:
         validation_data.to_file(output_file, driver='GeoJSON')
         logger.info(f"Saved validation metadata to {output_file}")
 
-    def deserialize_descriptors(self, json_string):
+    @staticmethod
+    def deserialize_descriptors(json_string):
         """
         Deserialize a JSON string back into a numpy array of descriptors.
         """
