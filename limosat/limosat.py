@@ -71,6 +71,7 @@ class ImageProcessor:
                  octave=OCTAVE,
                  min_correlation=MIN_CORRELATION,
                  response_threshold=RESPONSE_THRESHOLD,
+                 template_size=TEMPLATE_SIZE,
                  use_interpolation=True,
                  max_interpolation_time_gap_hours= MAX_INTERPOLATION_TIME_GAP_HOURS,
                  return_insitu_points_on_completion=False
@@ -99,6 +100,7 @@ class ImageProcessor:
         self.octave = octave
         self.max_interpolation_time_gap_hours = max_interpolation_time_gap_hours
         self.return_insitu_points_on_completion = return_insitu_points_on_completion
+        self.template_size = template_size
         
         # Initialize the KeypointDetector
         self.keypoint_detector = KeypointDetector(model=model)
@@ -313,17 +315,18 @@ class ImageProcessor:
                     logger.warning(f"Mismatch between surviving_tags ({len(surviving_tags)}) and "
                                    f"appended_points_gdf_reset ({len(appended_points_gdf_reset)}). Skipping insitu linking for this batch.")
 
-            templates_new, template_new_idx = extract_templates(appended_points_gdf, img, band=1, hs=TEMPLATE_SIZE)
+            templates_new, template_new_idx = extract_templates(appended_points_gdf, img, band=1, hs=self.template_size)
             self.templates = append_templates(
                 self.templates,
                 templates_new,
                 template_new_idx,
-                points_new
+                points_new,
+                template_shape=self.template_size*2+1
             )
 
         if len(points_final) > 0:
             self.points = self.points.update(points_final)
-            templates_final, template_final_idx = extract_templates(points_final, img, band=1, hs=TEMPLATE_SIZE)
+            templates_final, template_final_idx = extract_templates(points_final, img, band=1, hs=self.template_size)
             self.templates = update_templates(
                 self.templates,
                 templates_final,
@@ -441,6 +444,7 @@ class ImageProcessor:
             img,
             templates_all,
             points_orig,
+            hs=self.template_size,
             border_matched=self.border_matched,
             border_interpolated=self.border_interpolated,
             band=1
@@ -521,7 +525,7 @@ class ImageProcessor:
 
         # Update templates ONLY for the points that survived the descriptor check
         if not valid_points.empty:
-            new_templates, new_template_idx = extract_templates(valid_points, img, hs=TEMPLATE_SIZE, band=1)
+            new_templates, new_template_idx = extract_templates(valid_points, img, hs=self.template_size, band=1)
             # Check if extract_templates returned valid indices matching remaining points
             if len(new_template_idx) == len(valid_points):
                  self.templates = update_templates(self.templates, new_templates, new_template_idx, valid_points)
@@ -1582,7 +1586,7 @@ def extract_templates(points, img, band='s0_HV', hs=TEMPLATE_SIZE):
     return np.array(templates), np.array(ids)
 
 @log_execution_time
-def append_templates(templates, templates_new, template_new_idx, points, template_shape=TEMPLATE_SIZE*2+1):
+def append_templates(templates, templates_new, template_new_idx, points, template_shape=TEMPLATE_SIZE):
     """
     Append new templates to the templates DataArray.
 
