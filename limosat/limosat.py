@@ -632,12 +632,9 @@ class Image(Nansat):
         corners_nx_meters, corners_ny_meters = super().transform_points(cols, rows, DstToSrc=0, dst_srs=self.srs)
 
         # Construct coordinates in the required order to form a polygon (e.g., clockwise or counter-clockwise)
-        # Nansat corners are typically UL, UR, LR, LL. Polygon needs ordered vertices.
-        # Assuming standard corner order: 0:UL, 1:UR, 2:LR, 3:LL
-        # A common ordering for Polygon is clockwise: UL, UR, LR, LL
         coords = np.vstack([
-        corners_nx_meters[[0, 2, 3, 1]],
-        corners_ny_meters[[0, 2, 3, 1]]
+            corners_nx_meters[[0, 2, 3, 1]],
+            corners_ny_meters[[0, 2, 3, 1]]
         ]).T
 
         # Create and return the polygon
@@ -817,9 +814,13 @@ class KeypointDetector:
             list: List of tuples (cv2.KeyPoint, None)
         """
         img0 = img[1]
-        landmask = img[2]
-        img0[landmask == 2] = 0
         img0[np.isnan(img0)] = 0
+        
+        # TODO: generalise preprocessing to create boolean landmask
+        if img.bands().get(2, {'name': 'none'}).get('name') == 'mask':
+            landmask = img[2]
+            img0[landmask == 2] = 0
+
         if step is None:
             step = window_size
 
@@ -919,6 +920,11 @@ class KeypointDetector:
         # Get image data and replace NaNs with zero
         img0 = img[1]
         img0[np.isnan(img0)] = 0
+        
+        # TODO: generalise preprocessing to create boolean landmask
+        if img.bands().get(2, {'name': 'none'}).get('name') == 'mask':
+            landmask = img[2]
+            img0[landmask == 2] = 0
 
         # Generate grid keypoints
         keypoints = []
@@ -1361,7 +1367,7 @@ def interpolate_drift(points_poly, points_fg1, points_fg2, img,
             DstToSrc=1, dst_srs=img.srs
         )
         
-        height, width = img[1].shape 
+        height, width = img.shape()
 
         border = 16
         pixel_valid_mask_np = (cols_final_pixel >= border) & (cols_final_pixel < width - border) & \
@@ -1576,7 +1582,7 @@ def extract_templates(points, img, band='s0_HV', hs=TEMPLATE_SIZE):
     return np.array(templates), np.array(ids)
 
 @log_execution_time
-def append_templates(templates, templates_new, template_new_idx, points, template_shape=33):
+def append_templates(templates, templates_new, template_new_idx, points, template_shape=TEMPLATE_SIZE*2+1):
     """
     Append new templates to the templates DataArray.
 
@@ -1657,7 +1663,7 @@ def pattern_matching(
     templates: xr.DataArray,             
     points_fg1: gpd.GeoDataFrame,         
     band: str = 's0_HV',
-    hs: int = 16,
+    hs: int = TEMPLATE_SIZE,
     border_matched: int = 16,
     border_interpolated: int = 32
 ):
@@ -1765,7 +1771,7 @@ def pattern_matching(
                 c_start_search >= 0 and c_end_search <= image_band_data.shape[1]):
             results_list.append((([0, 0], -1.0, 0.0)))
             continue
-            
+
         sub_img = image_band_data[r_start_search:r_end_search, c_start_search:c_end_search]
 
         # Expected shape of sub_img uses current_border
@@ -1782,7 +1788,7 @@ def pattern_matching(
 
         for angle_offset in rotation_angles:
             current_rotation_to_apply = angle_diff + angle_offset
-            
+
             if best_corr_for_point >= early_exit_correlation_threshold and angle_offset != 0 : # check 0 rot first
                 break 
                 
@@ -1799,7 +1805,7 @@ def pattern_matching(
                 if np.sum(mask) < (0.5 * h_t * w_t): # If less than 50% of template is valid after rotation
                     continue # Skip this rotation if too much of template is lost
                 result_match = cv2.matchTemplate(sub_img, rotated_template, mtype, mask=mask)
-            
+
             _, current_max_corr, _, max_loc_in_result = cv2.minMaxLoc(result_match)
 
             if current_max_corr > best_corr_for_point:
@@ -1807,7 +1813,7 @@ def pattern_matching(
                 # Correction is from center of search window to center of matched template
                 best_dc_for_point = (max_loc_in_result[0] + hs) - (hs + current_border)
                 best_dr_for_point = (max_loc_in_result[1] + hs) - (hs + current_border)
-                best_rotation_offset_for_point = m_offset # Store the offset that gave the best result
+                best_rotation_offset_for_point = angle_offset # Store the offset that gave the best result
             
             if angle_offset == 0 and best_corr_for_point >= early_exit_correlation_threshold:
                 break # Early exit if non-rotated version is already good enough
