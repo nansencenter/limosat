@@ -389,6 +389,7 @@ class ImageProcessor:
                 img=img,
                 max_interpolation_time_gap_hours=self.max_interpolation_time_gap_hours,
                 model_type=AffineTransform,
+                border_size=self.border_size
                 )
             if points_combined is None or points_combined.empty:
                  logger.warning("Interpolation resulted in no valid points. Proceeding with only matched points.")
@@ -1259,7 +1260,8 @@ def interpolate_drift(points_poly, points_fg1, points_fg2, img,
                                         max_interpolation_time_gap_hours,
                                         model_type=AffineTransform,
                                         max_interpolation_speed_m_per_day=50000,
-                                        max_anchor_distance_km=20.0 
+                                        max_anchor_distance_km=20.0,
+                                        border_size=BORDER_SIZE
                                         ):
     points_result = points_fg2.copy()
     points_result['interpolated'] = 0 
@@ -1373,9 +1375,8 @@ def interpolate_drift(points_poly, points_fg1, points_fg2, img,
         
         height, width = img.shape()
 
-        border = 16
-        pixel_valid_mask_np = (cols_final_pixel >= border) & (cols_final_pixel < width - border) & \
-                              (rows_final_pixel >= border) & (rows_final_pixel < height - border) & \
+        pixel_valid_mask_np = (cols_final_pixel >= border_size) & (cols_final_pixel < width - border_size) & \
+                              (rows_final_pixel >= border_size) & (rows_final_pixel < height - border_size) & \
                               np.isfinite(cols_final_pixel) & np.isfinite(rows_final_pixel)
 
         final_valid_metadata_df = unmatched_points_after_velocity_filter[pixel_valid_mask_np]
