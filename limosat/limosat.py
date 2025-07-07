@@ -28,6 +28,7 @@ from matplotlib import pyplot as plt
 from skimage.util import view_as_windows
 from skimage.transform import AffineTransform
 from nansat import Nansat, NSR
+from matplotlib.tri import Triangulation
 
 # Constants for commonly used values
 CANDIDATE_SEARCH_MAX_DAILY_DRIFT_M_PER_DAY = 10000
@@ -451,24 +452,53 @@ class ImageProcessor:
             band=1
         )
 
-        # Remove points below the correlation threshold
+        # correlation filter
         points_combined['corr'] = corr_values
-        valid_mask = corr_values >= self.min_correlation
-        # Ensure we handle the case where NO points pass the correlation threshold
-        if not np.any(valid_mask):
-             logger.debug(f"No points passed the correlation threshold of {self.min_correlation}. Returning empty.")
+        correlation_mask = corr_values >= self.min_correlation
+        
+        if not np.any(correlation_mask):
+             logger.debug(f"No points passed correlation threshold of {self.min_correlation}. Returning empty.")
              return Keypoints()
 
-        valid_points = points_combined[valid_mask].copy()
-        valid_corrected_rc = keypoints_corrected_rc[valid_mask]
-        # Assign geometry using the index from valid_points to align correctly
+        # prepare inputs to filter triangles with negative area
+        points_prefiltered = points_combined[correlation_mask].copy()
+        xy_prefiltered = keypoints_corrected_xy[correlation_mask]
+        rc_prefiltered = keypoints_corrected_rc[correlation_mask]
+        orig_geom = points_orig[['trajectory_id', 'geometry']].rename(columns={'geometry': 'geometry_orig'})
+        aligned_points = pd.merge(points_prefiltered, orig_geom, on='trajectory_id', how='left')
+        
+        x0 = aligned_points.geometry_orig.x.to_numpy()
+        y0 = aligned_points.geometry_orig.y.to_numpy()
+        x1_raw = xy_prefiltered[:, 0]
+        y1_raw = xy_prefiltered[:, 1]
+        
+        # perform triangulation, masking, and interpolation
+        tri = Triangulation(x0, y0)
+        x1m, y1m, _ = mask_bad_vectors(x0, y0, x1_raw, y1_raw, tri.triangles)
+
+        # Create a final validity mask for points that survived the geometric filter
+        final_valid_mask = ~np.isnan(x1m)
+        
+        if not np.any(final_valid_mask):
+            logger.info("Triangulation filter removed all remaining points.")
+            return Keypoints()
+            
+        logger.info(f"Triangulation filter kept {np.sum(final_valid_mask)}/{len(aligned_points)} points.")
+        
+        # apply mask to create the final points
+        valid_points = aligned_points[final_valid_mask].copy()
+        valid_corrected_rc = rc_prefiltered[final_valid_mask]
+        final_corrected_xy = np.column_stack((x1m[final_valid_mask], y1m[final_valid_mask]))
+        
+
+        # 8. Assign final geometry and clean up temporary columns
+        valid_points = valid_points.drop(columns=['geometry_orig'])
         valid_points = valid_points.assign(
             geometry=gpd.points_from_xy(
-                keypoints_corrected_xy[valid_mask, 0],
-                keypoints_corrected_xy[valid_mask, 1]
+                final_corrected_xy[:, 0],
+                final_corrected_xy[:, 1]
             )
         )
-
         logger.info(f"Pattern matching kept {len(valid_points)}/{len(points_combined)} points based on correlation threshold of {self.min_correlation}")
 
         # Prepare KeyPoints for descriptor computation for currently valid points
@@ -1854,7 +1884,6 @@ def pattern_matching(
         # Fill with NaNs if final transform fails
         corrected_positions_xy_np = np.full((len(points), 2), np.nan)
 
-
     # Log statistics
     valid_correlations_for_stats = correlation_values_np[np.isfinite(correlation_values_np) & (correlation_values_np > -1.0)]
     if len(valid_correlations_for_stats) > 0:
@@ -1868,3 +1897,140 @@ def pattern_matching(
         logger.info("Pattern Matching: No valid correlations found to report stats.")
 
     return corrected_positions_xy_np, corrected_colsrows_np, correlation_values_np
+
+def jacobian(x0, y0, x1, y1, x2, y2):
+    """ Calculates the Jacobian determinant for a triangle defined by three points.
+    Args:
+        x0, y0: Numpy arrays with coordinates of the first point.
+        x1, y1: Numpy arrays with coordinates of the second point.
+        x2, y2: Numpy arrays with coordinates of the third point.
+    Returns:
+        Numpy array with the Jacobian determinant, which is twice the area of the triangle.
+    """
+    return (x1-x0)*(y2-y0)-(x2-x0)*(y1-y0)
+
+def get_area(x, y, t):
+    """Calculates the area of triangles defined by vertices in x and y at indices in t.
+    Args:
+        x: Numpy array with x-coordinates of vertices.
+        y: Numpy array with y-coordinates of vertices.
+        t: Numpy array with indices of triangles (shape: n_triangles x 3).
+    Returns:
+        Numpy array with the area of each triangle.
+    Note:
+        The area is negative for flipped triangles.
+    """
+    return .5*jacobian(x[t][:,0], y[t][:,0], x[t][:,1], y[t][:,1], x[t][:,2], y[t][:,2])
+
+def find_triangle(x, y, t, point):
+    """ Finds the first triangle containing a given point.
+    Args:
+        x: Numpy array with x-coordinates of vertices.
+        y: Numpy array with y-coordinates of vertices.
+        t: Numpy array with indices of triangles (shape: n_triangles x 3).
+        point: A tuple or list with the x and y coordinates of the point to check.
+    Returns:
+        The index of the first triangle containing the point, or -1 if no triangle contains it.
+    """
+    # Reshape to get triangle vertices as (n_triangles, 3, 2)
+    vertices = np.dstack([x[t], y[t]])
+
+    # Calculate vectors
+    v0 = vertices[:, 1] - vertices[:, 0]
+    v1 = vertices[:, 2] - vertices[:, 0]
+
+    # Broadcast the point to calculate v2 for all triangles at once
+    point_array = np.array(point)
+    v2 = point_array - vertices[:, 0]
+
+    # Compute dot products
+    d00 = np.sum(v0 * v0, axis=1)
+    d01 = np.sum(v0 * v1, axis=1)
+    d11 = np.sum(v1 * v1, axis=1)
+    d20 = np.sum(v2 * v0, axis=1)
+    d21 = np.sum(v2 * v1, axis=1)
+
+    # Calculate denominators
+    denom = d00 * d11 - d01 * d01
+
+    # Avoid division by zero
+    valid_denom = denom != 0
+
+    # Initialize barycentric coordinates
+    v = np.full_like(denom, np.inf)
+    w = np.full_like(denom, np.inf)
+
+    # Calculate only where denominator is valid
+    v[valid_denom] = (d11[valid_denom] * d20[valid_denom] - d01[valid_denom] * d21[valid_denom]) / denom[valid_denom]
+    w[valid_denom] = (d00[valid_denom] * d21[valid_denom] - d01[valid_denom] * d20[valid_denom]) / denom[valid_denom]
+    u = 1.0 - v - w
+
+    # Point is inside triangle if all barycentric coordinates are positive
+    inside = (u > 0) & (v > 0) & (w > 0)
+    # tol = 1e-8
+    # inside = (u >= -tol) & (v >= -tol) & (w >= -tol) 
+
+    # Return the index of the first triangle containing the point, or -1 if none
+    containing_triangles = np.where(inside)[0]
+    return containing_triangles[0] if len(containing_triangles) > 0 else -1
+
+def find_triangles_for_points(x, y, t, points):
+    """ Finds triangles containing each point in a list of points.
+    Args:
+        x: Numpy array with x-coordinates of vertices.
+        y: Numpy array with y-coordinates of vertices.
+        t: Numpy array with indices of triangles (shape: n_triangles x 3).
+        points: A list or array of points, where each point is a tuple or list with x and y coordinates.
+    Returns:
+        Numpy array with the index of the first triangle containing each point, or -1 if no triangle contains it.
+    """
+    return np.array([find_triangle(x, y, t, point) for point in points])
+
+def mask_bad_vectors(x0, y0, x1, y1, t, n=0, max_iter=100):
+    """ Recursively masks bad points in x1, y1 with NaN. Bad points are located within other triangles.
+    Args:
+        x1: Numpy array with x-coordinates of the second set of points.
+        y1: Numpy array with y-coordinates of the second set of points.
+        t: Numpy array with indices of triangles (shape: n_triangles x 3).
+        n: Current recursion depth, used to limit iterations.
+        max_iter: Maximum number of iterations to prevent infinite recursion.
+    Returns:
+        Tuple of masked x1, y1, and t arrays.
+    """
+    x1 = x1.copy()
+    y1 = y1.copy()
+    t = t.copy() 
+    if n >= max_iter:
+        print("Max iterations reached, returning current vectors.")
+        return x1, y1, t
+
+    a0 = get_area(x0, y0, t)
+    a1 = get_area(x1, y1, t)
+    flipped = np.sign(a0) != np.sign(a1)
+
+    if not np.any(flipped):
+        print("No flipped triangles found.")
+        return x1, y1, t
+
+    min_area_idx = np.where(flipped)[0][np.argmin(np.abs(a1[flipped]))]
+    # indices of nodes forming the triangle with the smallest area
+    neg_pts_idx = t[min_area_idx].flatten()
+    # coordinates of nodes of the triangle with the smallest area
+    potential_trouble_points = np.column_stack([x1[neg_pts_idx], y1[neg_pts_idx]])
+    # for potential trouble points find neighbour triangles containing these points
+    # tri_i may contain [35, -1, -1] if the first point is in triangle 35 and the other two points are not in any triangle
+    # or it may contain [-1, -1, -1] if none of the points are in any triangle
+    tri_i = find_triangles_for_points(x1, y1, t, potential_trouble_points)
+    # index of point that is inside a triangle
+    bad_vector_idx = neg_pts_idx[tri_i > 0]
+    if bad_vector_idx.size > 0:
+        # mask bad second coordinate with nan
+        x1[bad_vector_idx] = np.nan
+        y1[bad_vector_idx] = np.nan
+        # remove triangles containing bad points
+        t = t[np.all(np.isfinite(x1[t]), axis=1)]
+        print(f"Iteration {n}: Found {len(bad_vector_idx)} bad points, removing triangles.")
+    else:
+        # if no bad points found, remove the triangle with the smallest area (can be next to border)
+        t = t[np.arange(t.shape[0]) != min_area_idx]
+    return mask_bad_vectors(x0, y0, x1, y1, t, n+1, max_iter)
