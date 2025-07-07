@@ -460,7 +460,7 @@ class ImageProcessor:
              logger.debug(f"No points passed correlation threshold of {self.min_correlation}. Returning empty.")
              return Keypoints()
 
-        # prepare aligned data from pattern matching filter
+        # prepare aligned data from correlation survivors
         points_survived_corr = points_combined[correlation_mask].copy()
         xy_survived_corr = keypoints_corrected_xy[correlation_mask]
         
@@ -470,24 +470,52 @@ class ImageProcessor:
             on='trajectory_id',
             how='left'
         )
-
-        # identify and mask vectors causing triangle inversions
         x0, y0 = aligned_points.geometry_orig.x.to_numpy(), aligned_points.geometry_orig.y.to_numpy()
-        x1m, y1m, _ = mask_bad_vectors(x0, y0, xy_survived_corr[:, 0], xy_survived_corr[:, 1], Triangulation(x0, y0).triangles)
-
-        # create final validity mask and filter all data structures
-        final_valid_mask = ~np.isnan(x1m)
-        num_kept = np.sum(final_valid_mask)
+        x1_raw, y1_raw = xy_survived_corr[:, 0], xy_survived_corr[:, 1]
         
+        # identify bad vectors, then attempt to interpolate them
+        tri = Triangulation(x0, y0)
+        x1m, y1m, _ = mask_bad_vectors(x0, y0, x1_raw, y1_raw, tri.triangles)
+        x1i, y1i, confidence = interpolate_bad_vectors(x0, y0, x1m, y1m, tri, min_neighbours=3)
+
+        # re-validate the newly interpolated points via pattern matching
+        recheck_mask = confidence['was_interpolated']
+        if np.any(recheck_mask):
+            
+            # Prepare the subset of points that need re-checking
+            points_to_recheck = aligned_points[recheck_mask].copy()
+            points_to_recheck['geometry'] = gpd.points_from_xy(x1i[recheck_mask], y1i[recheck_mask])
+            templates_recheck = self.templates.sel(trajectory_id=points_to_recheck.trajectory_id.values)
+            points_orig_recheck = aligned_points[recheck_mask][['trajectory_id', 'geometry_orig', 'angle']].rename(columns={'geometry_orig': 'geometry'})
+
+            # re-run pattern matching and get new coordinates and correlations
+            xy_rechecked, _, corr_rechecked = pattern_matching(
+                points_to_recheck, img, templates_recheck, points_orig_recheck,
+                hs=self.template_size, border_matched=self.border_matched,
+                border_interpolated=self.border_interpolated, band=1
+            )
+            
+            # Update the main coordinate arrays: keep successes, mark failures as NaN
+            passed_recheck = corr_rechecked >= self.min_correlation
+            recheck_indices = np.where(recheck_mask)[0]
+            
+            x1i[recheck_indices[passed_recheck]] = xy_rechecked[passed_recheck, 0]
+            y1i[recheck_indices[passed_recheck]] = xy_rechecked[passed_recheck, 1]
+            x1i[recheck_indices[~passed_recheck]] = np.nan # Mark failures for removal
+            
+            logger.debug(f"{np.sum(passed_recheck)}/{len(points_to_recheck)} interpolated points passed pattern matching re-check ")
+
+        # create final validity mask from the (potentially updated) interpolated arrays
+        final_valid_mask = ~np.isnan(x1i)
+        num_kept = np.sum(final_valid_mask)
+
         if num_kept == 0:
-            logger.info("Triangulation filter removed all remaining points.")
             return Keypoints()
-
-        logger.info(f"Triangulation filter kept {num_kept}/{len(aligned_points)} points.")
-
+                
+        # apply the final mask to all data structures
         valid_points = aligned_points[final_valid_mask].copy()
         valid_corrected_rc = keypoints_corrected_rc[correlation_mask][final_valid_mask]
-        final_corrected_xy = np.column_stack((x1m[final_valid_mask], y1m[final_valid_mask]))
+        final_corrected_xy = np.column_stack((x1i[final_valid_mask], y1i[final_valid_mask]))
         
         # assign final geometry
         valid_points = valid_points.drop(columns=['geometry_orig'])
@@ -1065,7 +1093,7 @@ class KeypointDetector:
                     keypoints_with_indices.append((final_kp_to_add, point_row.name))
                 
             except Exception as e:
-                print(f"Error processing point original_idx {original_idx} (input index {point_row.name}): {e}")
+                logger.info(f"Error processing point original_idx {original_idx} (input index {point_row.name}): {e}")
                 pass 
                 
         return keypoints_with_indices
@@ -1999,7 +2027,6 @@ def mask_bad_vectors(x0, y0, x1, y1, t, n=0, max_iter=100):
     y1 = y1.copy()
     t = t.copy() 
     if n >= max_iter:
-        print("Max iterations reached, returning current vectors.")
         return x1, y1, t
 
     a0 = get_area(x0, y0, t)
@@ -2007,7 +2034,6 @@ def mask_bad_vectors(x0, y0, x1, y1, t, n=0, max_iter=100):
     flipped = np.sign(a0) != np.sign(a1)
 
     if not np.any(flipped):
-        print("No flipped triangles found.")
         return x1, y1, t
 
     min_area_idx = np.where(flipped)[0][np.argmin(np.abs(a1[flipped]))]
@@ -2027,8 +2053,62 @@ def mask_bad_vectors(x0, y0, x1, y1, t, n=0, max_iter=100):
         y1[bad_vector_idx] = np.nan
         # remove triangles containing bad points
         t = t[np.all(np.isfinite(x1[t]), axis=1)]
-        print(f"Iteration {n}: Found {len(bad_vector_idx)} bad points, removing triangles.")
     else:
         # if no bad points found, remove the triangle with the smallest area (can be next to border)
         t = t[np.arange(t.shape[0]) != min_area_idx]
     return mask_bad_vectors(x0, y0, x1, y1, t, n+1, max_iter)
+
+def interpolate_bad_vectors(x0, y0, x1m, y1m, tri, min_neighbours=3):
+    """ Interpolates bad vectors in x1m, y1m using the average of neighbouring points.
+    Args:
+        x0: Numpy array with x-coordinates of the first set of points.
+        y0: Numpy array with y-coordinates of the first set of points.
+        x1m: Numpy array with x-coordinates of the second set of points (may contain NaN).
+        y1m: Numpy array with y-coordinates of the second set of points (may contain NaN).
+        tri: Delaunay triangulation object containing edges.
+        min_neighbours: Minimum number of valid neighbors required for interpolation.
+    Returns:
+        Tuple of interpolated x1i, y1i arrays and an interpolation_info dict.
+    """
+    x1i = x1m.copy()
+    y1i = y1m.copy()
+    bad_points = np.nonzero(np.isnan(x1m))[0]
+    
+    # Track interpolation information
+    interpolation_info = {
+        'was_interpolated': np.zeros(len(x1m), dtype=bool),
+        'high_confidence': np.zeros(len(x1m), dtype=bool),
+        'neighbor_count': np.zeros(len(x1m), dtype=int)
+    }
+        
+    for bad_point in bad_points:
+        # Find neighbors through triangulation edges
+        neighbors = np.unique(tri.edges[np.any(tri.edges == bad_point, axis=1)])
+        neighbors = neighbors[neighbors != bad_point]
+        
+        # Keep only neighbors with finite displacement
+        valid = np.isfinite(x1m[neighbors]) & np.isfinite(y1m[neighbors])
+        valid_neighbors = neighbors[valid]
+        
+        interpolation_info['neighbor_count'][bad_point] = len(valid_neighbors)
+        
+        if len(valid_neighbors) < min_neighbours:
+            # Leave as NaN - not enough reliable neighbors
+            continue
+        
+        # Calculate average displacement from neighbors
+        u_avg = np.nanmedian(x1m[valid_neighbors] - x0[valid_neighbors])
+        v_avg = np.nanmedian(y1m[valid_neighbors] - y0[valid_neighbors])
+        
+        # Apply interpolation
+        x1i[bad_point] = x0[bad_point] + u_avg
+        y1i[bad_point] = y0[bad_point] + v_avg
+        
+        # Mark as interpolated and set confidence
+        interpolation_info['was_interpolated'][bad_point] = True
+        interpolation_info['high_confidence'][bad_point] = len(valid_neighbors) >= min_neighbours
+    
+    successful_interpolations = np.sum(interpolation_info['was_interpolated'])
+    logger.debug(f"Interpolated {successful_interpolations}/{len(bad_points)} points that were removed due to triangle inversions.")
+    
+    return x1i, y1i, interpolation_info
