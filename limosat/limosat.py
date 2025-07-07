@@ -460,38 +460,36 @@ class ImageProcessor:
              logger.debug(f"No points passed correlation threshold of {self.min_correlation}. Returning empty.")
              return Keypoints()
 
-        # prepare inputs to filter triangles with negative area
-        points_prefiltered = points_combined[correlation_mask].copy()
-        xy_prefiltered = keypoints_corrected_xy[correlation_mask]
-        rc_prefiltered = keypoints_corrected_rc[correlation_mask]
-        orig_geom = points_orig[['trajectory_id', 'geometry']].rename(columns={'geometry': 'geometry_orig'})
-        aligned_points = pd.merge(points_prefiltered, orig_geom, on='trajectory_id', how='left')
+        # prepare aligned data from pattern matching filter
+        points_survived_corr = points_combined[correlation_mask].copy()
+        xy_survived_corr = keypoints_corrected_xy[correlation_mask]
         
-        x0 = aligned_points.geometry_orig.x.to_numpy()
-        y0 = aligned_points.geometry_orig.y.to_numpy()
-        x1_raw = xy_prefiltered[:, 0]
-        y1_raw = xy_prefiltered[:, 1]
-        
-        # perform triangulation, masking, and interpolation
-        tri = Triangulation(x0, y0)
-        x1m, y1m, _ = mask_bad_vectors(x0, y0, x1_raw, y1_raw, tri.triangles)
+        aligned_points = pd.merge(
+            points_survived_corr,
+            points_orig[['trajectory_id', 'geometry']].rename(columns={'geometry': 'geometry_orig'}),
+            on='trajectory_id',
+            how='left'
+        )
 
-        # Create a final validity mask for points that survived the geometric filter
+        # identify and mask vectors causing triangle inversions
+        x0, y0 = aligned_points.geometry_orig.x.to_numpy(), aligned_points.geometry_orig.y.to_numpy()
+        x1m, y1m, _ = mask_bad_vectors(x0, y0, xy_survived_corr[:, 0], xy_survived_corr[:, 1], Triangulation(x0, y0).triangles)
+
+        # create final validity mask and filter all data structures
         final_valid_mask = ~np.isnan(x1m)
+        num_kept = np.sum(final_valid_mask)
         
-        if not np.any(final_valid_mask):
+        if num_kept == 0:
             logger.info("Triangulation filter removed all remaining points.")
             return Keypoints()
-            
-        logger.info(f"Triangulation filter kept {np.sum(final_valid_mask)}/{len(aligned_points)} points.")
-        
-        # apply mask to create the final points
+
+        logger.info(f"Triangulation filter kept {num_kept}/{len(aligned_points)} points.")
+
         valid_points = aligned_points[final_valid_mask].copy()
-        valid_corrected_rc = rc_prefiltered[final_valid_mask]
+        valid_corrected_rc = keypoints_corrected_rc[correlation_mask][final_valid_mask]
         final_corrected_xy = np.column_stack((x1m[final_valid_mask], y1m[final_valid_mask]))
         
-
-        # 8. Assign final geometry and clean up temporary columns
+        # assign final geometry
         valid_points = valid_points.drop(columns=['geometry_orig'])
         valid_points = valid_points.assign(
             geometry=gpd.points_from_xy(
