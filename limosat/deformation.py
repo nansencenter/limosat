@@ -233,6 +233,11 @@ def filter_and_interpolate_flipped_triangles(x0, y0, x1_raw, y1_raw):
         The arrays contain NaNs for points that could not be interpolated.
         The mask identifies which points were successfully interpolated.
     """
+    if len(x0) < 3:
+        logger.debug(f"Skipping triangle filtering: only {len(x0)} points provided.")
+        was_interpolated_mask = np.zeros(len(x0), dtype=bool)
+        return x1_raw, y1_raw, was_interpolated_mask
+
     tri = Triangulation(x0, y0)
     
     # 1. Initial masking of vectors causing flips
