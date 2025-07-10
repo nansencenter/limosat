@@ -50,7 +50,6 @@ class ImageProcessor:
             'pruning_interval': 10,
             'temporal_window': 3,
             'candidate_search_max_daily_drift_m': 10000,
-            'descriptor_size': 32,
             'window_size': 64,
             'border_size': 128,
             'border_matched': 16,
@@ -234,7 +233,7 @@ class ImageProcessor:
 
             if len(matching_insitu_points) > 0:
                 logger.info(f"Found {len(matching_insitu_points)} matching buoy observations in image {basename}")
-                buoy_kps = self.keypoint_detector.keypoint_from_point(matching_insitu_points, self.descriptor_size, octave=self.octave,img=img, response_threshold=self.response_threshold)
+                buoy_kps = self.keypoint_detector.keypoint_from_point(matching_insitu_points, octave=self.octave,img=img, response_threshold=self.response_threshold)
                 if buoy_kps is None:
                     logger.error("keypoint_from_point returned None unexpectedly!")
                     buoy_kps = []
@@ -292,7 +291,6 @@ class ImageProcessor:
             img,
             stride=self.stride,
             border_size=self.border_size,
-            size=self.descriptor_size,
             octave=self.octave,
         )
 
@@ -460,7 +458,8 @@ class ImageProcessor:
         # Recompute descriptors for final points
         if not points_matched.empty:
             keypoints_list_with_tags_recompute = [
-                (cv2.KeyPoint(px_c, px_r, size=self.descriptor_size, angle=img.angle, octave=self.octave), None)
+                # The size parameter is required, but will be overwritten by the detector's patch size
+                (cv2.KeyPoint(px_c, px_r, size=31, angle=img.angle, octave=self.octave), None)
                 for px_c, px_r in corrected_rc
             ]
             

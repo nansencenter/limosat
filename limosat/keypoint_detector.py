@@ -81,7 +81,7 @@ class KeypointDetector:
 
             img_hv = img['s0_HV'].copy()
             img_hv[np.isnan(img_hv)] = 0
-            keypoints_output_hv_check, descriptors_hv = self.model.compute(img_hv, keypoints_output_hh) 
+            keypoints_output_hv_check, descriptors_hv = self.model.compute(img_hv, keypoints_output_hh)
 
             if descriptors_hv is None:
                 return None, None, None
@@ -236,7 +236,6 @@ class KeypointDetector:
         self,
         img,
         stride,
-        size,
         octave,
         border_size,
     ):
@@ -265,7 +264,8 @@ class KeypointDetector:
         keypoints = []
         for r in range(0, img0.shape[0], stride):
             for c in range(0, img0.shape[1], stride):
-                kp = cv2.KeyPoint(r, c, size=size, octave=octave, angle=img.angle)
+                # The size parameter is required, but will be overwritten by the detector's patch size
+                kp = cv2.KeyPoint(r, c, size=31, octave=octave, angle=img.angle)
                 keypoints.append((kp, None)) # Append tuple with None as tag
 
         # Filter keypoints within image borders
@@ -299,7 +299,6 @@ class KeypointDetector:
     def keypoint_from_point(
             self, # KeypointDetector instance
             points_gdf_for_current_image, # GDF of buoy points for *this* image
-            descriptor_size, # Passed by ImageProcessor, for cv2.KeyPoint.size & descriptor area check
             octave,          # Passed by ImageProcessor, for cv2.KeyPoint.octave
             img,              # Nansat image object for the current image
             response_threshold
@@ -312,7 +311,7 @@ class KeypointDetector:
         # as it's part of a specific workflow in ImageProcessor where descriptors
         # are computed later in a batch.
         # this is the window it searches
-        patch_size_for_detection = 32
+        window_size_for_detection = 32
         keypoints_with_indices = []
         orb_model = self.model
         img_band_data = img[1]
@@ -328,14 +327,14 @@ class KeypointDetector:
                 if buoy_col_px_float is None:
                     continue
 
-                patch_half = patch_size_for_detection // 2
+                patch_half = window_size_for_detection // 2
                 r0 = max(0, int(round(buoy_row_px_float)) - patch_half)
-                r1 = min(img_height, int(round(buoy_row_px_float)) + patch_half + (patch_size_for_detection % 2))
+                r1 = min(img_height, int(round(buoy_row_px_float)) + patch_half + (window_size_for_detection % 2))
                 c0 = max(0, int(round(buoy_col_px_float)) - patch_half)
-                c1 = min(img_width, int(round(buoy_col_px_float)) + patch_half + (patch_size_for_detection % 2))
+                c1 = min(img_width, int(round(buoy_col_px_float)) + patch_half + (window_size_for_detection % 2))
 
-                if not ((r1 - r0) >= patch_size_for_detection * 0.8 and \
-                        (c1 - c0) >= patch_size_for_detection * 0.8):
+                if not ((r1 - r0) >= window_size_for_detection * 0.8 and \
+                        (c1 - c0) >= window_size_for_detection * 0.8):
                     continue 
 
                 patch = img_band_data[r0:r1, c0:c1]
@@ -359,16 +358,16 @@ class KeypointDetector:
                     kp_final_r = r0 + best_kp_in_patch.pt[1]
 
                     # Boundary check for the keypoint for subsequent descriptor computation
-                    orb_desc_computation_half_patch = int(descriptor_size / 2) 
+                    orb_desc_computation_half_patch = int(best_kp_in_patch.size / 2)
 
                     if not (orb_desc_computation_half_patch <= kp_final_c < img_width - orb_desc_computation_half_patch and \
                             orb_desc_computation_half_patch <= kp_final_r < img_height - orb_desc_computation_half_patch):
-                        continue 
+                        continue
 
                     final_kp_to_add = cv2.KeyPoint(
                         x=float(kp_final_c),
                         y=float(kp_final_r),
-                        size=float(descriptor_size), 
+                        size=float(best_kp_in_patch.size),
                         octave=int(octave),
                         angle=float(img.angle),
                         response=float(best_kp_in_patch.response)

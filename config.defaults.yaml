@@ -32,7 +32,6 @@ image_processor_params:
   pruning_interval: 25
   temporal_window: 4
   candidate_search_max_daily_drift_m: 10000
-  descriptor_size: 32
   window_size: 64
   border_size: 128
   border_matched: 16
