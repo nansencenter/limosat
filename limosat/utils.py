@@ -17,6 +17,7 @@ import functools
 import time
 import re
 import pandas as pd
+import yaml
 
 APP_LOGGER_NAME = 'LiMOSAT'
 
@@ -111,3 +112,26 @@ def extract_date(filename):
             return None
     else:
         return None
+
+
+def load_config(config_path):
+    """
+    Loads a YAML configuration file.
+
+    Parameters:
+        config_path (str): The path to the YAML configuration file.
+
+    Returns:
+        dict: The loaded configuration.
+    """
+    try:
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+        logger.info(f"Successfully loaded configuration from {config_path}")
+        return config
+    except FileNotFoundError:
+        logger.error(f"Configuration file not found at: {config_path}")
+        raise
+    except yaml.YAMLError as e:
+        logger.error(f"Error parsing YAML file {config_path}: {e}")
+        raise
