@@ -265,7 +265,8 @@ class KeypointDetector:
         for r in range(0, img0.shape[0], stride):
             for c in range(0, img0.shape[1], stride):
                 # The size parameter is required, but will be overwritten by the detector's patch size
-                kp = cv2.KeyPoint(r, c, size=31, octave=octave, angle=img.angle)
+                # Corrected order: cv2.KeyPoint expects (x, y) which is (c, r)
+                kp = cv2.KeyPoint(float(c), float(r), size=31, octave=octave, angle=img.angle)
                 keypoints.append((kp, None)) # Append tuple with None as tag
 
         # Filter keypoints within image borders

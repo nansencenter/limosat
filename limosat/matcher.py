@@ -81,21 +81,18 @@ class Matcher:
         x0 = np.vstack(points_poly['descriptors'].values)
         x1 = np.vstack(points_grid['descriptors'].values)
 
-        # Match
-        matches = self.match_with_crosscheck(x0, x1)
+        # Match - Replicating original logic
+        # 1. Get initial matches from cross-check
+        matches_crosscheck = self.match_with_crosscheck(x0, x1)
+        # 2. Get additional potential matches from Lowe's ratio test
+        matches_combined = self.match_with_lowe_ratio(matches_crosscheck, x0, x1, pos0, pos1)
+        
+        # 3. Filter the combined list of matches
+        rc_idx0, rc_idx1, residuals = self.filter(matches_combined, pos0, pos1)
 
-        # Filter
-        rc_idx0, rc_idx1, residuals = self.filter(matches, pos0, pos1)
-
-        # If filter returned None or we don't have enough matches, try Lowe's ratio test
-        if rc_idx0 is None or (rc_idx0.size / pos0.shape[0] < 0.1):
-            matches = self.match_with_lowe_ratio(matches, x0, x1, pos0, pos1)
-            rc_idx0, rc_idx1, residuals = self.filter(matches, pos0, pos1)
-            if rc_idx0 is not None:
-                logger.debug(f"After Lowe's ratio test, number of matches: {rc_idx0.size}")
-            # If we still don't have valid matches, return None
-            if rc_idx0 is None:
-                return None, None
+        # If we still don't have valid matches after the combined approach, return None
+        if rc_idx0 is None:
+            return None, None
 
         return points_poly.iloc[rc_idx0], points_grid.iloc[rc_idx1]
 

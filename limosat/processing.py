@@ -36,13 +36,21 @@ def interpolate_drift(points_poly, points_fg1, points_fg2, img,
         return points_result
 
     try:
-        src_pts_for_atm_geodf = points_poly.loc[points_fg1.index]
-        if src_pts_for_atm_geodf.geometry.isna().any() or points_fg2.geometry.isna().any():
-            logger.error("interpolate_drift: NaN geometry in ATM anchor points. Skipping.")
+        # Use a robust merge to select source points for the transform, ensuring alignment.
+        # This is the key change to match the original script's behavior precisely.
+        merged_anchors = pd.merge(
+            points_fg2[['trajectory_id', 'geometry']],
+            points_poly[['trajectory_id', 'geometry']],
+            on='trajectory_id',
+            suffixes=('_new', '_orig')
+        )
+
+        if merged_anchors.empty:
+            logger.warning("interpolate_drift: Merging anchor points resulted in an empty DataFrame. Skipping.")
             return points_result
 
-        pos0_atm = np.array(list(src_pts_for_atm_geodf.geometry.apply(lambda p: p.coords[0])))
-        pos1_atm = np.array(list(points_fg2.geometry.apply(lambda p: p.coords[0])))
+        pos0_atm = np.array(list(merged_anchors.geometry_orig.apply(lambda p: p.coords[0])))
+        pos1_atm = np.array(list(merged_anchors.geometry_new.apply(lambda p: p.coords[0])))
         
         atm = model_type()
         if not atm.estimate(pos0_atm, pos1_atm):
@@ -76,9 +84,10 @@ def interpolate_drift(points_poly, points_fg1, points_fg2, img,
     if unmatched_points_current_stage.empty: return points_result
 
     max_anchor_distance_meters = max_anchor_distance_km * 1000.0
-    if not src_pts_for_atm_geodf.geometry.empty and len(src_pts_for_atm_geodf.geometry) >= 3:
+    # Use the original geometry from the merged anchors for the convex hull
+    if not merged_anchors.geometry_orig.empty and len(merged_anchors.geometry_orig) >= 3:
         try:
-            anchor_cloud_multipoint = MultiPoint(src_pts_for_atm_geodf.geometry.tolist())
+            anchor_cloud_multipoint = MultiPoint(merged_anchors.geometry_orig.tolist())
             convex_hull_of_anchors = anchor_cloud_multipoint.convex_hull
             distances_to_hull_edge = unmatched_points_current_stage.geometry.distance(convex_hull_of_anchors)
             near_anchor_hull_mask = distances_to_hull_edge <= max_anchor_distance_meters

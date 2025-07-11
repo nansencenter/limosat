@@ -115,26 +115,27 @@ class Templates:
     @log_execution_time
     def update(self, points, img, template_size, band=1):
         """
-        Extracts and updates templates for existing tracked points.
+        Extracts and updates templates with a strict "all or nothing" policy.
+
+        If a template cannot be extracted for every point, the entire update
+        is skipped to ensure data consistency.
         """
         templates_new, template_new_idx = self._extract_from_img(points, img, hs=template_size, band=band)
 
-        if templates_new.size == 0:
+        if len(template_new_idx) != len(points):
+            logger.warning(
+                f"Template extraction mismatch (expected {len(points)}, got {len(template_new_idx)}). "
+                "Skipping batch update."
+            )
             return
 
         trajectory_ids = points.trajectory_id.iloc[template_new_idx].values
-        existing_trajectory_ids = self.data.trajectory_id.values
+        current_times = points['time'].iloc[template_new_idx].values
 
-        is_existing = np.isin(trajectory_ids, existing_trajectory_ids)
-        if np.any(is_existing):
-            update_templates_data = templates_new[is_existing]
-            update_trajectory_ids = trajectory_ids[is_existing]
-            
-            current_time = points['time'].iloc[template_new_idx[is_existing]].values
-            
-            self.data['time'].loc[dict(trajectory_id=update_trajectory_ids)] = current_time
-            self.data.loc[dict(trajectory_id=update_trajectory_ids)] = update_templates_data
-            logger.debug(f"Updated {len(update_trajectory_ids)} existing templates.")
+        self.data['time'].loc[dict(trajectory_id=trajectory_ids)] = current_times
+        self.data.loc[dict(trajectory_id=trajectory_ids)] = templates_new
+
+        logger.debug(f"Updated {len(trajectory_ids)} templates.")
 
     def get_by_id(self, trajectory_ids):
         """
