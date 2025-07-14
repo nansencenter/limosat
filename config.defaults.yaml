@@ -1,0 +1,67 @@
+# LiMOSAT Default Configuration File (config.defaults.yaml)
+# Users should copy this to 'config.yaml' and modify it for their specific run.
+
+run_settings:
+  run_name: "limosat_default_run" # Unique name for the run, used for DB and Zarr store
+  clear_existing_data: false      # If true, drops DB table for 'run_name' and clears Zarr store.
+  max_cpu_cores: null             # Integer: Max number of CPU cores to use. null or omit to disable.
+
+database:
+  engine_url: "postgresql://user:password@localhost:5432/arktalas"
+  zarr_path_template: "./data/zarr_stores/{run_name}.zarr"
+
+paths:
+  image_catalog:
+    metadata_path: "./data/catalogs/image_catalog.geojson" # Path to pre-existing image catalog GeoJSON
+    start_date_filter: null # Optional: "YYYY-MM-DD HH:MM:SS"
+    end_date_filter: null   # Optional: "YYYY-MM-DD HH:MM:SS"
+
+  insitu_points: # Optional: for seeding initial points
+    use_insitu_seeding: false
+    geojson_path: "./data/insitu/buoy_data.geojson" # GeoJSON with in-situ data
+    target_crs: "EPSG:3413" # Target Coordinate Reference System
+    seeding_selection:
+      max_attempts_per_buoy: 100
+      max_time_diff_minutes: 60
+      min_hours_between_seeds: 2
+      warmup_days: 0
+
+image_processor_params:
+  persist_updates: true
+  persist_interval: 100
+  pruning_interval: 25
+  temporal_window: 4
+  candidate_search_max_daily_drift_m: 10000
+  window_size: 64
+  border_size: 128
+  border_matched: 16
+  border_interpolated: 32
+  stride: 10
+  octave: 8
+  min_correlation: 0.35
+  response_threshold: 0
+  template_size: 16
+  use_interpolation: true
+  max_interpolation_time_gap_hours: 24
+
+keypoint_detector:
+  type: "ORB"
+  orb_params:
+    nfeatures: 500
+    scaleFactor: 1.2
+    nlevels: 8
+    edgeThreshold: 31
+    firstLevel: 0
+    patchSize: 31
+    scoreType: "HARRIS_SCORE"
+
+matcher_params:
+  norm_type: "NORM_HAMMING2"
+  descriptor_distance_max: 120
+  spatial_distance_max: 100000
+  model_threshold: 10000
+  plot_matches: false
+  geometric_model:
+    type: "AffineTransform"
+    use_model_estimation: true
+    estimation_method: "USAC_MAGSAC"
