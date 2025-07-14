@@ -180,35 +180,39 @@ class ImageProcessor:
         if self.persist_updates:
             current_points_image_id = self.points.last_image_id
             images_since_persist = current_points_image_id - self._last_persisted_id
+
             if images_since_persist >= self.persist_interval:
                 current_last_image_id = current_points_image_id
-                try:
-                    save_successful = self.db.save(
-                        self.points,
-                        self.templates,
-                        self._last_persisted_id,
-                        self.insitu_points
-                    )
+                
+                # --- 1. Attempt to save data to the database ---
+                save_successful = self.db.save(
+                    self.points,
+                    self.templates,
+                    self._last_persisted_id,
+                    self.insitu_points
+                )
 
-                    if save_successful:
-                        # Prune points
+                # --- 2. Prune in-memory data only if save was successful ---
+                if save_successful:
+                    try:
                         points_delta_count = len(self.points[self.points['image_id'] > self._last_persisted_id])
                         logger.info(f"Database persistence successful for {points_delta_count} new/updated points.")
+                        
                         num_before_prune = len(self.points)
-                        keep_mask_points = (self.points['is_last'] == 1) & \
-                                           (self.points['time'] >= time_threshold) # Use existing time_threshold
-                        points_to_keep = self.points[keep_mask_points].copy()
-                        self.points = Keypoints._from_gdf(points_to_keep)
+                        keep_mask = (self.points['is_last'] == 1) & \
+                                    (self.points['time'] >= time_threshold)
+                        
+                        self.points = Keypoints._from_gdf(self.points[keep_mask].copy())
+                        
                         num_after_prune = len(self.points)
-                        logger.debug(
-                            f"In-memory points pruned: {num_before_prune} -> {num_after_prune} "
-                        )
+                        logger.debug(f"In-memory points pruned: {num_before_prune} -> {num_after_prune}")
+                        
                         self._last_persisted_id = current_last_image_id
-                    else:
-                        logger.warning("Database save operation reported failure. Skipping in-memory point pruning.")
-                except Exception as e:
-                    logger.error(f"Error during persistence or pruning: {e}", exc_info=True)
-                    logger.warning("Skipping in-memory point pruning for this interval due to error. Database state may not be current.")
+                    except Exception as e:
+                        logger.error(f"Error during in-memory point pruning after successful save: {e}", exc_info=True)
+                        logger.critical("CRITICAL: In-memory pruning failed. State may be inconsistent. Continuing without pruning.")
+                else:
+                    logger.warning("Database save reported failure. Skipping in-memory point pruning to prevent data loss.")
 
     @log_execution_time
     def _process_new_points(self, points_final, img, image_id, basename):
