@@ -8,6 +8,7 @@ import numpy as np
 import cv2
 from skimage.transform import AffineTransform
 from matplotlib import pyplot as plt
+from collections import defaultdict
 from .utils import log_execution_time, logger
 
 class Matcher:
@@ -62,16 +63,18 @@ class Matcher:
         plt.show()
 
     @log_execution_time
-    def match_with_grid(self, points_poly, points_grid):
+    def match_with_grid(self, points_poly, points_grid, validation_mode=True):
         """
-        Match points between polygon and grid representations.
+        Match points between polygon and grid representations. Match globally, filter locally.
 
         Parameters:
         points_poly: Points from polygon representation (GeoDataFrame)
         points_grid: Points from grid representation (GeoDataFrame)
+        validation_mode (bool): If True, return a dict comparing new and old methods.
 
         Returns:
         tuple: (points_fg1, points_fg2) matched points, or (None, None) if matching fails
+        dict: If validation_mode is True, returns comparison results.
         """
         # Extract positions from geometry columns
         pos0 = np.column_stack((points_poly.geometry.x, points_poly.geometry.y))
@@ -81,23 +84,54 @@ class Matcher:
         x0 = np.vstack(points_poly['descriptors'].values)
         x1 = np.vstack(points_grid['descriptors'].values)
 
-        # Match
+        # 1. Global Descriptor Matching
         matches = self.match_with_crosscheck(x0, x1)
 
-        # Filter
-        rc_idx0, rc_idx1, residuals = self.filter(matches, pos0, pos1)
+        # --- New Method (Per-Group Filtering) ---
+        matches_by_group = defaultdict(list)
+        for match in matches:
+            image_id = points_poly.iloc[match.queryIdx]['image_id']
+            matches_by_group[image_id].append(match)
 
-        # If filter returned None or we don't have enough matches, try Lowe's ratio test
-        if rc_idx0 is None or (rc_idx0.size / pos0.shape[0] < 0.1):
-            matches = self.match_with_lowe_ratio(matches, x0, x1, pos0, pos1)
-            rc_idx0, rc_idx1, residuals = self.filter(matches, pos0, pos1)
-            if rc_idx0 is not None:
-                logger.debug(f"After Lowe's ratio test, number of matches: {rc_idx0.size}")
-            # If we still don't have valid matches, return None
-            if rc_idx0 is None:
-                return None, None
+        all_inliers_idx0, all_inliers_idx1, all_residuals = [], [], []
 
-        return points_poly.iloc[rc_idx0], points_grid.iloc[rc_idx1]
+        for image_id, group_matches in matches_by_group.items():
+            rc_idx0_group, rc_idx1_group, residuals_group = self.filter(group_matches, pos0, pos1)
+            if rc_idx0_group is not None and rc_idx0_group.size > 0:
+                all_inliers_idx0.append(rc_idx0_group)
+                all_inliers_idx1.append(rc_idx1_group)
+                all_residuals.append(residuals_group)
+
+        if not all_inliers_idx0:
+            points_fg1_new, points_fg2_new, residuals_new = None, None, None
+        else:
+            final_rc_idx0_new = np.concatenate(all_inliers_idx0)
+            final_rc_idx1_new = np.concatenate(all_inliers_idx1)
+            residuals_new = np.concatenate(all_residuals)
+            points_fg1_new = points_poly.iloc[final_rc_idx0_new]
+            points_fg2_new = points_grid.iloc[final_rc_idx1_new]
+            logger.info(f"Total aggregated inliers from all groups: {len(points_fg1_new)}")
+
+        # --- Validation Block ---
+        if validation_mode:
+            # --- Old Method (Global Filtering) ---
+            rc_idx0_old, rc_idx1_old, residuals_old = self.filter(matches, pos0, pos1)
+            if rc_idx0_old is None or (rc_idx0_old.size / pos0.shape[0] < 0.1):
+                l_matches = self.match_with_lowe_ratio(matches, x0, x1, pos0, pos1)
+                rc_idx0_old, rc_idx1_old, residuals_old = self.filter(l_matches, pos0, pos1)
+
+            if rc_idx0_old is None:
+                points_fg1_old, points_fg2_old = None, None
+            else:
+                points_fg1_old = points_poly.iloc[rc_idx0_old]
+                points_fg2_old = points_grid.iloc[rc_idx1_old]
+
+            return {
+                'new_method': (points_fg1_new, points_fg2_new, residuals_new),
+                'old_method': (points_fg1_old, points_fg2_old, residuals_old)
+            }
+
+        return points_fg1_new, points_fg2_new, residuals_new
 
     @log_execution_time
     def match_with_crosscheck(self, x0, x1):

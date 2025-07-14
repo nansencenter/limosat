@@ -61,6 +61,7 @@ class ImageProcessor:
             'template_size': 16,
             'use_interpolation': True,
             'max_interpolation_time_gap_hours': 25,
+            'matcher_validation_mode': False,
         }
 
         # Start with defaults, update from config, then from kwargs
@@ -305,7 +306,29 @@ class ImageProcessor:
         points_grid = Keypoints.create(keypoints_coords_arr_grid, descriptors_grid, img, image_id=image_id)
 
         # Match and filter points
-        points_fg1, points_fg2 = self.matcher.match_with_grid(points_poly, points_grid)
+        match_results = self.matcher.match_with_grid(
+            points_poly,
+            points_grid,
+            validation_mode=self.matcher_validation_mode
+        )
+
+        if self.matcher_validation_mode:
+            points_fg1_new, points_fg2_new, residuals_new = match_results['new_method']
+            points_fg1_old, points_fg2_old, residuals_old = match_results['old_method']
+            
+            num_new = len(points_fg1_new) if points_fg1_new is not None else 0
+            num_old = len(points_fg1_old) if points_fg1_old is not None else 0
+            logger.info(f"Matcher Validation: New method found {num_new} points, Old method found {num_old} points.")
+
+            if residuals_new is not None and residuals_new.size > 0:
+                logger.info(f"Residuals (New): Mean={np.mean(residuals_new):.2f}, Median={np.median(residuals_new):.2f}, Std={np.std(residuals_new):.2f}")
+            if residuals_old is not None and residuals_old.size > 0:
+                logger.info(f"Residuals (Old): Mean={np.mean(residuals_old):.2f}, Median={np.median(residuals_old):.2f}, Std={np.std(residuals_old):.2f}")
+
+            # Proceed with the new method's results for the rest of the processing
+            points_fg1, points_fg2 = points_fg1_new, points_fg2_new
+        else:
+            points_fg1, points_fg2, _ = match_results
 
         if points_fg1 is None or points_fg2 is None or points_fg1.empty or points_fg2.empty:
             logger.info("Insufficient match quality or no matches found, skipping point matching step.")
