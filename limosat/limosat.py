@@ -15,6 +15,7 @@ import os
 from functools import cached_property
 from .utils import log_execution_time, extract_date, logger
 from .database import DriftDatabase
+from.deformation import filter_and_interpolate_flipped_triangles
 
 import numpy as np
 from numpy.linalg import norm
@@ -28,6 +29,7 @@ from matplotlib import pyplot as plt
 from skimage.util import view_as_windows
 from skimage.transform import AffineTransform
 from nansat import Nansat, NSR
+from matplotlib.tri import Triangulation
 
 # Constants for commonly used values
 CANDIDATE_SEARCH_MAX_DAILY_DRIFT_M_PER_DAY = 10000
@@ -363,8 +365,8 @@ class ImageProcessor:
         )
 
         if keypoints_coords_arr_grid is None or descriptors_grid is None:
-             logger.warning("Failed to compute descriptors for grid points. Skipping matching.")
-             return None
+            logger.warning("Failed to compute descriptors for grid points. Skipping matching.")
+            return None
 
         points_grid = Keypoints.create(keypoints_coords_arr_grid, descriptors_grid, img, image_id=image_id)
 
@@ -376,13 +378,13 @@ class ImageProcessor:
             return Keypoints()
 
         # Assign trajectory IDs to matched points
-        points_matched = points_fg2.copy()
-        points_matched['trajectory_id'] = points_fg1.trajectory_id.values
-        points_matched['interpolated'] = 0
+        points_fg2['trajectory_id'] = points_fg1.trajectory_id.values
+        points_fg2['interpolated'] = 0
+        points_matched = points_fg2
 
-        # Interpolate drift
+        # Interpolate drift if needed
         if self.use_interpolation and len(points_fg1) < len(points_poly):
-            points_combined = interpolate_drift(
+            points_matched = interpolate_drift(
                 points_poly=points_poly,
                 points_fg1=points_fg1,
                 points_fg2=points_matched,
@@ -390,58 +392,43 @@ class ImageProcessor:
                 max_interpolation_time_gap_hours=self.max_interpolation_time_gap_hours,
                 model_type=AffineTransform,
                 border_size=self.border_size
-                )
-            if points_combined is None or points_combined.empty:
-                 logger.warning("Interpolation resulted in no valid points. Proceeding with only matched points.")
-                 points_combined = points_matched # Fall back to only matched points
+            )
+            if points_matched is None or points_matched.empty:
+                logger.warning("Interpolation resulted in no valid points. Proceeding with only matched points.")
+                points_matched = points_fg2  # Fall back to only matched points
         else:
-            # Handle logging messages for why interpolation wasn't run
             if not self.use_interpolation:
                 logger.info("Interpolation disabled, using only matched points")
             elif len(points_fg1) >= len(points_poly):
                 logger.info("All points matched, no interpolation needed")
-            points_combined = points_matched
-
-        # Check if points_combined is empty before proceeding
-        if points_combined.empty:
-             logger.info("No matched or interpolated points remaining before template check.")
-             return Keypoints()
-        
-        # Get initial trajectory IDs and corresponding original points
-        all_traj_ids = points_combined.trajectory_id.values
-        points_orig = points_poly[points_poly.trajectory_id.isin(all_traj_ids)]
 
         # Filter out points that don't have templates
+        all_traj_ids = points_matched.trajectory_id.values
         available_traj_ids = self.templates.trajectory_id.values
         has_template_mask = np.isin(all_traj_ids, available_traj_ids)
 
         if not np.all(has_template_mask):
-            missing_count = np.sum(~has_template_mask)
-            logger.debug(f"Filtering out {missing_count} points that don't have templates")
+            points_matched = points_matched[has_template_mask]
+            all_traj_ids = points_matched.trajectory_id.values
             
-            # Filter points_combined
-            points_combined = points_combined[has_template_mask].copy()
-            
-            if points_combined.empty:
-                 logger.debug("No points remaining after template availability filter.")
-                 return Keypoints()
-
-            # Synchronise points_orig with the filtered points_combined
-            all_traj_ids = points_combined.trajectory_id.values 
-            points_orig = points_poly[points_poly.trajectory_id.isin(all_traj_ids)] 
-
-        # Perform pattern matching
-        templates_all = self.templates.sel(trajectory_id=all_traj_ids) 
-        
-        if not (len(points_combined) == len(points_orig) == len(templates_all.trajectory_id)):
-            logger.error(f"Length mismatch before pattern_matching! "
-                         f"points_combined: {len(points_combined)}, "
-                         f"points_orig: {len(points_orig)}, "
-                         f"templates_all: {len(templates_all.trajectory_id)}")
+        if points_matched.empty:
+            logger.debug("No points remaining after template filtering.")
             return Keypoints() 
 
+        # Get original points and templates for pattern matching
+        points_orig = points_poly[points_poly.trajectory_id.isin(all_traj_ids)]
+        templates_all = self.templates.sel(trajectory_id=all_traj_ids) 
+        
+        if not (len(points_matched) == len(points_orig) == len(templates_all.trajectory_id)):
+            logger.error(f"Length mismatch before pattern_matching! "
+                        f"points_matched: {len(points_matched)}, "
+                        f"points_orig: {len(points_orig)}, "
+                        f"templates_all: {len(templates_all.trajectory_id)}")
+            return Keypoints() 
+
+        # Perform pattern matching
         keypoints_corrected_xy, keypoints_corrected_rc, corr_values = pattern_matching(
-            points_combined,
+            points_matched,
             img,
             templates_all,
             points_orig,
@@ -451,36 +438,102 @@ class ImageProcessor:
             band=1
         )
 
-        # Remove points below the correlation threshold
-        points_combined['corr'] = corr_values
-        valid_mask = corr_values >= self.min_correlation
-        # Ensure we handle the case where NO points pass the correlation threshold
-        if not np.any(valid_mask):
-             logger.debug(f"No points passed the correlation threshold of {self.min_correlation}. Returning empty.")
-             return Keypoints()
+        # Initial correlation filter
+        points_matched['corr'] = corr_values
+        correlation_mask = corr_values >= self.min_correlation
+        
+        if not np.any(correlation_mask):
+            logger.debug("No points passed correlation filter.")
+            return Keypoints()
 
-        valid_points = points_combined[valid_mask].copy()
-        valid_corrected_rc = keypoints_corrected_rc[valid_mask]
-        # Assign geometry using the index from valid_points to align correctly
-        valid_points = valid_points.assign(
-            geometry=gpd.points_from_xy(
-                keypoints_corrected_xy[valid_mask, 0],
-                keypoints_corrected_xy[valid_mask, 1]
-            )
+        # Apply correlation filter
+        points_matched = points_matched[correlation_mask].copy()
+        keypoints_corrected_xy = keypoints_corrected_xy[correlation_mask]
+        
+        # Prepare data for triangulation filter
+        points_matched = pd.merge(
+            points_matched,
+            points_orig[['trajectory_id', 'geometry']].rename(columns={'geometry': 'geometry_orig'}),
+            on='trajectory_id', how='left'
+        )
+        
+        # Call the filter to mask bad vectors and propose interpolated positions
+        x1_interp, y1_interp, was_interpolated_mask = filter_and_interpolate_flipped_triangles(
+            points_matched.geometry_orig.x.to_numpy(),
+            points_matched.geometry_orig.y.to_numpy(),
+            keypoints_corrected_xy[:, 0],
+            keypoints_corrected_xy[:, 1],
         )
 
-        logger.info(f"Pattern matching kept {len(valid_points)}/{len(points_combined)} points based on correlation threshold of {self.min_correlation}")
+        # Separate points into "good" (not interpolated) and "re-check" (interpolated)
+        good_mask = ~was_interpolated_mask & ~np.isnan(x1_interp)
+        
+        # Handle good points
+        points_good = points_matched[good_mask].copy()
+        xy_good = np.column_stack((x1_interp[good_mask], y1_interp[good_mask]))
+        rc_good = keypoints_corrected_rc[correlation_mask][good_mask]
 
-        # Prepare KeyPoints for descriptor computation for currently valid points
-        if not valid_points.empty:
+        # Handle points that need re-checking
+        if np.any(was_interpolated_mask):
+            logger.info(f"Re-validating {np.sum(was_interpolated_mask)} interpolated vectors...")
+            
+            points_to_recheck = points_matched[was_interpolated_mask].copy()
+            points_to_recheck['geometry'] = gpd.points_from_xy(x1_interp[was_interpolated_mask], y1_interp[was_interpolated_mask])
+            templates_recheck = self.templates.sel(trajectory_id=points_to_recheck.trajectory_id.values)
+            
+            points_fg1_recheck = points_matched[was_interpolated_mask][['trajectory_id', 'geometry_orig', 'angle']]
+            points_fg1_recheck.rename(columns={'geometry_orig': 'geometry'}, inplace=True)
+
+            xy_rechecked, rc_rechecked, corr_rechecked = pattern_matching(
+                points_to_recheck,
+                img, 
+                templates_recheck, 
+                points_fg1_recheck,
+                hs=self.template_size,
+                border_matched=self.border_matched,
+                border_interpolated=self.border_interpolated,
+                band=1
+            )
+            
+            recheck_passed_mask = corr_rechecked >= self.min_correlation
+
+            num_passed = np.sum(recheck_passed_mask)
+            logger.debug(f"Re-validation: {num_passed}/{len(points_to_recheck)} interpolated vectors passed.")
+            
+            # Combine survivors from both groups
+            points_rechecked = points_to_recheck[recheck_passed_mask].copy()
+            points_rechecked['corr'] = corr_rechecked[recheck_passed_mask]
+
+            # Combine final results
+            points_matched = pd.concat([points_good, points_rechecked], ignore_index=True)
+            corrected_xy = np.vstack([xy_good, xy_rechecked[recheck_passed_mask]])
+            corrected_rc = np.vstack([rc_good, rc_rechecked[recheck_passed_mask]])
+        else:
+            # No re-checking needed - use good points directly
+            points_matched = points_good
+            corrected_xy = xy_good
+            corrected_rc = rc_good
+
+        # Final checks
+        if points_matched.empty:
+            logger.debug("No points survived filtering.")
+            return Keypoints()
+                        
+        # Update geometry with corrected positions
+        points_matched = points_matched.drop(columns=['geometry_orig'])
+        points_matched['geometry'] = gpd.points_from_xy(corrected_xy[:, 0], corrected_xy[:, 1])
+        
+        logger.info(f"Pattern matching kept {len(points_matched)} points (correlation >= {self.min_correlation})")
+
+        # Recompute descriptors for final points
+        if not points_matched.empty:
             keypoints_list_with_tags_recompute = [
-                # Create (cv2.KeyPoint, None) tuples as tags are not relevant here for linking insitu
                 (cv2.KeyPoint(px_c, px_r, size=self.descriptor_size, angle=img.angle, octave=self.octave), None)
-                for px_c, px_r in valid_corrected_rc
+                for px_c, px_r in corrected_rc
             ]
-            # Recompute descriptors
+            
             _raw_kps_recomputed, new_descriptors, _surviving_tags_recomputed = compute_descriptors(
-                keypoints_list_with_tags_recompute, # Pass list of tuples
+                keypoints_list_with_tags_recompute,
                 img,
                 self.model,
                 polarisation=1, 
@@ -490,56 +543,33 @@ class ImageProcessor:
             new_descriptors = None
 
         # Filter points based on successful descriptor computation
-        original_count = len(valid_points)
-        removed_count = 0
 
-        if new_descriptors is not None:
-            # Ensure descriptor count matches point count
-            if len(new_descriptors) != len(valid_points):
-                 logger.debug(f"Descriptor count mismatch after re-computation! "
-                              f"Expected {len(valid_points)}, got {len(new_descriptors)}. Removing points.")
-                 removed_count = original_count
-                 valid_points = valid_points.iloc[0:0].copy() # Discard points due to ambiguity
+        original_count = len(points_matched)
+
+        if new_descriptors is not None and len(new_descriptors) == len(points_matched):
+            points_matched['descriptors'] = list(new_descriptors)
+            
+            # Filter out points with invalid descriptors
+            valid_mask_desc = points_matched['descriptors'].apply(lambda d: isinstance(d, np.ndarray))
+            points_matched = points_matched[valid_mask_desc].copy()
+            
+            if len(points_matched) < original_count:
+                logger.debug(f"Removed {original_count - len(points_matched)} points with invalid descriptors")
+        elif original_count > 0:
+            logger.warning("Descriptor computation failed; removing all remaining points.")
+            points_matched = points_matched.iloc[0:0]  # Empty DataFrame
+
+        # Update templates for surviving points
+        if not points_matched.empty:
+            new_templates, new_template_idx = extract_templates(points_matched, img, hs=self.template_size, band=1)
+            
+            if len(new_template_idx) == len(points_matched):
+                self.templates = update_templates(self.templates, new_templates, new_template_idx, points_matched)
             else:
-                valid_points['descriptors'] = list(new_descriptors)
-                # Define the validity check (isinstance check handles None implicitly if compute_descriptors returned a list with Nones)
-                valid_mask_desc = valid_points['descriptors'].apply(lambda d: isinstance(d, np.ndarray))
+                logger.warning("Template extraction index mismatch. Skipping template update.")
 
-                # Apply the filter if any descriptors are invalid
-                if not valid_mask_desc.all():
-                    valid_points = valid_points[valid_mask_desc].copy() # Filter and copy
-                    removed_count = original_count - len(valid_points)
-        else:
-            # Descriptor computation failed entirely (returned None) or was skipped
-            if original_count > 0:
-                logger.warning("Descriptor re-computation failed or was skipped; removing remaining points.")
-                removed_count = original_count
-                valid_points = valid_points.iloc[0:0].copy()
-
-        # Log the result of filtering
-        if removed_count > 0:
-            logger.debug(f"Final filtering removed {removed_count} points "
-                        f"due to invalid/None descriptors after re-computation attempts. "
-                        f"Returning {len(valid_points)} points.")
-        elif original_count > 0: # Log success only if we started with points and removed none
-             logger.debug("Final descriptor check passed, all points kept.")
-
-        # Update templates ONLY for the points that survived the descriptor check
-        if not valid_points.empty:
-            new_templates, new_template_idx = extract_templates(valid_points, img, hs=self.template_size, band=1)
-            # Check if extract_templates returned valid indices matching remaining points
-            if len(new_template_idx) == len(valid_points):
-                 self.templates = update_templates(self.templates, new_templates, new_template_idx, valid_points)
-                 logger.debug(f"Updated templates for {len(valid_points)} points after descriptor check.")
-            else:
-                 logger.warning(f"Template extraction index mismatch. Expected {len(valid_points)} indices, "
-                                f"got {len(new_template_idx)}. Skipping template update.")
-        else:
-            logger.info("No valid points remain after descriptor check to update templates.")
-
-        logger.debug(f"Points returned after final descriptor check: {len(valid_points)}")
-
-        return valid_points
+        logger.debug(f"Returning {len(points_matched)} final points")
+        return points_matched
 
     def ensure_final_persistence(self):
         """Ensure final persistence of any remaining unprocessed data."""
@@ -1037,7 +1067,7 @@ class KeypointDetector:
                     keypoints_with_indices.append((final_kp_to_add, point_row.name))
                 
             except Exception as e:
-                print(f"Error processing point original_idx {original_idx} (input index {point_row.name}): {e}")
+                logger.info(f"Error processing point original_idx {original_idx} (input index {point_row.name}): {e}")
                 pass 
                 
         return keypoints_with_indices
@@ -1222,8 +1252,15 @@ class Matcher:
             # H, inliers is your gpi2, applied to md_idx0/md_idx1
             # The `inliers` mask returned by findHomography is relative to the points fed into it (pos0[md_idx0], pos1[md_idx1])
             if self.estimation_method_name.upper() == "DEGENSAC":
-                import pydegensac
-                H, inliers_mask_homography_relative = pydegensac.findHomography(pos0[md_idx0], pos1[md_idx1], self.model_threshold)
+                try:
+                    import pydegensac
+                    H, inliers_mask_homography_relative = pydegensac.findHomography(pos0[md_idx0], pos1[md_idx1], self.model_threshold)
+                except ImportError:
+                    logger.warning("pydegensac not found, falling back to cv2.USAC_MAGSAC")
+                    self.estimation_method_name = "USAC_MAGSAC"
+                    self.estimation_method = cv2.USAC_MAGSAC
+                    H, inliers_mask_homography_relative = cv2.findHomography(pos0[md_idx0], pos1[md_idx1], 
+                                                                            self.estimation_method, self.model_threshold)
             else:
                 H, inliers_mask_homography_relative = cv2.findHomography(pos0[md_idx0], pos1[md_idx1], 
                                                                         self.estimation_method, self.model_threshold)
@@ -1853,7 +1890,6 @@ def pattern_matching(
         logger.error(f"Pattern Matching: Error transforming corrected pixel coords to projected: {e_final_transform}")
         # Fill with NaNs if final transform fails
         corrected_positions_xy_np = np.full((len(points), 2), np.nan)
-
 
     # Log statistics
     valid_correlations_for_stats = correlation_values_np[np.isfinite(correlation_values_np) & (correlation_values_np > -1.0)]
