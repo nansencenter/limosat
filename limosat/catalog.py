@@ -13,7 +13,7 @@ File handling functions for preparing remote sensing data for processing by limo
 import os
 import re
 from datetime import datetime, timezone
-from .limosat import Image
+from .image import Image
 import geopandas as gpd
 import glob
 import concurrent.futures
