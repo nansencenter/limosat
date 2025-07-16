@@ -279,7 +279,6 @@ class KeypointDetector:
             )
         ]
 
-        logger.debug(f"Detected {len(filtered_keypoints_with_tags)} raw gridded points. Now computing descriptors.")
         return self.compute_descriptors(
             filtered_keypoints_with_tags,
             img,

@@ -61,6 +61,7 @@ class ImageProcessor:
             'template_size': 16,
             'use_interpolation': True,
             'max_interpolation_time_gap_hours': 25,
+            'max_valid_speed_m_per_day': 50000.0,
         }
 
         # Start with defaults, update from config, then from kwargs
@@ -305,7 +306,10 @@ class ImageProcessor:
         points_grid = Keypoints.create(keypoints_coords_arr_grid, descriptors_grid, img, image_id=image_id)
 
         # Match and filter points
-        points_fg1, points_fg2 = self.matcher.match_with_grid(points_poly, points_grid)
+        points_fg1, points_fg2, _ = self.matcher.match_with_grid(
+            points_poly,
+            points_grid
+        )
 
         if points_fg1 is None or points_fg2 is None or points_fg1.empty or points_fg2.empty:
             logger.info("Insufficient match quality or no matches found, skipping point matching step.")
@@ -335,6 +339,47 @@ class ImageProcessor:
                 logger.info("Interpolation disabled, using only matched points")
             elif len(points_fg1) >= len(points_poly):
                 logger.info("All points matched, no interpolation needed")
+
+        # GLOBAL VELOCITY FILTER for both matched and interpolated points
+        if not points_matched.empty:
+            num_before_speed_filter = len(points_matched)
+            
+            # Merge with `points_poly` which contains the previous state for all candidates
+            candidates_with_history = pd.merge(
+                points_matched,
+                points_poly[['trajectory_id', 'geometry', 'time']],
+                on='trajectory_id',
+                suffixes=('', '_prev')
+            )
+
+            # Calculate speed
+            # The current time for all points in `points_matched` is the time of the new image
+            time_diff_days = (img.date - candidates_with_history['time_prev']).dt.total_seconds() / 86400.0
+            distance_m = candidates_with_history.geometry.distance(candidates_with_history.geometry_prev)
+            
+            # Avoid division by zero
+            speed_m_per_day = np.divide(
+                distance_m, 
+                time_diff_days, 
+                out=np.full_like(time_diff_days, np.inf), 
+                where=time_diff_days > 1e-9
+            )
+
+            # Apply filter
+            speed_filter_mask = speed_m_per_day <= self.max_valid_speed_m_per_day
+            valid_trajectory_ids = candidates_with_history.loc[speed_filter_mask, 'trajectory_id']
+            
+            # Filter the original `points_matched` dataframe
+            final_mask = points_matched['trajectory_id'].isin(valid_trajectory_ids)
+            points_matched = points_matched[final_mask]
+            
+            num_after_speed_filter = len(points_matched)
+            if num_after_speed_filter < num_before_speed_filter:
+                num_removed = num_before_speed_filter - num_after_speed_filter
+                logger.info(
+                    f"Global velocity filter: Removed {num_removed} outlier points "
+                    f"exceeding {self.max_valid_speed_m_per_day} m/day."
+                )
 
         # Filter out points that don't have templates
         all_traj_ids = points_matched.trajectory_id.values

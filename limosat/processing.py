@@ -16,169 +16,121 @@ from .utils import log_execution_time, logger
 from .keypoints import Keypoints
 
 @log_execution_time
-def interpolate_drift(points_poly, points_fg1, points_fg2, img, 
-                                        max_interpolation_time_gap_hours,
-                                        border_size,
-                                        model_type=AffineTransform,
-                                        max_interpolation_speed_m_per_day=50000,
-                                        max_anchor_distance_km=20.0
+def interpolate_drift(points_poly, points_fg1, points_fg2, img,
+                                         max_interpolation_time_gap_hours,
+                                         border_size,
+                                         model_type=AffineTransform,
+                                         max_anchor_distance_km=0
                                         ):
+    """
+    Interpolates drift for unmatched points using per-source-image affine transforms.
+    (Corrected minimalist style)
+    """
     points_result = points_fg2.copy()
-    points_result['interpolated'] = 0 
-
+    points_result['interpolated'] = 0
+    
     MIN_SAMPLES_FOR_AFFINE = 10
-    
-    if len(points_fg1) < MIN_SAMPLES_FOR_AFFINE: 
-        if len(points_fg1) == 0 and (points_poly.empty or len(points_fg1) == len(points_poly)):
-             logger.info("interpolate_drift: No valid anchor points for ATM. Skipping interpolation.")
-        else:
-             logger.info(f"interpolate_drift: Not enough matched points ({len(points_fg1)}) for ATM. Min: {MIN_SAMPLES_FOR_AFFINE}. Skipping.")
+    if len(points_fg1) < MIN_SAMPLES_FOR_AFFINE:
+        logger.info(f"Not enough matched points ({len(points_fg1)}) for interpolation. Min: {MIN_SAMPLES_FOR_AFFINE}.")
         return points_result
 
-    try:
-        # Use a robust merge to select source points for the transform, ensuring alignment.
-        # This is the key change to match the original script's behavior precisely.
-        merged_anchors = pd.merge(
-            points_fg2[['trajectory_id', 'geometry']],
-            points_poly[['trajectory_id', 'geometry']],
+    # 1. Identify unmatched points and group all points by source image_id
+    unmatched_points = points_poly[~points_poly['trajectory_id'].isin(points_fg1['trajectory_id'])].copy()
+    if unmatched_points.empty:
+        logger.debug("No unmatched points to consider for interpolation.")
+        return points_result
+        
+    anchor_groups = points_fg1.groupby('image_id')
+    unmatched_groups = unmatched_points.groupby('image_id')
+    
+    all_interpolated_points = []
+
+    # 2. Loop through each source image group
+    for source_id, anchor_group in anchor_groups:
+        if len(anchor_group) < MIN_SAMPLES_FOR_AFFINE:
+            logger.debug(f"Skipping group {source_id}: not enough anchor points ({len(anchor_group)}).")
+            continue
+        
+        # a. Find corresponding destination points and estimate local transform
+        tids_group = anchor_group['trajectory_id']
+        anchor_dest_group = points_fg2[points_fg2['trajectory_id'].isin(tids_group)]
+        
+        # Ensure perfect alignment for transform estimation
+        # This merge is local to the loop and thus safe and correct.
+        local_anchors = pd.merge(
+            anchor_group[['trajectory_id', 'geometry']],
+            anchor_dest_group[['trajectory_id', 'geometry']],
             on='trajectory_id',
-            suffixes=('_new', '_orig')
+            suffixes=('_src', '_dst')
         )
 
-        if merged_anchors.empty:
-            logger.warning("interpolate_drift: Merging anchor points resulted in an empty DataFrame. Skipping.")
-            return points_result
-
-        pos0_atm = np.array(list(merged_anchors.geometry_orig.apply(lambda p: p.coords[0])))
-        pos1_atm = np.array(list(merged_anchors.geometry_new.apply(lambda p: p.coords[0])))
+        pos0_atm = np.column_stack((local_anchors.geometry_src.x, local_anchors.geometry_src.y))
+        pos1_atm = np.column_stack((local_anchors.geometry_dst.x, local_anchors.geometry_dst.y))
         
-        atm = model_type()
-        if not atm.estimate(pos0_atm, pos1_atm):
-            logger.warning("interpolate_drift: Affine transformation estimation failed.")
-            return points_result
-    except Exception as e:
-        logger.error(f"interpolate_drift: Error during ATM estimation: {e}", exc_info=True)
-        return points_result
+        atm_local = model_type()
+        if not atm_local.estimate(pos0_atm, pos1_atm):
+            logger.warning(f"Affine transform estimation failed for group {source_id}.")
+            continue
 
-    unmatched_mask = ~points_poly.index.isin(points_fg1.index)
-    unmatched_points_current_stage = points_poly[unmatched_mask].copy() 
-
-    if unmatched_points_current_stage.empty:
-        logger.debug("interpolate_drift: No unmatched points to consider for interpolation.")
-        return points_result
-
-    try:
-        unmatched_points_current_stage = unmatched_points_current_stage[unmatched_points_current_stage.within(img.poly)]
-    except Exception as e_bounds:
-        logger.warning(f"interpolate_drift: Error checking image bounds: {e_bounds}. Proceeding unfiltered.")
-
-    if unmatched_points_current_stage.empty:
-        logger.debug("interpolate_drift: No unmatched points within image bounds."); return points_result
-
-    current_img_time_naive = img.date.tz_localize(None) if img.date.tzinfo else img.date
-    unmatched_times_naive = unmatched_points_current_stage['time'].dt.tz_localize(None) 
-    time_gap_mask = (current_img_time_naive - unmatched_times_naive).dt.total_seconds() <= (max_interpolation_time_gap_hours * 3600)
-    unmatched_points_current_stage = unmatched_points_current_stage[time_gap_mask]
-    
-    logger.debug(f"interpolate_drift: {len(unmatched_points_current_stage)} unmatched points after bounds & time gap filters.")
-    if unmatched_points_current_stage.empty: return points_result
-
-    max_anchor_distance_meters = max_anchor_distance_km * 1000.0
-    # Use the original geometry from the merged anchors for the convex hull
-    if not merged_anchors.geometry_orig.empty and len(merged_anchors.geometry_orig) >= 3:
+        # b. Select and filter unmatched points for this group
         try:
-            anchor_cloud_multipoint = MultiPoint(merged_anchors.geometry_orig.tolist())
-            convex_hull_of_anchors = anchor_cloud_multipoint.convex_hull
-            distances_to_hull_edge = unmatched_points_current_stage.geometry.distance(convex_hull_of_anchors)
-            near_anchor_hull_mask = distances_to_hull_edge <= max_anchor_distance_meters
+            unmatched_group = unmatched_groups.get_group(source_id)
+        except KeyError:
+            logger.debug(f"No unmatched points for source_id {source_id}.")
+            continue
+        
+        # Chain all pre-transform filters together for a single pass
+        try:
+            convex_hull_of_anchors = MultiPoint(local_anchors.geometry_src.tolist()).convex_hull
             
-            num_discarded = len(unmatched_points_current_stage) - np.sum(near_anchor_hull_mask)
-            unmatched_points_current_stage = unmatched_points_current_stage[near_anchor_hull_mask]
-            if num_discarded > 0:
-                 logger.debug(f"interpolate_drift: Discarded {num_discarded} points far from anchor hull.")
-        except Exception as e_hull: # Catches errors from MultiPoint, convex_hull, or distance
-            logger.warning(f"interpolate_drift: Error during hull processing or distance calc: {e_hull}. Skipping filter.")
-    else:
-        logger.debug(f"interpolate_drift: Not enough anchors ({len(src_pts_for_atm_geodf.geometry)}) for hull filter.")
+            is_within_bounds = unmatched_group.within(img.poly)
+            time_gap_ok = (img.date.tz_localize(None) - unmatched_group['time'].dt.tz_localize(None)).dt.total_seconds() <= (max_interpolation_time_gap_hours * 3600)
+            is_near_hull = unmatched_group.geometry.distance(convex_hull_of_anchors) <= (max_anchor_distance_km * 1000.0)
+            
+            filtered_unmatched = unmatched_group[is_within_bounds & time_gap_ok & is_near_hull].copy()
+        except Exception as e:
+            logger.warning(f"Error during pre-filtering for group {source_id}: {e}")
+            continue
 
-    if unmatched_points_current_stage.empty:
-        logger.debug("interpolate_drift: No points remaining after anchor distance filter."); return points_result
+        if filtered_unmatched.empty: continue
+
+        # c. Apply transform and perform post-interpolation checks
+        pos0_to_interp = np.column_stack((filtered_unmatched.geometry.x, filtered_unmatched.geometry.y))
+        interpolated_coords_np = atm_local(pos0_to_interp)
         
-    pos0_to_interp = np.column_stack((unmatched_points_current_stage.geometry.x, unmatched_points_current_stage.geometry.y))
-    interpolated_pos_geo_coords_np = atm(pos0_to_interp)
-
-    prev_times_series = unmatched_points_current_stage['time']
-    prev_geoms_series = unmatched_points_current_stage.geometry
-    prev_times_for_calc_naive = prev_times_series.dt.tz_localize(None)
-    time_diff_seconds_series = (current_img_time_naive - prev_times_for_calc_naive).dt.total_seconds()
-    time_diff_days_series = pd.Series(time_diff_seconds_series / (24.0 * 60.0 * 60.0), index=unmatched_points_current_stage.index)
-    
-    new_interpolated_geoms_series = gpd.GeoSeries(
-        gpd.points_from_xy(interpolated_pos_geo_coords_np[:,0], interpolated_pos_geo_coords_np[:,1]),
-        crs=prev_geoms_series.crs, index=unmatched_points_current_stage.index)
-    
-    displacements_m_series = prev_geoms_series.distance(new_interpolated_geoms_series)
-    speeds_m_per_day_series = pd.Series(np.nan, index=unmatched_points_current_stage.index)
-    valid_time_diff_mask = time_diff_days_series > 1e-9
-    if valid_time_diff_mask.any():
-        speeds_m_per_day_series.loc[valid_time_diff_mask] = \
-            displacements_m_series[valid_time_diff_mask] / time_diff_days_series[valid_time_diff_mask]
-
-    speed_filter_mask_series = (speeds_m_per_day_series <= max_interpolation_speed_m_per_day) & speeds_m_per_day_series.notna()
-    unmatched_points_after_velocity_filter = unmatched_points_current_stage[speed_filter_mask_series]
-    interpolated_pos_geo_coords_after_velocity_filter_np = interpolated_pos_geo_coords_np[speed_filter_mask_series.values] 
-
-    num_discarded_speed = len(unmatched_points_current_stage) - len(unmatched_points_after_velocity_filter)
-    if num_discarded_speed > 0:
-        logger.debug(f"Post-interp velocity check: Discarded {num_discarded_speed} points.")
-    if unmatched_points_after_velocity_filter.empty:
-        logger.debug("interpolate_drift: No points remaining after velocity check."); return points_result
-        
-    points_final_interpolated = Keypoints()
-    if not unmatched_points_after_velocity_filter.empty:
-        cols_final_pixel, rows_final_pixel = img.transform_points(
-            interpolated_pos_geo_coords_after_velocity_filter_np[:, 0], 
-            interpolated_pos_geo_coords_after_velocity_filter_np[:, 1], 
-            DstToSrc=1, dst_srs=img.srs
+        filtered_unmatched['interpolated_geom'] = gpd.points_from_xy(
+            interpolated_coords_np[:, 0], interpolated_coords_np[:, 1], crs=filtered_unmatched.crs
         )
-        
-        height, width = img.shape()
 
-        pixel_valid_mask_np = (cols_final_pixel >= border_size) & (cols_final_pixel < width - border_size) & \
-                              (rows_final_pixel >= border_size) & (rows_final_pixel < height - border_size) & \
-                              np.isfinite(cols_final_pixel) & np.isfinite(rows_final_pixel)
+        # d. Final boundary checks (speed check removed)
+        cols, rows = img.transform_points(interpolated_coords_np[:, 0], interpolated_coords_np[:, 1], DstToSrc=1, dst_srs=img.srs)
+        pixel_bounds_ok = (cols >= border_size) & (cols < img.shape()[1] - border_size) & \
+                          (rows >= border_size) & (rows < img.shape()[0] - border_size) & \
+                          np.isfinite(cols) & np.isfinite(rows)
 
-        final_valid_metadata_df = unmatched_points_after_velocity_filter[pixel_valid_mask_np]
-        final_valid_pixel_coords_np = np.column_stack((cols_final_pixel[pixel_valid_mask_np], rows_final_pixel[pixel_valid_mask_np]))
-        final_valid_geo_coords_np = interpolated_pos_geo_coords_after_velocity_filter_np[pixel_valid_mask_np]
+        final_valid_mask = pixel_bounds_ok
+        final_points_to_add = filtered_unmatched[final_valid_mask]
+
+        if final_points_to_add.empty: continue
         
-        if not final_valid_metadata_df.empty:
-            base_image_id_val = points_result['image_id'].iloc[0]
-            points_final_interpolated = Keypoints.create(
-                final_valid_pixel_coords_np, 
-                [None] * len(final_valid_metadata_df), img, base_image_id_val 
-            )
-            points_final_interpolated['trajectory_id'] = final_valid_metadata_df.trajectory_id.values
-            points_final_interpolated['interpolated'] = 1
-            points_final_interpolated.geometry = gpd.points_from_xy(
-                 final_valid_geo_coords_np[:,0], final_valid_geo_coords_np[:,1], crs=points_poly.crs
-            )
-            logger.info(f"Successfully interpolated and kept {len(points_final_interpolated)} points.")
-        else:
-            logger.info("interpolate_drift: No points passed final pixel boundary checks.")
-    
-    if not points_final_interpolated.empty:
-        points_final_combined_df = pd.concat(
-            [points_result, points_final_interpolated], ignore_index=True, sort=False 
+        # e. Collect valid interpolated points
+        points_interpolated_group = Keypoints.create(
+            np.column_stack((cols[final_valid_mask], rows[final_valid_mask])),
+            [None] * len(final_points_to_add), img, points_result['image_id'].iloc[0]
         )
-        current_crs = points_poly.crs
-        if isinstance(points_final_combined_df, gpd.GeoDataFrame):
-            combined_gdf = points_final_combined_df.set_crs(current_crs, allow_override=True)
-        else:
-            combined_gdf = gpd.GeoDataFrame(points_final_combined_df, geometry='geometry', crs=current_crs)
-        return Keypoints._from_gdf(combined_gdf)
-    else:
+        points_interpolated_group['trajectory_id'] = final_points_to_add['trajectory_id'].values
+        points_interpolated_group['interpolated'] = 1
+        points_interpolated_group.geometry = final_points_to_add['interpolated_geom'].values
+        
+        all_interpolated_points.append(points_interpolated_group)
+        logger.info(f"Group {source_id}: Successfully interpolated and kept {len(points_interpolated_group)} points.")
+
+    # 3. Aggregate results
+    if not all_interpolated_points:
+        logger.info("No points were successfully interpolated across any group.")
         return points_result
+
+    return Keypoints._from_gdf(pd.concat([points_result] + all_interpolated_points, ignore_index=True))
 
 @log_execution_time
 def pattern_matching(

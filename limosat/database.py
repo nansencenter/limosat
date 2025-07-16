@@ -49,11 +49,11 @@ class DriftDatabase:
     def save(self, points, templates, last_persisted_id, insitu_points=None):
         if points.empty:
              logger.info("No points to save.")
-             if templates is not None and templates.trajectory_id.size > 0 and self.zarr_path:
+             if templates is not None and templates.trajectory_ids.size > 0 and self.zarr_path:
                  try:
                       logger.info("Saving empty points state, but saving templates...")
-                      templates.to_dataset(name="template_data").to_zarr(self.zarr_path, mode="w")
-                      logger.info(f"Successfully persisted {templates.trajectory_id.size} templates (with 0 new points).")
+                      templates.data.to_dataset(name="template_data").to_zarr(self.zarr_path, mode="w")
+                      logger.info(f"Successfully persisted {templates.trajectory_ids.size} templates (with 0 new points).")
                       return True
                  except Exception as e:
                       logger.error(f"Failed to save templates even with no points: {e}", exc_info=True)
@@ -70,9 +70,9 @@ class DriftDatabase:
 
             if points_delta.empty:
                 logger.info("No new points detected since last save.")
-                if templates is not None and templates.trajectory_id.size > 0 and self.zarr_path:
+                if templates is not None and templates.trajectory_ids.size > 0 and self.zarr_path:
                     logger.info("Saving templates only (no new points).")
-                    templates.to_dataset(name="template_data").to_zarr(self.zarr_path, mode="w") 
+                    templates.data.to_dataset(name="template_data").to_zarr(self.zarr_path, mode="w") 
                     return True
                 return True
 
@@ -108,8 +108,8 @@ class DriftDatabase:
                     )
                     logger.debug(f"Appended {len(points_delta)} points to database.")
 
-            if templates is not None and templates.trajectory_id.size > 0:
-                templates_to_save = templates.copy()
+            if templates is not None and templates.trajectory_ids.size > 0:
+                templates_to_save = templates.data.copy()
                 if hasattr(templates_to_save, 'encoding') and 'chunks' in templates_to_save.encoding:
                     del templates_to_save.encoding['chunks']
                 templates_to_save.to_dataset(name="template_data").to_zarr(self.zarr_path, mode="w")
