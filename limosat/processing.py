@@ -20,8 +20,7 @@ def interpolate_drift(points_poly, points_fg1, points_fg2, img,
                                          max_interpolation_time_gap_hours,
                                          border_size,
                                          model_type=AffineTransform,
-                                         max_interpolation_speed_m_per_day=50000,
-                                         max_anchor_distance_km=20.0
+                                         max_anchor_distance_km=0
                                         ):
     """
     Interpolates drift for unmatched points using per-source-image affine transforms.
@@ -46,7 +45,7 @@ def interpolate_drift(points_poly, points_fg1, points_fg2, img,
     
     all_interpolated_points = []
 
-    # 2. Loop through each source image group (this is the safer, original structure)
+    # 2. Loop through each source image group
     for source_id, anchor_group in anchor_groups:
         if len(anchor_group) < MIN_SAMPLES_FOR_AFFINE:
             logger.debug(f"Skipping group {source_id}: not enough anchor points ({len(anchor_group)}).")
