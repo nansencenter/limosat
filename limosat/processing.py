@@ -102,22 +102,14 @@ def interpolate_drift(points_poly, points_fg1, points_fg2, img,
         filtered_unmatched['interpolated_geom'] = gpd.points_from_xy(
             interpolated_coords_np[:, 0], interpolated_coords_np[:, 1], crs=filtered_unmatched.crs
         )
-        time_diff_days = (img.date.tz_localize(None) - filtered_unmatched['time'].dt.tz_localize(None)).dt.total_seconds() / 86400.0
-        
-        filtered_unmatched['speed_m_per_day'] = np.divide(
-            filtered_unmatched.geometry.distance(filtered_unmatched['interpolated_geom']),
-            time_diff_days,
-            out=np.full_like(time_diff_days, np.nan), where=time_diff_days > 1e-9
-        )
 
-        # d. Final speed and boundary checks
-        speed_ok = filtered_unmatched['speed_m_per_day'] <= max_interpolation_speed_m_per_day
+        # d. Final boundary checks (speed check removed)
         cols, rows = img.transform_points(interpolated_coords_np[:, 0], interpolated_coords_np[:, 1], DstToSrc=1, dst_srs=img.srs)
         pixel_bounds_ok = (cols >= border_size) & (cols < img.shape()[1] - border_size) & \
                           (rows >= border_size) & (rows < img.shape()[0] - border_size) & \
                           np.isfinite(cols) & np.isfinite(rows)
 
-        final_valid_mask = speed_ok.values & pixel_bounds_ok
+        final_valid_mask = pixel_bounds_ok
         final_points_to_add = filtered_unmatched[final_valid_mask]
 
         if final_points_to_add.empty: continue
