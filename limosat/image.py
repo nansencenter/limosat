@@ -4,12 +4,14 @@
 #
 # Licensed under the MIT License. See the LICENSE file in the project root for full details.
 
+import os
+import re
 from functools import cached_property
 import numpy as np
 import cartopy.crs as ccrs
 from shapely.geometry import Polygon
 from nansat import Nansat, NSR
-from .utils import extract_date
+from .utils import extract_date, logger
 
 class Image(Nansat):
     """
@@ -55,6 +57,15 @@ class Image(Nansat):
         # Initialize cache attributes
         self._transform_cache = {}
         self._max_cache_entries = 50  # Limit cache size to prevent excessive memory use
+
+    @cached_property
+    def orbit_num(self):
+        """Extracts the orbit number from the filename."""
+        match = re.search(r'_\d{8}T\d{6}_(\d{6})_', os.path.basename(self.filename))
+        if match:
+            return int(match.group(1))
+        logger.warning(f"Could not extract orbit number from {os.path.basename(self.filename)}")
+        return None
 
     @cached_property
     def angle(self):

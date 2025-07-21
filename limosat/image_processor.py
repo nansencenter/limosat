@@ -70,9 +70,24 @@ class ImageProcessor:
             proc_params.update(config['image_processor_params'])
         proc_params.update(kwargs)
 
-        # Set attributes from the final parameters
-        for key, value in proc_params.items():
-            setattr(self, key, value)
+        # Set attributes from the final parameters for clarity and static analysis
+        self.persist_updates = proc_params['persist_updates']
+        self.persist_interval = proc_params['persist_interval']
+        self.pruning_interval = proc_params['pruning_interval']
+        self.temporal_window = proc_params['temporal_window']
+        self.candidate_search_max_daily_drift_m = proc_params['candidate_search_max_daily_drift_m']
+        self.window_size = proc_params['window_size']
+        self.border_size = proc_params['border_size']
+        self.border_matched = proc_params['border_matched']
+        self.border_interpolated = proc_params['border_interpolated']
+        self.stride = proc_params['stride']
+        self.octave = proc_params['octave']
+        self.min_correlation = proc_params['min_correlation']
+        self.response_threshold = proc_params['response_threshold']
+        self.template_size = proc_params['template_size']
+        self.use_interpolation = proc_params['use_interpolation']
+        self.max_interpolation_time_gap_hours = proc_params['max_interpolation_time_gap_hours']
+        self.max_valid_speed_m_per_day = proc_params['max_valid_speed_m_per_day']
 
         self._last_persisted_id = 0
         
@@ -153,7 +168,7 @@ class ImageProcessor:
             points_final = Keypoints()
         else:
             logger.info(f"{len(points_poly)} overlapping points found")
-            points_final = self._match_existing_points(points_poly, img, image_id)
+            points_final = self._match_existing_points(points_poly, img, image_id, img.orbit_num)
             if points_final is None:
                 logger.info("Insufficient match quality, skipping point matching")
                 points_final = Keypoints()
@@ -254,7 +269,7 @@ class ImageProcessor:
         )
 
         if keypoints_coords_arr is not None and descriptors_arr is not None:
-            points_new = Keypoints.create(keypoints_coords_arr, descriptors_arr, img, image_id)
+            points_new = Keypoints.create(keypoints_coords_arr, descriptors_arr, img, image_id, img.orbit_num)
             
             current_self_points_len = len(self.points)
             self.points = self.points.append(points_new) # This assigns final trajectory_ids to the points_new portion
@@ -285,12 +300,38 @@ class ImageProcessor:
             self.templates.update(points_final, img, self.template_size, band=1)
             
     @log_execution_time
-    def _match_existing_points(self, points_poly, img, image_id):
+    def _match_existing_points(self, points_poly, img, image_id, current_orbit_num):
         """
         Match points from previous image to current one, with optional interpolation,
         then apply pattern matching and filter by correlation. This version uses the
         empirically correct trajectory_id assignment and robust descriptor filtering.
         """
+        # Goal: Filter points_poly to exclude points from the same orbit.
+
+        # 1. Check for the prerequisite column.
+        if 'orbit_num' not in points_poly.columns:
+            logger.error("FATAL: 'orbit_num' column not found in points_poly. Cannot apply orbit filter.")
+            return Keypoints() # Return an empty Keypoints object
+
+        # 2. Create and apply the filter mask.
+        previous_orbit_nums = points_poly['orbit_num']
+        orbit_filter_mask = previous_orbit_nums != current_orbit_num
+        points_poly_filtered = points_poly[orbit_filter_mask]
+
+        # 3. Log the operation and handle the empty case.
+        if points_poly_filtered.empty:
+            total_candidates_in_buffer = len(points_poly)
+            logger.info(
+                f"Found {total_candidates_in_buffer} points in buffer, but all were from the same orbit ({current_orbit_num}). "
+                "Skipping matching."
+            )
+            return Keypoints() # Exit early
+        else:
+            logger.info(
+                f"{len(points_poly_filtered)} valid candidate points found for matching from previous orbits."
+            )
+
+        # 4. Ensure the rest of the method uses the filtered data.
         # Detect gridded keypoints and compute their descriptors in one step
         keypoints_coords_arr_grid, descriptors_grid, _ = self.keypoint_detector.detect_gridded_points(
             img,
@@ -303,11 +344,11 @@ class ImageProcessor:
             logger.warning("Failed to compute descriptors for grid points. Skipping matching.")
             return None
 
-        points_grid = Keypoints.create(keypoints_coords_arr_grid, descriptors_grid, img, image_id=image_id)
+        points_grid = Keypoints.create(keypoints_coords_arr_grid, descriptors_grid, img, image_id=image_id, orbit_num=img.orbit_num)
 
         # Match and filter points
         points_fg1, points_fg2, _ = self.matcher.match_with_grid(
-            points_poly,
+            points_poly_filtered,
             points_grid
         )
 
@@ -321,9 +362,9 @@ class ImageProcessor:
         points_matched = points_fg2
 
         # Interpolate drift if needed
-        if self.use_interpolation and len(points_fg1) < len(points_poly):
+        if self.use_interpolation and len(points_fg1) < len(points_poly_filtered):
             points_matched = interpolate_drift(
-                points_poly=points_poly,
+                points_poly=points_poly_filtered,
                 points_fg1=points_fg1,
                 points_fg2=points_matched,
                 img=img,
@@ -337,17 +378,17 @@ class ImageProcessor:
         else:
             if not self.use_interpolation:
                 logger.info("Interpolation disabled, using only matched points")
-            elif len(points_fg1) >= len(points_poly):
+            elif len(points_fg1) >= len(points_poly_filtered):
                 logger.info("All points matched, no interpolation needed")
 
         # GLOBAL VELOCITY FILTER for both matched and interpolated points
         if not points_matched.empty:
             num_before_speed_filter = len(points_matched)
             
-            # Merge with `points_poly` which contains the previous state for all candidates
+            # Merge with `points_poly_filtered` which contains the previous state for all candidates
             candidates_with_history = pd.merge(
                 points_matched,
-                points_poly[['trajectory_id', 'geometry', 'time']],
+                points_poly_filtered[['trajectory_id', 'geometry', 'time']],
                 on='trajectory_id',
                 suffixes=('', '_prev')
             )
@@ -395,7 +436,7 @@ class ImageProcessor:
             return Keypoints() 
 
         # Get original points and templates for pattern matching
-        points_orig = points_poly[points_poly.trajectory_id.isin(all_traj_ids)]
+        points_orig = points_poly_filtered[points_poly_filtered.trajectory_id.isin(all_traj_ids)]
         templates_all = self.templates.get_by_id(all_traj_ids)
         
         if not (len(points_matched) == len(points_orig) == len(templates_all.trajectory_id)):
