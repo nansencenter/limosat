@@ -184,7 +184,6 @@ class Matcher:
     def filter(self, matches, pos0, pos1):
         bf_idx0 = np.array([m.queryIdx for m in matches]) # Indices into pos0 for ALL 'matches'
         bf_idx1 = np.array([m.trainIdx for m in matches]) # Indices into pos1 for ALL 'matches'
-        logger.debug(f'Matching: Number of matches: {bf_idx0.size}')
 
         # Filter by descriptor distance
         # descriptor_distance is already calculated for ALL 'matches' (initial crosscheck)
@@ -192,7 +191,6 @@ class Matcher:
         gpi0_desc_filter_mask = descriptor_distance < self.descriptor_distance_max 
         dd_idx0 = bf_idx0[gpi0_desc_filter_mask] # Indices of points passing descriptor distance filter
         dd_idx1 = bf_idx1[gpi0_desc_filter_mask]
-        logger.debug(f'Distance: Number of matches: {dd_idx0.size}')
         if dd_idx0.size == 0: # No points passed descriptor distance filter
             if not self.use_model_estimation: return dd_idx0, dd_idx1, None
             return None, None, None
@@ -207,6 +205,10 @@ class Matcher:
 
         if not self.use_model_estimation:
             return md_idx0, md_idx1, None # md_idx0, md_idx1 are the final indices if no model estimation
+
+        if md_idx0.size < 4:
+            logger.warning("Warning: Insufficient matches for model estimation (minimum 4 required)")
+            return None, None, None
 
         try:
             # H, inliers is your gpi2, applied to md_idx0/md_idx1
@@ -242,7 +244,9 @@ class Matcher:
                 
             model = self.model(H) # Assuming self.model is AffineTransform class
             residuals = model.residuals(pos0[rc_idx0], pos1[rc_idx1])
-            logger.debug(f'{self.estimation_method_name}: Number of matches: {rc_idx0.size}')
+            logger.info(
+                f'{self.estimation_method_name}: Found {rc_idx0.size} inliers from {len(matches)} initial candidates.'
+            )
             
             if self.plot: # Your existing plot call
                 self.plot_quiver(pos0[rc_idx0], pos1[rc_idx1], residuals)

@@ -116,7 +116,8 @@ def interpolate_drift(points_poly, points_fg1, points_fg2, img,
         # e. Collect valid interpolated points
         points_interpolated_group = Keypoints.create(
             np.column_stack((cols[final_valid_mask], rows[final_valid_mask])),
-            [None] * len(final_points_to_add), img, points_result['image_id'].iloc[0]
+            [None] * len(final_points_to_add), img, points_result['image_id'].iloc[0],
+            img.orbit_num
         )
         points_interpolated_group['trajectory_id'] = final_points_to_add['trajectory_id'].values
         points_interpolated_group['interpolated'] = 1

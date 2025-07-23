@@ -25,9 +25,12 @@ class Keypoints(gpd.GeoDataFrame):
                 'angle': [],
                 'corr': [],
                 'time': [],
-                'interpolated': []
+                'interpolated': [],
+                'orbit_num': [],
             }
             super().__init__(empty_data)
+            if 'orbit_num' in self.columns:
+                self['orbit_num'] = self['orbit_num'].astype('int32')
             if 'time' in self.columns:
                 self['time'] = pd.to_datetime(self['time'], errors='coerce')
         else:
@@ -113,7 +116,7 @@ class Keypoints(gpd.GeoDataFrame):
         return self._from_gdf(result)
 
     @classmethod
-    def create(cls, keypoints, descriptors, img, image_id):
+    def create(cls, keypoints, descriptors, img, image_id, orbit_num):
         xy = img.transform_points(keypoints[:, 0], keypoints[:, 1], DstToSrc=0, dst_srs=cls.srs)
         N = len(xy[0])
         new_data = {
@@ -126,6 +129,7 @@ class Keypoints(gpd.GeoDataFrame):
             'corr': np.zeros(N),
             'time': [img.date] * N,
             'interpolated': np.zeros(N),
+            'orbit_num': np.full(N, orbit_num, dtype='int32'),
 
         }
         return cls(new_data)

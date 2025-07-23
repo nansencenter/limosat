@@ -14,7 +14,7 @@ import os
 import json
 import numpy as np
 import pandas as pd 
-from sqlalchemy import text, Float, Text, DateTime, inspect
+from sqlalchemy import text, Float, Text, DateTime, inspect, Integer
 from .utils import logger, log_execution_time 
 
 class DriftDatabase:
@@ -42,7 +42,8 @@ class DriftDatabase:
             'angle': Float(),
             'corr': Float(),
             'time': DateTime(timezone=False),
-            'interpolated': Float()
+            'interpolated': Float(),
+            'orbit_num': Integer()
         }
         
     @log_execution_time
@@ -86,8 +87,10 @@ class DriftDatabase:
                     updated_traj_ids = points_delta['trajectory_id'].unique().tolist()
                     updated_traj_ids = [int(tid) for tid in updated_traj_ids if pd.notna(tid)]
 
-                    inspector = inspect(connection.engine) # Use the engine from the connection
-                    if updated_traj_ids and inspector.has_table(self.run_name, schema=connection.dialect.default_schema_name):
+                    inspector = inspect(connection.engine)
+                    table_exists = inspector.has_table(self.run_name, schema=connection.dialect.default_schema_name)
+
+                    if updated_traj_ids and table_exists:
                         update_sql = text(f"""
                             UPDATE {self.run_name}
                             SET is_last = 0
@@ -96,8 +99,7 @@ class DriftDatabase:
                         result = connection.execute(update_sql, {"traj_ids": updated_traj_ids})
                         logger.debug(f"Updated is_last=0 for {result.rowcount} previous points in DB.")
                     elif updated_traj_ids:
-                        # This condition is met on the very first save operation for this run_name
-                        logger.debug(f"Table '{self.run_name}' does not exist yet or is empty. Skipping initial 'is_last' update.")
+                        logger.debug(f"Table '{self.run_name}' does not exist yet. It will be created.")
 
                     points_delta.to_postgis(
                         self.run_name,
