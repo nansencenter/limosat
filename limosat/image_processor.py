@@ -200,20 +200,29 @@ class ImageProcessor:
             if images_since_persist >= self.persist_interval:
                 current_last_image_id = current_points_image_id
                 
-                # --- 1. Attempt to save data to the database ---
+                # --- 1. Filter points to save only matched trajectories ---
+                
+                # Identify trajectory_ids that appear more than once (i.e., have been matched)
+                traj_id_counts = self.points['trajectory_id'].value_counts()
+                matched_traj_ids = traj_id_counts[traj_id_counts > 1].index
+                
+                # Create a filtered dataframe for persistence
+                points_to_persist = self.points[self.points['trajectory_id'].isin(matched_traj_ids)]
+                
+                logger.info(f"Found {len(matched_traj_ids)} matched trajectories. "
+                            f"Persisting {len(points_to_persist)} points.")
+
+                # --- 2. Attempt to save data to the database ---
                 save_successful = self.db.save(
-                    self.points,
+                    points_to_persist,
                     self.templates,
                     self._last_persisted_id,
                     self.insitu_points
                 )
 
-                # --- 2. Prune in-memory data only if save was successful ---
+                # --- 3. Prune in-memory data only if save was successful ---
                 if save_successful:
                     try:
-                        points_delta_count = len(self.points[self.points['image_id'] > self._last_persisted_id])
-                        logger.info(f"Database persistence successful for {points_delta_count} new/updated points.")
-                        
                         num_before_prune = len(self.points)
                         keep_mask = (self.points['is_last'] == 1) & \
                                     (self.points['time'] >= time_threshold)
