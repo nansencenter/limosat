@@ -227,12 +227,17 @@ def pattern_matching(
                  raise KeyError(f"Template for TID {current_tid} resulted in empty selection.")
             template_np = template_data_array.data.astype(np.uint8)
         except KeyError:
-            # logger.warning(f"Pattern Matching: Template not found for TID {current_tid}. Skipping.")
+            logger.warning(f"Pattern Matching: Template not found for TID {current_tid}. Skipping.")
+            results_list.append((([0, 0], -1.0, 0.0)))
+            continue
+
+        if np.var(template_np) < 1e-9:
+            logger.warning(f"Pattern Matching: Template for TID {current_tid} has zero variance. Skipping.")
             results_list.append((([0, 0], -1.0, 0.0)))
             continue
         
         if template_np.shape != (hs * 2 + 1, hs * 2 + 1):
-            # logger.warning(f"Pattern Matching: Template for TID {current_tid} has unexpected shape {template_np.shape}. Expected ({hs*2+1}, {hs*2+1}). Skipping.")
+            logger.warning(f"Pattern Matching: Template for TID {current_tid} has unexpected shape {template_np.shape}. Expected ({hs*2+1}, {hs*2+1}). Skipping.")
             results_list.append( ([0, 0], -1.0, 0.0) )
             continue
 
