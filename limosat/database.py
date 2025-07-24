@@ -80,7 +80,11 @@ class DriftDatabase:
             logger.info(f"Processing {len(points_delta)} new/updated points for persistence.")
             points_delta = points_delta.set_crs('EPSG:3413')
             if 'descriptors' in points_delta.columns:
-                 points_delta['descriptors'] = points_delta['descriptors'].apply(self._serialize_descriptors)
+                # To save space, only persist descriptors for the last known point of a trajectory.
+                points_delta['descriptors'] = points_delta.apply(
+                    lambda row: self._serialize_descriptors(row['descriptors']) if row['is_last'] == 1 else None,
+                    axis=1
+                )
 
             with self.engine.connect() as connection:
                 with connection.begin():
