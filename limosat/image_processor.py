@@ -223,9 +223,6 @@ class ImageProcessor:
                 # --- 3. Prune in-memory data only if save was successful ---
                 if save_successful:
                     try:
-                        points_delta_count = len(self.points[self.points['image_id'] > self._last_persisted_id])
-                        logger.info(f"Database persistence successful for {points_delta_count} new/updated points.")
-                        
                         num_before_prune = len(self.points)
                         keep_mask = (self.points['is_last'] == 1) & \
                                     (self.points['time'] >= time_threshold)
