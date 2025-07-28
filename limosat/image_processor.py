@@ -70,6 +70,9 @@ class ImageProcessor:
             proc_params.update(config['image_processor_params'])
         proc_params.update(kwargs)
 
+        # Add new parameters for detection method
+        self.top_n = proc_params.pop('top_n', 1) # Default to 1 for new points
+
         # Set attributes from the final parameters for clarity and static analysis
         self.persist_updates = proc_params['persist_updates']
         self.persist_interval = proc_params['persist_interval']
@@ -113,39 +116,14 @@ class ImageProcessor:
             logger.info("Validation mode enabled with in-situ points")
 
     def process_image(self, image_id, filename):
-        """
-        Process a single image and update internal points/templates.
-        
-        This method modifies the internal state of the processor by updating
-        self.points and self.templates.
-        
-        Parameters:
-        -----------
-        image_id : int
-            Unique identifier for the image being processed
-        filename : str
-            Path to the image file
-        """
         basename = os.path.basename(filename)
-
-        # Skip if already processed
         if image_id <= self.points.last_image_id:
             logger.info(f"Skipping image {image_id}: {basename}")
             return
-
         logger.info(f"Processing image {image_id}: {basename}")
-
-        # Create Nansat Image object from file
         img = Image(filename)
-        
-        # Calculate buffer to capture points drifting INTO image
         max_possible_drift = self.candidate_search_max_daily_drift_m * self.temporal_window 
         buffer_distance = min(max_possible_drift, self.matcher.spatial_distance_max)
-        logger.debug(f"Using buffer distance: {buffer_distance/1000.0:.2f} km "
-                    f"(Min of {max_possible_drift/1000.0:.1f}km theoretical max drift over {self.temporal_window} days "
-                    f"and {self.matcher.spatial_distance_max/1000.0:.1f}km spatial match limit)")
-    
-        # Filter for active points within the buffered polygon and time threshold
         buffered_image_poly = img.poly.buffer(buffer_distance)
         time_threshold = img.date - pd.Timedelta(days=self.temporal_window)
         points_last = self.points.last()
@@ -153,36 +131,16 @@ class ImageProcessor:
             points_last.within(buffered_image_poly) &
             (points_last['time'] >= time_threshold)
         ]
-
-        # this is to prevent memory errors for rare instances with many overlapping active points
         CANDIDATE_POINT_LIMIT = 40000
         if len(points_poly) > CANDIDATE_POINT_LIMIT:
-            logger.info(
-                f"Candidate points ({len(points_poly)}) exceed limit. "
-                f"Taking a random sample of {CANDIDATE_POINT_LIMIT} points"
-            )
             points_poly = points_poly.sample(n=CANDIDATE_POINT_LIMIT, random_state=42)
-
         if len(points_poly) == 0:
-            logger.info("No overlapping points found")
             points_final = Keypoints()
         else:
-            logger.info(f"{len(points_poly)} overlapping points found")
             points_final = self._match_existing_points(points_poly, img, image_id, img.orbit_num)
             if points_final is None:
-                logger.info("Insufficient match quality, skipping point matching")
                 points_final = Keypoints()
-            else:
-                if 'interpolated' in points_final.columns:
-                    interp_count = points_final['interpolated'].sum()
-                    total_count = len(points_final)
-                    if interp_count > 0:
-                        logger.debug(f"Interpolation stats: {interp_count}/{total_count} points ({interp_count/total_count:.1%}) were interpolated")
-
-        # Process new points
         self._process_new_points(points_final, img, image_id, basename)
-
-        # Template pruning
         if image_id > 0 and image_id % self.pruning_interval == 0 and len(self.templates) > 0:
             try:
                 time_threshold_prune = img.date.to_numpy() - np.timedelta64(self.temporal_window, 'D')
@@ -190,425 +148,220 @@ class ImageProcessor:
                 self.templates.prune(active_traj_ids, time_threshold_prune)
             except Exception as e:
                 logger.error(f"Error during template pruning: {e}", exc_info=True)
-                logger.warning("Skipping template pruning for this interval due to error.")
-
-        # Persist database every X images
         if self.persist_updates:
             current_points_image_id = self.points.last_image_id
             images_since_persist = current_points_image_id - self._last_persisted_id
-
             if images_since_persist >= self.persist_interval:
                 current_last_image_id = current_points_image_id
-                
-                # --- 1. Filter points to save only matched trajectories ---
-                
-                # Identify trajectory_ids that appear more than once (i.e., have been matched)
                 traj_id_counts = self.points['trajectory_id'].value_counts()
                 matched_traj_ids = traj_id_counts[traj_id_counts > 1].index
-                
-                # Create a filtered dataframe for persistence
                 points_to_persist = self.points[self.points['trajectory_id'].isin(matched_traj_ids)]
-                
-                logger.info(f"Found {len(matched_traj_ids)} matched trajectories. "
-                            f"Persisting {len(points_to_persist)} points.")
-
-                # --- 2. Attempt to save data to the database ---
                 save_successful = self.db.save(
-                    points_to_persist,
-                    self.templates,
-                    self._last_persisted_id,
-                    self.insitu_points
+                    points_to_persist, self.templates, self._last_persisted_id, self.insitu_points
                 )
-
-                # --- 3. Prune in-memory data only if save was successful ---
                 if save_successful:
                     try:
-                        num_before_prune = len(self.points)
-                        keep_mask = (self.points['is_last'] == 1) & \
-                                    (self.points['time'] >= time_threshold)
-                        
+                        keep_mask = (self.points['is_last'] == 1) & (self.points['time'] >= time_threshold)
                         self.points = Keypoints._from_gdf(self.points[keep_mask].copy())
-                        
-                        num_after_prune = len(self.points)
-                        logger.debug(f"In-memory points pruned: {num_before_prune} -> {num_after_prune}")
-                        
                         self._last_persisted_id = current_last_image_id
                     except Exception as e:
-                        logger.error(f"Error during in-memory point pruning after successful save: {e}", exc_info=True)
-                        logger.critical("CRITICAL: In-memory pruning failed. State may be inconsistent. Continuing without pruning.")
-                else:
-                    logger.warning("Database save reported failure. Skipping in-memory point pruning to prevent data loss.")
+                        logger.error(f"Error during in-memory point pruning: {e}", exc_info=True)
 
     @log_execution_time
     def _process_new_points(self, points_final, img, image_id, basename):
-        """Process new points, including validation data, and update templates."""
-        # Detect new keypoints (raw)
-        raw_kps_new = self.keypoint_detector.detect_new_keypoints(
-            points=points_final,
+        raw_kps_new = self.keypoint_detector.detect_keypoints(
             img=img,
+            points=points_final,
             window_size=self.window_size,
+            stride=self.window_size,
             border_size=self.border_size,
             response_threshold=self.response_threshold,
             octave=self.octave,
-            # Set to False because we will compute descriptors in a batch later
-            compute_descriptors=False 
+            top_n=1,
+            check_existing=True,
+            compute_descriptors=False
         )
-        logger.debug(f"Detected {len(raw_kps_new)} new raw keypoints from image {image_id}")
-
         if self.insitu_points is not None:
             matching_insitu_points = self.insitu_points.loc[
                 self.insitu_points['image_filepath'].isin([basename])
             ]
-
             if len(matching_insitu_points) > 0:
-                logger.info(f"Found {len(matching_insitu_points)} matching buoy observations in image {basename}")
-                buoy_kps = self.keypoint_detector.keypoint_from_point(matching_insitu_points, octave=self.octave,img=img, response_threshold=self.response_threshold)
-                if buoy_kps is None:
-                    logger.error("keypoint_from_point returned None unexpectedly!")
-                    buoy_kps = []
-                raw_kps_new = raw_kps_new + buoy_kps
-                logger.info(f"Added {len(buoy_kps)} buoy keypoints to detection set")
-
-        # Now, compute descriptors for the combined list of new and buoy keypoints
+                buoy_kps = self.keypoint_detector.keypoint_from_point(
+                    matching_insitu_points, octave=self.octave, img=img, response_threshold=self.response_threshold
+                )
+                if buoy_kps:
+                    raw_kps_new.extend(buoy_kps)
         keypoints_coords_arr, descriptors_arr, surviving_tags = self.keypoint_detector.compute_descriptors(
-            raw_kps_new,
-            img,
-            polarisation=1,
-            normalize=False
+            raw_kps_new, img, polarisation=1, normalize=False
         )
-
         if keypoints_coords_arr is not None and descriptors_arr is not None:
             points_new = Keypoints.create(keypoints_coords_arr, descriptors_arr, img, image_id, img.orbit_num)
-            
             current_self_points_len = len(self.points)
-            self.points = self.points.append(points_new) # This assigns final trajectory_ids to the points_new portion
-            
+            self.points = self.points.append(points_new)
             appended_points_gdf = self.points.iloc[current_self_points_len:]
-            logger.info(f"Added {len(appended_points_gdf)} new points (total: {len(self.points)})")
-
-            # Link insitu_points to final trajectory_ids using surviving_tags
             if self.insitu_points is not None and surviving_tags is not None and not appended_points_gdf.empty:
                 appended_points_gdf_reset = appended_points_gdf.reset_index(drop=True)
-                
                 if len(surviving_tags) == len(appended_points_gdf_reset):
                     for i, original_df_idx_tag in enumerate(surviving_tags):
-                        if original_df_idx_tag is not None: # Check if the tag is an actual index
+                        if original_df_idx_tag is not None:
                             final_tid = appended_points_gdf_reset.iloc[i]['trajectory_id']
                             self.insitu_points.loc[original_df_idx_tag, 'trajectory_id'] = final_tid
-                            logger.debug(f"Linked insitu_point (original index {original_df_idx_tag}) to trajectory_id {final_tid}")
-                else:
-                    logger.warning(f"Mismatch between surviving_tags ({len(surviving_tags)}) and "
-                                   f"appended_points_gdf_reset ({len(appended_points_gdf_reset)}). Skipping insitu linking for this batch.")
-
-            # Add templates for the newly created points
             self.templates.add(appended_points_gdf, img, self.template_size, band=1)
-
         if len(points_final) > 0:
             self.points = self.points.update(points_final)
-            # Update templates for the points that were successfully matched and updated
             self.templates.update(points_final, img, self.template_size, band=1)
             
     @log_execution_time
     def _match_existing_points(self, points_poly, img, image_id, current_orbit_num):
-        """
-        Match points from previous image to current one, with optional interpolation,
-        then apply pattern matching and filter by correlation. This version uses the
-        empirically correct trajectory_id assignment and robust descriptor filtering.
-        """
-        # Goal: Filter points_poly to exclude points from the same orbit.
-
-        # 1. Check for the prerequisite column.
         if 'orbit_num' not in points_poly.columns:
-            logger.error("FATAL: 'orbit_num' column not found in points_poly. Cannot apply orbit filter.")
-            return Keypoints() # Return an empty Keypoints object
-
-        # 2. Create and apply the filter mask.
+            return Keypoints()
         previous_orbit_nums = points_poly['orbit_num']
         orbit_filter_mask = previous_orbit_nums != current_orbit_num
         points_poly_filtered = points_poly[orbit_filter_mask]
-
-        # 3. Log the operation and handle the empty case.
         if points_poly_filtered.empty:
-            total_candidates_in_buffer = len(points_poly)
-            logger.info(
-                f"Found {total_candidates_in_buffer} points in buffer, but all were from the same orbit ({current_orbit_num}). "
-                "Skipping matching."
-            )
-            return Keypoints() # Exit early
-        else:
-            logger.info(
-                f"{len(points_poly_filtered)} valid candidate points found for matching from previous orbits."
-            )
-
-        # 4. Ensure the rest of the method uses the filtered data.
-        # Detect gridded keypoints and compute their descriptors in one step
-        keypoints_coords_arr_grid, descriptors_grid, _ = self.keypoint_detector.detect_gridded_points(
-            img,
+            return Keypoints()
+        
+        keypoints_coords_arr_grid, descriptors_grid, _ = self.keypoint_detector.detect_keypoints(
+            img=img,
+            window_size=self.window_size,
             stride=self.stride,
             border_size=self.border_size,
+            response_threshold=self.response_threshold,
             octave=self.octave,
+            top_n=self.top_n,
+            check_existing=False,
+            compute_descriptors=True
         )
-
         if keypoints_coords_arr_grid is None or descriptors_grid is None:
-            logger.warning("Failed to compute descriptors for grid points. Skipping matching.")
-            return None
-
-        points_grid = Keypoints.create(keypoints_coords_arr_grid, descriptors_grid, img, image_id=image_id, orbit_num=img.orbit_num)
-
-        # Match and filter points
-        points_fg1, points_fg2, _ = self.matcher.match_with_grid(
-            points_poly_filtered,
-            points_grid
-        )
-
-        if points_fg1 is None or points_fg2 is None or points_fg1.empty or points_fg2.empty:
-            logger.info("Insufficient match quality or no matches found, skipping point matching step.")
             return Keypoints()
 
-        # Assign trajectory IDs to matched points
+        points_grid = Keypoints.create(keypoints_coords_arr_grid, descriptors_grid, img, image_id=image_id, orbit_num=img.orbit_num)
+        points_fg1, points_fg2, _ = self.matcher.match_with_grid(points_poly_filtered, points_grid)
+        if points_fg1 is None or points_fg2 is None or points_fg1.empty or points_fg2.empty:
+            return Keypoints()
+
         points_fg2['trajectory_id'] = points_fg1.trajectory_id.values
         points_fg2['interpolated'] = 0
         points_matched = points_fg2
 
-        # Interpolate drift if needed
         if self.use_interpolation and len(points_fg1) < len(points_poly_filtered):
             points_matched = interpolate_drift(
-                points_poly=points_poly_filtered,
-                points_fg1=points_fg1,
-                points_fg2=points_matched,
-                img=img,
-                max_interpolation_time_gap_hours=self.max_interpolation_time_gap_hours,
-                border_size=self.border_size,
-                model_type=AffineTransform
+                points_poly=points_poly_filtered, points_fg1=points_fg1, points_fg2=points_matched,
+                img=img, max_interpolation_time_gap_hours=self.max_interpolation_time_gap_hours,
+                border_size=self.border_size, model_type=AffineTransform
             )
             if points_matched is None or points_matched.empty:
-                logger.warning("Interpolation resulted in no valid points. Proceeding with only matched points.")
-                points_matched = points_fg2  # Fall back to only matched points
-        else:
-            if not self.use_interpolation:
-                logger.info("Interpolation disabled, using only matched points")
-            elif len(points_fg1) >= len(points_poly_filtered):
-                logger.info("All points matched, no interpolation needed")
-
-        # GLOBAL VELOCITY FILTER for both matched and interpolated points
+                points_matched = points_fg2
+        
         if not points_matched.empty:
-            num_before_speed_filter = len(points_matched)
-            
-            # Merge with `points_poly_filtered` which contains the previous state for all candidates
             candidates_with_history = pd.merge(
-                points_matched,
-                points_poly_filtered[['trajectory_id', 'geometry', 'time']],
-                on='trajectory_id',
-                suffixes=('', '_prev')
+                points_matched, points_poly_filtered[['trajectory_id', 'geometry', 'time']],
+                on='trajectory_id', suffixes=('', '_prev')
             )
-
-            # Calculate speed
-            # The current time for all points in `points_matched` is the time of the new image
             time_diff_days = (img.date - candidates_with_history['time_prev']).dt.total_seconds() / 86400.0
             distance_m = candidates_with_history.geometry.distance(candidates_with_history.geometry_prev)
-            
-            # Avoid division by zero
             speed_m_per_day = np.divide(
-                distance_m, 
-                time_diff_days, 
-                out=np.full_like(time_diff_days, np.inf), 
-                where=time_diff_days > 1e-9
+                distance_m, time_diff_days, out=np.full_like(time_diff_days, np.inf), where=time_diff_days > 1e-9
             )
-
-            # Apply filter
-            speed_filter_mask = speed_m_per_day <= self.max_valid_speed_m_per_day
-            valid_trajectory_ids = candidates_with_history.loc[speed_filter_mask, 'trajectory_id']
-            
-            # Filter the original `points_matched` dataframe
-            final_mask = points_matched['trajectory_id'].isin(valid_trajectory_ids)
-            points_matched = points_matched[final_mask]
-            
-            num_after_speed_filter = len(points_matched)
-            if num_after_speed_filter < num_before_speed_filter:
-                num_removed = num_before_speed_filter - num_after_speed_filter
-                logger.info(
-                    f"Global velocity filter: Removed {num_removed} outlier points "
-                    f"exceeding {self.max_valid_speed_m_per_day} m/day."
-                )
-
-        # Filter out points that don't have templates
+            valid_trajectory_ids = candidates_with_history.loc[speed_m_per_day <= self.max_valid_speed_m_per_day, 'trajectory_id']
+            points_matched = points_matched[points_matched['trajectory_id'].isin(valid_trajectory_ids)]
+        
         all_traj_ids = points_matched.trajectory_id.values
         available_traj_ids = self.templates.trajectory_ids
         has_template_mask = np.isin(all_traj_ids, available_traj_ids)
-
         if not np.all(has_template_mask):
             points_matched = points_matched[has_template_mask]
             all_traj_ids = points_matched.trajectory_id.values
-            
         if points_matched.empty:
-            logger.debug("No points remaining after template filtering.")
             return Keypoints() 
 
-        # Get original points and templates for pattern matching
         points_orig = points_poly_filtered[points_poly_filtered.trajectory_id.isin(all_traj_ids)]
         templates_all = self.templates.get_by_id(all_traj_ids)
         
         if not (len(points_matched) == len(points_orig) == len(templates_all.trajectory_id)):
-            logger.error(f"Length mismatch before pattern_matching! "
-                        f"points_matched: {len(points_matched)}, "
-                        f"points_orig: {len(points_orig)}, "
-                        f"templates_all: {len(templates_all.trajectory_id)}")
             return Keypoints() 
 
-        # Perform pattern matching
         keypoints_corrected_xy, keypoints_corrected_rc, corr_values = pattern_matching(
-            points_matched,
-            img,
-            templates_all,
-            points_orig,
-            hs=self.template_size,
-            border_matched=self.border_matched,
-            border_interpolated=self.border_interpolated,
-            band=1
+            points_matched, img, templates_all, points_orig, hs=self.template_size,
+            border_matched=self.border_matched, border_interpolated=self.border_interpolated, band=1
         )
-
-        # Initial correlation filter
         points_matched['corr'] = corr_values
         correlation_mask = corr_values >= self.min_correlation
-        
         if not np.any(correlation_mask):
-            logger.debug("No points passed correlation filter.")
             return Keypoints()
 
-        # Apply correlation filter
         points_matched = points_matched[correlation_mask].copy()
         keypoints_corrected_xy = keypoints_corrected_xy[correlation_mask]
-        
-        # Prepare data for triangulation filter
         points_matched = pd.merge(
-            points_matched,
-            points_orig[['trajectory_id', 'geometry']].rename(columns={'geometry': 'geometry_orig'}),
+            points_matched, points_orig[['trajectory_id', 'geometry']].rename(columns={'geometry': 'geometry_orig'}),
             on='trajectory_id', how='left'
         )
-        
-        # Call the filter to mask bad vectors and propose interpolated positions
         x1_interp, y1_interp, was_interpolated_mask = filter_and_interpolate_flipped_triangles(
-            points_matched.geometry_orig.x.to_numpy(),
-            points_matched.geometry_orig.y.to_numpy(),
-            keypoints_corrected_xy[:, 0],
-            keypoints_corrected_xy[:, 1],
+            points_matched.geometry_orig.x.to_numpy(), points_matched.geometry_orig.y.to_numpy(),
+            keypoints_corrected_xy[:, 0], keypoints_corrected_xy[:, 1],
         )
-
-        # Separate points into "good" (not interpolated) and "re-check" (interpolated)
         good_mask = ~was_interpolated_mask & ~np.isnan(x1_interp)
-        
-        # Handle good points
         points_good = points_matched[good_mask].copy()
         xy_good = np.column_stack((x1_interp[good_mask], y1_interp[good_mask]))
         rc_good = keypoints_corrected_rc[correlation_mask][good_mask]
 
-        # Handle points that need re-checking
         if np.any(was_interpolated_mask):
-            logger.info(f"Re-validating {np.sum(was_interpolated_mask)} interpolated vectors...")
-            
             points_to_recheck = points_matched[was_interpolated_mask].copy()
             points_to_recheck['geometry'] = gpd.points_from_xy(x1_interp[was_interpolated_mask], y1_interp[was_interpolated_mask])
             templates_recheck = self.templates.get_by_id(points_to_recheck.trajectory_id.values)
-            
             points_fg1_recheck = points_matched[was_interpolated_mask][['trajectory_id', 'geometry_orig', 'angle']]
             points_fg1_recheck.rename(columns={'geometry_orig': 'geometry'}, inplace=True)
-
             xy_rechecked, rc_rechecked, corr_rechecked = pattern_matching(
-                points_to_recheck,
-                img, 
-                templates_recheck, 
-                points_fg1_recheck,
-                hs=self.template_size,
-                border_matched=self.border_matched,
-                border_interpolated=self.border_interpolated,
-                band=1
+                points_to_recheck, img, templates_recheck, points_fg1_recheck, hs=self.template_size,
+                border_matched=self.border_matched, border_interpolated=self.border_interpolated, band=1
             )
-            
             recheck_passed_mask = corr_rechecked >= self.min_correlation
-
-            num_passed = np.sum(recheck_passed_mask)
-            logger.debug(f"Re-validation: {num_passed}/{len(points_to_recheck)} interpolated vectors passed.")
-            
-            # Combine survivors from both groups
             points_rechecked = points_to_recheck[recheck_passed_mask].copy()
             points_rechecked['corr'] = corr_rechecked[recheck_passed_mask]
-
-            # Combine final results
             points_matched = pd.concat([points_good, points_rechecked], ignore_index=True)
             corrected_xy = np.vstack([xy_good, xy_rechecked[recheck_passed_mask]])
             corrected_rc = np.vstack([rc_good, rc_rechecked[recheck_passed_mask]])
         else:
-            # No re-checking needed - use good points directly
             points_matched = points_good
             corrected_xy = xy_good
             corrected_rc = rc_good
 
-        # Final checks
         if points_matched.empty:
-            logger.debug("No points survived filtering.")
             return Keypoints()
                         
-        # Update geometry with corrected positions
         points_matched = points_matched.drop(columns=['geometry_orig'])
         points_matched['geometry'] = gpd.points_from_xy(corrected_xy[:, 0], corrected_xy[:, 1])
         
-        logger.info(f"Pattern matching kept {len(points_matched)} points (correlation >= {self.min_correlation})")
-
-        # Recompute descriptors for final points
         if not points_matched.empty:
             keypoints_list_with_tags_recompute = [
-                # The size parameter is required, but will be overwritten by the detector's patch size
                 (cv2.KeyPoint(px_c, px_r, size=31, angle=img.angle, octave=self.octave), None)
                 for px_c, px_r in corrected_rc
             ]
-            
-            _raw_kps_recomputed, new_descriptors, _surviving_tags_recomputed = self.keypoint_detector.compute_descriptors(
-                keypoints_list_with_tags_recompute,
-                img,
-                polarisation=1,
-                normalize=False
+            _raw_kps_recomputed, new_descriptors, _ = self.keypoint_detector.compute_descriptors(
+                keypoints_list_with_tags_recompute, img, polarisation=1, normalize=False
             )
         else:
             new_descriptors = None
 
-        # Filter points based on successful descriptor computation
-
-        original_count = len(points_matched)
-
         if new_descriptors is not None and len(new_descriptors) == len(points_matched):
             points_matched['descriptors'] = list(new_descriptors)
-            
-            # Filter out points with invalid descriptors
             valid_mask_desc = points_matched['descriptors'].apply(lambda d: isinstance(d, np.ndarray))
             points_matched = points_matched[valid_mask_desc].copy()
-            
-            if len(points_matched) < original_count:
-                logger.debug(f"Removed {original_count - len(points_matched)} points with invalid descriptors")
-        elif original_count > 0:
-            logger.warning("Descriptor computation failed; removing all remaining points.")
-            points_matched = points_matched.iloc[0:0]  # Empty DataFrame
+        elif not points_matched.empty:
+            points_matched = points_matched.iloc[0:0]
 
-        # Update templates for surviving points
         if not points_matched.empty:
             self.templates.update(points_matched, img, self.template_size, band=1)
 
-        logger.debug(f"Returning {len(points_matched)} final points")
         return points_matched
 
     def ensure_final_persistence(self):
-        """Ensure final persistence of any remaining unprocessed data."""
         if self.persist_updates:
             images_since_persist = self.points.last_image_id - self._last_persisted_id
             if images_since_persist > 0:
-                logger.info(f"Performing final persistence for remaining {images_since_persist} images")
                 save_successful = self.db.save(
-                    points=self.points,
-                    templates=self.templates,
-                    last_persisted_id=self._last_persisted_id,
-                    insitu_points=self.insitu_points
+                    points=self.points, templates=self.templates,
+                    last_persisted_id=self._last_persisted_id, insitu_points=self.insitu_points
                 )
                 if save_successful:
                     self._last_persisted_id = self.points.last_image_id
-                    logger.info(f"Final persistence completed. Last persisted ID set to {self._last_persisted_id}")
-                else:
-                    logger.error("Final persistence FAILED. _last_persisted_id not updated.")
