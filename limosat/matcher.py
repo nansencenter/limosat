@@ -27,6 +27,7 @@ class Matcher:
 
                  # Lowe's ratio test parameter
                  lowe_ratio=0.9,
+                 knn_k=4,
 
                  # Visualization
                  plot=False):
@@ -52,6 +53,7 @@ class Matcher:
 
         # Additional parameters
         self.lowe_ratio = lowe_ratio
+        self.knn_k = knn_k
         self.plot = plot
 
     def plot_quiver(self, pos0, pos1, dist):
@@ -151,8 +153,8 @@ class Matcher:
         index_params = dict(algorithm=6, table_number=12, key_size=20, multi_probe_level=2)
         search_params = {}
         knn_matcher = cv2.FlannBasedMatcher(index_params, search_params)
-        # Get k=4 nearest neighbors for each descriptor in x0 from x1
-        all_knn_matches = knn_matcher.knnMatch(x0, x1, k=4)
+        # Get k nearest neighbors for each descriptor in x0 from x1
+        all_knn_matches = knn_matcher.knnMatch(x0, x1, k=self.knn_k)
 
         new_matches_from_lowe_variant = []
 
