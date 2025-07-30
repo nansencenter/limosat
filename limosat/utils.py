@@ -22,48 +22,61 @@ import yaml
 APP_LOGGER_NAME = 'LiMOSAT'
 
 def setup_logging(log_dir='logs',
-                  logger_name=APP_LOGGER_NAME, # Use the authoritative name
+                  logger_name=APP_LOGGER_NAME,
                   console_level=logging.INFO,
                   file_level=logging.DEBUG,
-                  filename_prefix=APP_LOGGER_NAME): # Filename prefix defaults to logger name
+                  filename_prefix=APP_LOGGER_NAME,
+                  persist_log=False):
     """
-    Sets up basic logging with console and file handlers.
-    Ensures handlers are added only once to the specified logger.
+    Sets up logging.
+
+    If persist_log is True, logs to both console and a file.
+    If persist_log is False, logs only to the console at DEBUG level.
+
+    Ensures handlers are added only once to the specified logger, and clears
+    existing handlers to support interactive notebook environments.
     """
     logger_instance = logging.getLogger(logger_name)
+    
+    # Force clearing of existing handlers for interactive notebook use
+    if logger_instance.hasHandlers():
+        logger_instance.handlers.clear()
+
+    # If not persisting, we want the full log (DEBUG level) in the console.
+    effective_console_level = logging.DEBUG if not persist_log else console_level
 
     # Set the overall level for the logger.
-    logger_instance.setLevel(min(console_level, file_level))
+    log_level = min(effective_console_level, file_level) if persist_log else effective_console_level
+    logger_instance.setLevel(log_level)
 
-    # Only add handlers if THIS logger instance has none
-    if not logger_instance.handlers:
+    # Add console handler
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)-8s - %(message)s')
+    console_h = logging.StreamHandler()
+    console_h.setLevel(effective_console_level)
+    console_h.setFormatter(formatter)
+    logger_instance.addHandler(console_h)
+
+    # Add file handler only if persisting
+    if persist_log:
         if not os.path.exists(log_dir):
             os.makedirs(log_dir)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         log_file_path = os.path.join(log_dir, f"{filename_prefix}_{timestamp}.log")
 
-        # Console Handler
-        console_h = logging.StreamHandler()
-        console_h.setLevel(console_level)
-
-        # File Handler
         file_h = logging.FileHandler(log_file_path)
         file_h.setLevel(file_level)
-
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)-8s - %(message)s')
-        console_h.setFormatter(formatter)
         file_h.setFormatter(formatter)
-
-        logger_instance.addHandler(console_h)
         logger_instance.addHandler(file_h)
         
         logger_instance.log_file_path = log_file_path
+    else:
+        logger_instance.log_file_path = None
 
     return logger_instance
 
-# Initialize a module-level logger using our setup
-logger = setup_logging()
+# Initialize a module-level logger using our setup (defaulting to non-persistent)
+logger = setup_logging(persist_log=False)
 
 def log_execution_time(func):
     """
