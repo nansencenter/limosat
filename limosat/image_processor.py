@@ -227,7 +227,7 @@ class ImageProcessor:
                         keep_mask = (self.points['is_last'] == 1) & \
                                     (self.points['time'] >= time_threshold)
                         
-                        self.points = Keypoints._from_gdf(self.points[keep_mask].copy())
+                        self.points = Keypoints._from_gdf(self.points[keep_mask])
                         
                         num_after_prune = len(self.points)
                         logger.debug(f"In-memory points pruned: {num_before_prune} -> {num_after_prune}")
@@ -476,7 +476,7 @@ class ImageProcessor:
             return Keypoints()
 
         # Apply correlation filter
-        points_matched = points_matched[correlation_mask].copy()
+        points_matched = points_matched[correlation_mask]
         keypoints_corrected_xy = keypoints_corrected_xy[correlation_mask]
         
         # Prepare data for triangulation filter
@@ -498,7 +498,7 @@ class ImageProcessor:
         good_mask = ~was_interpolated_mask & ~np.isnan(x1_interp)
         
         # Handle good points
-        points_good = points_matched[good_mask].copy()
+        points_good = points_matched[good_mask]
         xy_good = np.column_stack((x1_interp[good_mask], y1_interp[good_mask]))
         rc_good = keypoints_corrected_rc[correlation_mask][good_mask]
 
@@ -506,7 +506,7 @@ class ImageProcessor:
         if np.any(was_interpolated_mask):
             logger.info(f"Re-validating {np.sum(was_interpolated_mask)} interpolated vectors...")
             
-            points_to_recheck = points_matched[was_interpolated_mask].copy()
+            points_to_recheck = points_matched[was_interpolated_mask]
             points_to_recheck['geometry'] = gpd.points_from_xy(x1_interp[was_interpolated_mask], y1_interp[was_interpolated_mask])
             templates_recheck = self.templates.get_by_id(points_to_recheck.trajectory_id.values)
             
@@ -530,7 +530,7 @@ class ImageProcessor:
             logger.debug(f"Re-validation: {num_passed}/{len(points_to_recheck)} interpolated vectors passed.")
             
             # Combine survivors from both groups
-            points_rechecked = points_to_recheck[recheck_passed_mask].copy()
+            points_rechecked = points_to_recheck[recheck_passed_mask]
             points_rechecked['corr'] = corr_rechecked[recheck_passed_mask]
 
             # Combine final results
@@ -580,7 +580,7 @@ class ImageProcessor:
             
             # Filter out points with invalid descriptors
             valid_mask_desc = points_matched['descriptors'].apply(lambda d: isinstance(d, np.ndarray))
-            points_matched = points_matched[valid_mask_desc].copy()
+            points_matched = points_matched[valid_mask_desc]
             
             if len(points_matched) < original_count:
                 logger.debug(f"Removed {original_count - len(points_matched)} points with invalid descriptors")

@@ -117,9 +117,6 @@ def mask_flipped_triangles(x0, y0, x1, y1, t, n=0, max_iter=100):
     Returns:
         Tuple of masked x1, y1, and t arrays.
     """
-    x1 = x1.copy()
-    y1 = y1.copy()
-    t = t.copy() 
     if n >= max_iter:
         return x1, y1, t
 
@@ -241,7 +238,7 @@ def filter_and_interpolate_flipped_triangles(x0, y0, x1_raw, y1_raw):
     tri = Triangulation(x0, y0)
     
     # 1. Initial masking of vectors causing flips
-    x1m, y1m, t1 = mask_flipped_triangles(x0, y0, x1_raw, y1_raw, tri.triangles)
+    x1m, y1m, t1 = mask_flipped_triangles(x0, y0, x1_raw.copy(), y1_raw.copy(), tri.triangles.copy())
     
     # 2. Interpolate the positions of the masked vectors
     x1i, y1i, confidence = interpolate_vectors(x0, y0, x1m, y1m, tri, min_neighbours=5)
