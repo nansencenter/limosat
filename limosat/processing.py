@@ -35,7 +35,7 @@ def interpolate_drift(points_poly, points_fg1, points_fg2, img,
         return points_result
 
     # 1. Identify unmatched points and group all points by source image_id
-    unmatched_points = points_poly[~points_poly['trajectory_id'].isin(points_fg1['trajectory_id'])].copy()
+    unmatched_points = points_poly[~points_poly['trajectory_id'].isin(points_fg1['trajectory_id'])]
     if unmatched_points.empty:
         logger.debug("No unmatched points to consider for interpolation.")
         return points_result
@@ -87,7 +87,7 @@ def interpolate_drift(points_poly, points_fg1, points_fg2, img,
             time_gap_ok = (img.date.tz_localize(None) - unmatched_group['time'].dt.tz_localize(None)).dt.total_seconds() <= (max_interpolation_time_gap_hours * 3600)
             is_near_hull = unmatched_group.geometry.distance(convex_hull_of_anchors) <= (max_anchor_distance_km * 1000.0)
             
-            filtered_unmatched = unmatched_group[is_within_bounds & time_gap_ok & is_near_hull].copy()
+            filtered_unmatched = unmatched_group.loc[is_within_bounds & time_gap_ok & is_near_hull]
         except Exception as e:
             logger.warning(f"Error during pre-filtering for group {source_id}: {e}")
             continue

@@ -104,10 +104,8 @@ class Keypoints(gpd.GeoDataFrame):
         # Vectorized update of is_last flag
         mask = self['trajectory_id'].isin(points['trajectory_id'])
         if mask.any():
-            # Create a copy to avoid SettingWithCopyWarning
-            temp_df = self.copy()
-            temp_df.loc[mask, 'is_last'] = 0
-            result = pd.concat([temp_df, points], ignore_index=True)
+            self.loc[mask, 'is_last'] = 0
+            result = pd.concat([self, points], ignore_index=True)
         else:
             # No matches to update, just concatenate
             result = pd.concat([self, points], ignore_index=True)
