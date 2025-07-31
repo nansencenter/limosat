@@ -27,6 +27,8 @@ class Keypoints(gpd.GeoDataFrame):
                 'time': [],
                 'interpolated': [],
                 'orbit_num': [],
+                'stopped': [],
+                'converged_to': [],
             }
             super().__init__(empty_data)
             if 'orbit_num' in self.columns:
@@ -128,6 +130,7 @@ class Keypoints(gpd.GeoDataFrame):
             'time': [img.date] * N,
             'interpolated': np.zeros(N),
             'orbit_num': np.full(N, orbit_num, dtype='int32'),
-
+            'stopped': np.zeros(N, dtype=bool),
+            'converged_to': np.full(N, -1, dtype=np.int64),
         }
         return cls(new_data)

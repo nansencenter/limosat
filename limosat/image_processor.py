@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 import cv2
+from scipy.spatial import cKDTree
 from skimage.transform import AffineTransform
 from .utils import log_execution_time, logger
 from .database import DriftDatabase
@@ -49,6 +50,7 @@ class ImageProcessor:
             'persist_interval': 10,
             'pruning_interval': 10,
             'temporal_window': 3,
+            'convergence_radius_pixels': 5,
             'candidate_search_max_daily_drift_m': 10000,
             'window_size': 64,
             'border_size': 128,
@@ -75,6 +77,7 @@ class ImageProcessor:
         self.persist_interval = proc_params['persist_interval']
         self.pruning_interval = proc_params['pruning_interval']
         self.temporal_window = proc_params['temporal_window']
+        self.convergence_radius_pixels = proc_params['convergence_radius_pixels']
         self.candidate_search_max_daily_drift_m = proc_params['candidate_search_max_daily_drift_m']
         self.window_size = proc_params['window_size']
         self.border_size = proc_params['border_size']
@@ -240,6 +243,74 @@ class ImageProcessor:
                     logger.warning("Database save reported failure. Skipping in-memory point pruning to prevent data loss.")
 
     @log_execution_time
+    def _handle_trajectory_convergence(self, points_matched):
+        """
+        Identifies and handles converging trajectories using a k-d tree.
+
+        When multiple trajectories converge to the same area, this method identifies
+        the longest trajectory as the 'winner' and stops the shorter 'loser'
+        trajectories.
+
+        Args:
+            points_matched (Keypoints): A GeoDataFrame of points that have been
+                                       successfully matched in the current image.
+
+        Returns:
+            Keypoints: The input GeoDataFrame with points from loser trajectories removed.
+        """
+        if len(points_matched) < 2:
+            return points_matched
+
+        # Use cKDTree for efficient spatial querying
+        coords = np.vstack(points_matched.geometry.apply(lambda p: (p.x, p.y)))
+        tree = cKDTree(coords)
+        # Find all pairs of points within the convergence radius
+        pairs = tree.query_pairs(r=self.convergence_radius_pixels, output_type='set')
+
+        if not pairs:
+            return points_matched
+
+        logger.info(f"Found {len(pairs)} converging trajectory pairs.")
+
+        # Get trajectory lengths for all unique trajectories involved in the convergences
+        all_involved_tids = np.unique(points_matched.iloc[list(sum(pairs,()))].trajectory_id.values)
+        
+        # We need to query the main `self.points` dataframe to get the full length
+        traj_lengths = self.points[self.points['trajectory_id'].isin(all_involved_tids)]['trajectory_id'].value_counts()
+
+        loser_tids = set()
+        
+        # Determine winner/loser for each pair
+        for i, j in pairs:
+            tid_i = points_matched.iloc[i].trajectory_id
+            tid_j = points_matched.iloc[j].trajectory_id
+
+            if tid_i in loser_tids or tid_j in loser_tids:
+                continue # One of these has already been marked as a loser
+
+            len_i = traj_lengths.get(tid_i, 1)
+            len_j = traj_lengths.get(tid_j, 1)
+
+            if len_i < len_j:
+                loser_tids.add(tid_i)
+                # Mark the last point of the loser trajectory as stopped
+                mask = self.points['trajectory_id'] == tid_i
+                self.points.loc[mask, ['stopped', 'converged_to']] = [True, tid_j]
+            elif len_j < len_i:
+                loser_tids.add(tid_j)
+                mask = self.points['trajectory_id'] == tid_j
+                self.points.loc[mask, ['stopped', 'converged_to']] = [True, tid_i]
+            # If lengths are equal, we could have a more complex rule, but for now we do nothing
+            # and let both continue. This can be refined later if needed.
+
+        if loser_tids:
+            logger.info(f"Stopping {len(loser_tids)} trajectories due to convergence.")
+            # Filter out the loser trajectories from the current set of matched points
+            return points_matched[~points_matched['trajectory_id'].isin(loser_tids)]
+        
+        return points_matched
+
+    @log_execution_time
     def _process_new_points(self, points_final, img, image_id, basename):
         """Process new points, including validation data, and update templates."""
         # Detect new keypoints (raw)
@@ -315,6 +386,15 @@ class ImageProcessor:
         then apply pattern matching and filter by correlation. This version uses the
         empirically correct trajectory_id assignment and robust descriptor filtering.
         """
+        # Goal: Filter out points from trajectories that have already been stopped.
+        stopped_tids = self.points[self.points['stopped'] == True]['trajectory_id'].unique()
+        if len(stopped_tids) > 0:
+            num_before_stop_filter = len(points_poly)
+            points_poly = points_poly[~points_poly['trajectory_id'].isin(stopped_tids)]
+            num_after_stop_filter = len(points_poly)
+            if num_after_stop_filter < num_before_stop_filter:
+                logger.info(f"Removed {num_before_stop_filter - num_after_stop_filter} points from stopped trajectories.")
+
         # Goal: Filter points_poly to exclude points from the same orbit.
 
         # 1. Check for the prerequisite column.
@@ -430,6 +510,13 @@ class ImageProcessor:
                     f"Global velocity filter: Removed {num_removed} outlier points "
                     f"exceeding {self.max_valid_speed_m_per_day} m/day."
                 )
+
+        # CONVERGENCE HANDLING
+        if not points_matched.empty:
+            points_matched = self._handle_trajectory_convergence(points_matched)
+            if points_matched.empty:
+                logger.info("All points removed after convergence handling.")
+                return Keypoints()
 
         # Filter out points that don't have templates
         all_traj_ids = points_matched.trajectory_id.values
