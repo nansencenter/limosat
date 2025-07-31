@@ -311,7 +311,7 @@ class KeypointDetector:
         # as it's part of a specific workflow in ImageProcessor where descriptors
         # are computed later in a batch.
         # this is the window it searches
-        window_size_for_detection = 32
+        window_size_for_detection = 16
         keypoints_with_indices = []
         orb_model = self.model
         img_band_data = img[1]
@@ -344,13 +344,21 @@ class KeypointDetector:
                 kps_in_patch = orb_model.detect(patch, None)
                 
                 best_kp_in_patch = None
-                max_response_found = -1.0 
+                min_distance_to_center = float('inf')
+                patch_center_x = patch.shape[1] / 2.0
+                patch_center_y = patch.shape[0] / 2.0
 
                 if kps_in_patch:
-                    for kp_candidate in kps_in_patch:
-                        if kp_candidate.response >= response_threshold:
-                            if kp_candidate.response > max_response_found:
-                                max_response_found = kp_candidate.response
+                    # Filter out keypoints below the response threshold first
+                    valid_kps = [kp for kp in kps_in_patch if kp.response >= response_threshold]
+
+                    if valid_kps:
+                        for kp_candidate in valid_kps:
+                            # Calculate squared distance from the candidate to the patch center
+                            dist_sq = (kp_candidate.pt[0] - patch_center_x)**2 + (kp_candidate.pt[1] - patch_center_y)**2
+                            
+                            if dist_sq < min_distance_to_center:
+                                min_distance_to_center = dist_sq
                                 best_kp_in_patch = kp_candidate
                 
                 if best_kp_in_patch is not None:
