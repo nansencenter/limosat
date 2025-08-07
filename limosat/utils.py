@@ -75,8 +75,14 @@ def setup_logging(log_dir='logs',
 
     return logger_instance
 
-# Initialize a module-level logger using our setup (defaulting to non-persistent)
-logger = setup_logging(persist_log=False)
+# Initialize a module-level logger.
+# This logger will be configured by the application using setup_logging.
+# By default, it will have no handlers and will not output messages.
+logger = logging.getLogger(APP_LOGGER_NAME)
+# To prevent messages from being propagated to the root logger if no handlers are configured
+logger.propagate = False
+# Add a NullHandler to prevent "No handlers could be found" warnings.
+logger.addHandler(logging.NullHandler())
 
 def log_execution_time(func):
     """
