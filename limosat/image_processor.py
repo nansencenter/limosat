@@ -50,6 +50,7 @@ class ImageProcessor:
             'pruning_interval': 10,
             'temporal_window': 3,
             'candidate_search_max_daily_drift_m': 10000,
+            'max_candidates_for_matching': 15000,
             'window_size': 64,
             'border_size': 128,
             'border_matched': 16,
@@ -61,7 +62,7 @@ class ImageProcessor:
             'template_size': 16,
             'use_interpolation': True,
             'max_interpolation_time_gap_hours': 25,
-            'max_valid_speed_m_per_day': 50000.0,
+            'max_drift_rate_m_per_day': 50000.0,
         }
 
         # Start with defaults, update from config, then from kwargs
@@ -76,6 +77,7 @@ class ImageProcessor:
         self.pruning_interval = proc_params['pruning_interval']
         self.temporal_window = proc_params['temporal_window']
         self.candidate_search_max_daily_drift_m = proc_params['candidate_search_max_daily_drift_m']
+        self.max_candidates_for_matching = proc_params['max_candidates_for_matching']
         self.window_size = proc_params['window_size']
         self.border_size = proc_params['border_size']
         self.border_matched = proc_params['border_matched']
@@ -87,7 +89,7 @@ class ImageProcessor:
         self.template_size = proc_params['template_size']
         self.use_interpolation = proc_params['use_interpolation']
         self.max_interpolation_time_gap_hours = proc_params['max_interpolation_time_gap_hours']
-        self.max_valid_speed_m_per_day = proc_params['max_valid_speed_m_per_day']
+        self.max_drift_rate_m_per_day = proc_params['max_drift_rate_m_per_day']
 
         self._last_persisted_id = 0
         
@@ -155,13 +157,12 @@ class ImageProcessor:
         ]
 
         # this is to prevent memory errors for rare instances with many overlapping active points
-        CANDIDATE_POINT_LIMIT = 40000
-        if len(points_poly) > CANDIDATE_POINT_LIMIT:
+        if len(points_poly) > self.max_candidates_for_matching:
             logger.info(
-                f"Candidate points ({len(points_poly)}) exceed limit. "
-                f"Taking a random sample of {CANDIDATE_POINT_LIMIT} points"
+                f"Candidate points ({len(points_poly)}) exceed limit of {self.max_candidates_for_matching}. "
+                f"Taking a random sample."
             )
-            points_poly = points_poly.sample(n=CANDIDATE_POINT_LIMIT, random_state=42)
+            points_poly = points_poly.sample(n=self.max_candidates_for_matching, random_state=42)
 
         if len(points_poly) == 0:
             logger.info("No overlapping points found")
@@ -390,9 +391,9 @@ class ImageProcessor:
             elif len(points_fg1) >= len(points_poly_filtered):
                 logger.info("All points matched, no interpolation needed")
 
-        # GLOBAL VELOCITY FILTER for both matched and interpolated points
+        # DYNAMIC VELOCITY FILTER for both matched and interpolated points
         if not points_matched.empty:
-            num_before_speed_filter = len(points_matched)
+            num_before_filter = len(points_matched)
             
             # Merge with `points_poly_filtered` which contains the previous state for all candidates
             candidates_with_history = pd.merge(
@@ -402,33 +403,28 @@ class ImageProcessor:
                 suffixes=('', '_prev')
             )
 
-            # Calculate speed
-            # The current time for all points in `points_matched` is the time of the new image
+            # Calculate time difference and distance for each point
             time_diff_days = (img.date - candidates_with_history['time_prev']).dt.total_seconds() / 86400.0
             distance_m = candidates_with_history.geometry.distance(candidates_with_history.geometry_prev)
             
-            # Avoid division by zero
-            speed_m_per_day = np.divide(
-                distance_m, 
-                time_diff_days, 
-                out=np.full_like(time_diff_days, np.inf), 
-                where=time_diff_days > 1e-9
-            )
-
-            # Apply filter
-            speed_filter_mask = speed_m_per_day <= self.max_valid_speed_m_per_day
-            valid_trajectory_ids = candidates_with_history.loc[speed_filter_mask, 'trajectory_id']
+            # Calculate the maximum allowed distance for each point based on its specific time gap
+            max_allowed_distance = self.max_drift_rate_m_per_day * time_diff_days
+            
+            # The new filter compares the actual distance to the calculated max allowed distance
+            dynamic_filter_mask = distance_m <= max_allowed_distance
+            
+            valid_trajectory_ids = candidates_with_history.loc[dynamic_filter_mask, 'trajectory_id']
             
             # Filter the original `points_matched` dataframe
             final_mask = points_matched['trajectory_id'].isin(valid_trajectory_ids)
             points_matched = points_matched[final_mask]
             
-            num_after_speed_filter = len(points_matched)
-            if num_after_speed_filter < num_before_speed_filter:
-                num_removed = num_before_speed_filter - num_after_speed_filter
+            num_after_filter = len(points_matched)
+            if num_after_filter < num_before_filter:
+                num_removed = num_before_filter - num_after_filter
                 logger.info(
-                    f"Global velocity filter: Removed {num_removed} outlier points "
-                    f"exceeding {self.max_valid_speed_m_per_day} m/day."
+                    f"Dynamic velocity filter: Removed {num_removed} outlier points "
+                    f"exceeding max drift rate of {self.max_drift_rate_m_per_day} m/day."
                 )
 
         # Filter out points that don't have templates
