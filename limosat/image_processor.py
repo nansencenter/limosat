@@ -62,6 +62,7 @@ class ImageProcessor:
             'use_interpolation': True,
             'max_interpolation_time_gap_hours': 25,
             'max_valid_speed_m_per_day': 50000.0,
+            'gaussian_sigma_factor': 0.5, 
         }
 
         # Start with defaults, update from config, then from kwargs
@@ -88,6 +89,7 @@ class ImageProcessor:
         self.use_interpolation = proc_params['use_interpolation']
         self.max_interpolation_time_gap_hours = proc_params['max_interpolation_time_gap_hours']
         self.max_valid_speed_m_per_day = proc_params['max_valid_speed_m_per_day']
+        self.gaussian_sigma_factor = proc_params['gaussian_sigma_factor']  # If <=0: no center weighting
 
         self._last_persisted_id = 0
         
@@ -250,8 +252,8 @@ class ImageProcessor:
             border_size=self.border_size,
             response_threshold=self.response_threshold,
             octave=self.octave,
-            # Set to False because we will compute descriptors in a batch later
-            compute_descriptors=False 
+            compute_descriptors=False,
+            gaussian_sigma_factor=self.gaussian_sigma_factor,  # 0 disables weighting
         )
         logger.debug(f"Detected {len(raw_kps_new)} new raw keypoints from image {image_id}")
 
@@ -611,4 +613,5 @@ class ImageProcessor:
                     self._last_persisted_id = self.points.last_image_id
                     logger.info(f"Final persistence completed. Last persisted ID set to {self._last_persisted_id}")
                 else:
+                    logger.error("Final persistence FAILED. _last_persisted_id not updated.")
                     logger.error("Final persistence FAILED. _last_persisted_id not updated.")

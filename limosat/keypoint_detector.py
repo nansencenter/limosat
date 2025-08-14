@@ -4,7 +4,7 @@
 #
 # Licensed under the MIT License. See the LICENSE file in the project root for full details.
 
-import numpy as np
+import numpy as np  # used for Gaussian weighting (np.exp)
 import cv2
 import cartopy.crs as ccrs
 from skimage.util import view_as_windows
@@ -124,6 +124,7 @@ class KeypointDetector:
         step=None,
         adjust_keypoint_angle=True,
         compute_descriptors=True,
+        gaussian_sigma_factor: float = 0.5,  # If <=0: disable Gaussian center weighting
     ):
         """
         Detect new keypoints in an image avoiding areas with existing keypoints.
@@ -135,6 +136,8 @@ class KeypointDetector:
             border_size (int): Border to exclude
             step (int): Step size between windows
             adjust_keypoint_angle (bool): Whether to adjust keypoint angles
+            gaussian_sigma_factor (float): >0 applies Gaussian center weighting (sigma = window_size * factor);
+                                           <=0 uses plain max response selection.
 
         Returns:
             tuple: (keypoint_coords, descriptors, surviving_tags)
@@ -196,19 +199,47 @@ class KeypointDetector:
                 window = windows[i, j]
                 # Detect keypoints in the window
                 kps = self.model.detect(window, None)
-                # Filter keypoints based on response
+                
+                if not kps:
+                    continue
+                    
                 kps = [kp for kp in kps if kp.response > response_threshold]
-                if len(kps) != 0:
-                    kp_best = max(kps, key=lambda kp: kp.response)
-                    # Adjust keypoint coordinates to the original image coordinates
-                    x_offset = x_start
-                    y_offset = y_start
-                    kp_best.pt = (kp_best.pt[0] + x_offset, kp_best.pt[1] + y_offset)
-                    if adjust_keypoint_angle:
-                        # combine img and feature angle
-                        kp_best.angle = img.angle
-                    kp_best.octave = octave
-                    keypoints.append((kp_best, None)) # Append tuple with None as tag
+
+                if not kps:
+                     continue
+
+                # Select a "local champion" keypoint in this window.
+                if gaussian_sigma_factor and gaussian_sigma_factor > 0:
+                    # Gaussian weighting favors keypoints near window center; reduces edge artifacts.
+                    # Composite score = kp.response * exp(-d^2 / (2*sigma^2))
+                    best_kp_in_window = None
+                    max_composite_score = -1.0
+                    center_x = window_size / 2.0
+                    center_y = window_size / 2.0
+                    sigma = max(1e-6, window_size * gaussian_sigma_factor)
+
+                    for kp in kps:
+                        dx = kp.pt[0] - center_x
+                        dy = kp.pt[1] - center_y
+                        distance_sq = dx * dx + dy * dy
+                        gaussian_weight = float(np.exp(-distance_sq / (2.0 * sigma * sigma)))
+                        composite_score = kp.response * gaussian_weight
+                        if composite_score > max_composite_score:
+                            max_composite_score = composite_score
+                            best_kp_in_window = kp
+                else:
+                    # Fallback: original behavior (choose maximum response)
+                    best_kp_in_window = max(kps, key=lambda kp: kp.response)
+
+                # Adjust keypoint coordinates to the original image coordinates
+                x_offset = x_start
+                y_offset = y_start
+                best_kp_in_window.pt = (best_kp_in_window.pt[0] + x_offset, best_kp_in_window.pt[1] + y_offset)
+                if adjust_keypoint_angle:
+                    # combine img and feature angle
+                    best_kp_in_window.angle = img.angle
+                best_kp_in_window.octave = octave
+                keypoints.append((best_kp_in_window, None)) # Append tuple with None as tag
 
         # Filter keypoints to remove ones too close to the image edges
         filtered_keypoints_with_tags = [
