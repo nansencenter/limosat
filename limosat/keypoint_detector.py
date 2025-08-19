@@ -35,6 +35,8 @@ class KeypointDetector:
             central_longitude=central_longitude,
             true_scale_latitude=true_scale_latitude
         )
+        # Cache for precomputed Gaussian masks: key = (window_size, gaussian_sigma_factor)
+        self._gaussian_cache = {}
         
     @log_execution_time
     def compute_descriptors(self, keypoints_with_tags, img, polarisation='s0_HV', normalize=True):
@@ -204,29 +206,38 @@ class KeypointDetector:
                     continue
                     
                 kps = [kp for kp in kps if kp.response > response_threshold]
-
                 if not kps:
-                     continue
+                    continue
 
                 # Select a "local champion" keypoint in this window.
                 if gaussian_sigma_factor and gaussian_sigma_factor > 0:
-                    # Gaussian weighting favors keypoints near window center; reduces edge artifacts.
-                    # Composite score = kp.response * exp(-d^2 / (2*sigma^2))
-                    best_kp_in_window = None
-                    max_composite_score = -1.0
-                    center_x = window_size / 2.0
-                    center_y = window_size / 2.0
-                    sigma = max(1e-6, window_size * gaussian_sigma_factor)
+                    # Precompute (or retrieve) Gaussian mask for this (window_size, gaussian_sigma_factor)
+                    cache_key = (window_size, float(gaussian_sigma_factor))
+                    gaussian_mask = self._gaussian_cache.get(cache_key)
+                    if gaussian_mask is None:
+                        sigma = max(1e-6, window_size * gaussian_sigma_factor)
+                        coords = np.arange(window_size, dtype=np.float32)
+                        xx, yy = np.meshgrid(coords, coords)
+                        cx = window_size / 2.0
+                        cy = window_size / 2.0
+                        dx = xx - cx
+                        dy = yy - cy
+                        gaussian_mask = np.exp(-(dx * dx + dy * dy) / (2.0 * sigma * sigma))
+                        self._gaussian_cache[cache_key] = gaussian_mask
 
-                    for kp in kps:
-                        dx = kp.pt[0] - center_x
-                        dy = kp.pt[1] - center_y
-                        distance_sq = dx * dx + dy * dy
-                        gaussian_weight = float(np.exp(-distance_sq / (2.0 * sigma * sigma)))
-                        composite_score = kp.response * gaussian_weight
-                        if composite_score > max_composite_score:
-                            max_composite_score = composite_score
-                            best_kp_in_window = kp
+                    # Vectorized composite score: response * gaussian(center-weight)
+                    # Round kp locations to nearest integer indices for lookup.
+                    responses = np.array([kp.response for kp in kps], dtype=np.float32)
+                    # (y, x) indices after rounding
+                    iy = np.array([int(round(kp.pt[1])) for kp in kps], dtype=np.int32)
+                    ix = np.array([int(round(kp.pt[0])) for kp in kps], dtype=np.int32)
+                    # Clamp to valid range (safety, should already be within window bounds)
+                    np.clip(iy, 0, window_size - 1, out=iy)
+                    np.clip(ix, 0, window_size - 1, out=ix)
+                    weights = gaussian_mask[iy, ix]
+                    composite_scores = responses * weights
+                    best_idx = int(np.argmax(composite_scores))
+                    best_kp_in_window = kps[best_idx]
                 else:
                     # Fallback: original behavior (choose maximum response)
                     best_kp_in_window = max(kps, key=lambda kp: kp.response)
@@ -236,10 +247,9 @@ class KeypointDetector:
                 y_offset = y_start
                 best_kp_in_window.pt = (best_kp_in_window.pt[0] + x_offset, best_kp_in_window.pt[1] + y_offset)
                 if adjust_keypoint_angle:
-                    # combine img and feature angle
                     best_kp_in_window.angle = img.angle
                 best_kp_in_window.octave = octave
-                keypoints.append((best_kp_in_window, None)) # Append tuple with None as tag
+                keypoints.append((best_kp_in_window, None))
 
         # Filter keypoints to remove ones too close to the image edges
         filtered_keypoints_with_tags = [
