@@ -35,6 +35,8 @@ class Keypoints(gpd.GeoDataFrame):
                 self['orbit_num'] = self['orbit_num'].astype('int32')
             if 'time' in self.columns:
                 self['time'] = pd.to_datetime(self['time'], errors='coerce')
+            if 'stopped' in self.columns:
+                self['stopped'] = self['stopped'].astype(bool)
         else:
             # Initialize with provided data
             super().__init__(*args, **kwargs)

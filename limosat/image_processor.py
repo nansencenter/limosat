@@ -302,8 +302,18 @@ class ImageProcessor:
                 loser_tids.add(tid_j)
                 mask = self.points['trajectory_id'] == tid_j
                 self.points.loc[mask, ['stopped', 'converged_to']] = [True, tid_i]
-            # If lengths are equal, we could have a more complex rule, but for now we do nothing
-            # and let both continue. This can be refined later if needed.
+            # If lengths are equal, use correlation as a tie-breaker
+            elif len_i == len_j:
+                corr_i = points_matched.iloc[i]['corr']
+                corr_j = points_matched.iloc[j]['corr']
+                if corr_i < corr_j:
+                    loser_tids.add(tid_i)
+                    mask = self.points['trajectory_id'] == tid_i
+                    self.points.loc[mask, ['stopped', 'converged_to']] = [True, tid_j]
+                else:
+                    loser_tids.add(tid_j)
+                    mask = self.points['trajectory_id'] == tid_j
+                    self.points.loc[mask, ['stopped', 'converged_to']] = [True, tid_i]
 
         if loser_tids:
             logger.info(f"Stopping {len(loser_tids)} trajectories due to convergence.")
