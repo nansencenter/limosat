@@ -64,7 +64,7 @@ class ImageProcessor:
             'use_interpolation': True,
             'max_interpolation_time_gap_hours': 25,
             'max_valid_speed_m_per_day': 50000.0,
-            'window_border': 0, 
+            'window_border': 0,
         }
 
         # Start with defaults, update from config, then from kwargs
@@ -93,7 +93,6 @@ class ImageProcessor:
         self.max_interpolation_time_gap_hours = proc_params['max_interpolation_time_gap_hours']
         self.max_valid_speed_m_per_day = proc_params['max_valid_speed_m_per_day']
         self.window_border = proc_params['window_border']  # 0 disables weighting
-
         self._last_persisted_id = 0
         
         # Initialize the KeypointDetector
@@ -244,7 +243,6 @@ class ImageProcessor:
                 else:
                     logger.warning("Database save reported failure. Skipping in-memory point pruning to prevent data loss.")
 
-    @log_execution_time
     def _handle_trajectory_convergence(self, points_matched):
         """
         Identifies and handles converging trajectories using a k-d tree.
@@ -334,7 +332,7 @@ class ImageProcessor:
             response_threshold=self.response_threshold,
             octave=self.octave,
             compute_descriptors=False,
-            window_border=self.window_border,  # renamed parameter
+            window_border=self.window_border,
         )
         logger.debug(f"Detected {len(raw_kps_new)} new raw keypoints from image {image_id}")
 
