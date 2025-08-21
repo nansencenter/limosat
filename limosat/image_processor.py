@@ -64,7 +64,7 @@ class ImageProcessor:
             'use_interpolation': True,
             'max_interpolation_time_gap_hours': 25,
             'max_valid_speed_m_per_day': 50000.0,
-            'gaussian_sigma_factor': 0.5, 
+            'window_border': 0, 
         }
 
         # Start with defaults, update from config, then from kwargs
@@ -92,7 +92,7 @@ class ImageProcessor:
         self.use_interpolation = proc_params['use_interpolation']
         self.max_interpolation_time_gap_hours = proc_params['max_interpolation_time_gap_hours']
         self.max_valid_speed_m_per_day = proc_params['max_valid_speed_m_per_day']
-        self.gaussian_sigma_factor = proc_params['gaussian_sigma_factor']  # If <=0: no center weighting
+        self.window_border = proc_params['window_border']  # 0 disables weighting
 
         self._last_persisted_id = 0
         
@@ -334,7 +334,7 @@ class ImageProcessor:
             response_threshold=self.response_threshold,
             octave=self.octave,
             compute_descriptors=False,
-            gaussian_sigma_factor=self.gaussian_sigma_factor,  # 0 disables weighting
+            window_border=self.window_border,  # renamed parameter
         )
         logger.debug(f"Detected {len(raw_kps_new)} new raw keypoints from image {image_id}")
 
