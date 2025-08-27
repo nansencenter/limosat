@@ -27,12 +27,16 @@ class Keypoints(gpd.GeoDataFrame):
                 'time': [],
                 'interpolated': [],
                 'orbit_num': [],
+                'stopped': [],
+                'converged_to': [],
             }
             super().__init__(empty_data)
             if 'orbit_num' in self.columns:
                 self['orbit_num'] = self['orbit_num'].astype('int32')
             if 'time' in self.columns:
                 self['time'] = pd.to_datetime(self['time'], errors='coerce')
+            if 'stopped' in self.columns:
+                self['stopped'] = self['stopped'].astype(bool)
         else:
             # Initialize with provided data
             super().__init__(*args, **kwargs)
@@ -128,6 +132,7 @@ class Keypoints(gpd.GeoDataFrame):
             'time': [img.date] * N,
             'interpolated': np.zeros(N),
             'orbit_num': np.full(N, orbit_num, dtype='int32'),
-
+            'stopped': np.zeros(N, dtype=bool),
+            'converged_to': np.full(N, -1, dtype=np.int64),
         }
         return cls(new_data)
