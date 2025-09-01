@@ -18,6 +18,7 @@ import pandas as pd
 import geopandas as gpd
 import xarray as xr
 from sqlalchemy import text, Float, Text, DateTime, inspect, Integer
+from sqlalchemy import Boolean
 from .utils import logger, log_execution_time
 
 class DriftDatabase:
@@ -37,16 +38,18 @@ class DriftDatabase:
 
         # Define database column types
         self.dtype = {
-            'image_id': Float(),
-            'is_last': Float(),
+            'image_id': Integer(),
+            'is_last': Integer(),
             'trajectory_id': Float(),
             'geometry': 'geometry',
             'descriptors': Text(),
             'angle': Float(),
             'corr': Float(),
             'time': DateTime(timezone=False),
-            'interpolated': Float(),
-            'orbit_num': Integer()
+            'interpolated': Integer(),   # CHANGED (was Float)
+            'orbit_num': Integer(),
+            'stopped': Boolean(),
+            'converged_to': Integer(),
         }
 
     def prepare_run_state(self, clear_existing_data=False, temporal_window_days=None):
@@ -98,9 +101,9 @@ class DriftDatabase:
 
         try:
             # --- 1. Prepare Points Delta ---
-            points_image_id_series = points['image_id'].astype(float)
-            last_persisted_id_float = float(last_persisted_id)
-            mask_series = points_image_id_series > last_persisted_id_float
+            points_image_id_series = points['image_id'].astype(int)
+            last_persisted_id_int = int(last_persisted_id)
+            mask_series = points_image_id_series > last_persisted_id_int
             points_delta = points.loc[mask_series].copy()
 
             if points_delta.empty:
@@ -119,6 +122,20 @@ class DriftDatabase:
                     lambda row: self._serialize_descriptors(row['descriptors']) if row['is_last'] == 1 else None,
                     axis=1
                 )
+            # --- ensure new columns exist / dtypes ---
+            if 'stopped' not in points_delta.columns:
+                points_delta['stopped'] = False
+            if 'converged_to' not in points_delta.columns:
+                points_delta['converged_to'] = -1
+            # NEW: enforce integer dtypes for interpolated & orbit_num
+            if 'interpolated' in points_delta.columns:
+                points_delta['interpolated'] = points_delta['interpolated'].astype('int64', errors='ignore')
+            if 'orbit_num' in points_delta.columns:
+                points_delta['orbit_num'] = points_delta['orbit_num'].astype('int64', errors='ignore')
+            points_delta['image_id'] = points_delta['image_id'].astype('int64')
+            points_delta['is_last'] = points_delta['is_last'].astype('int64')
+            points_delta['stopped'] = points_delta['stopped'].astype(bool)
+            points_delta['converged_to'] = points_delta['converged_to'].astype('int64')
 
             with self.engine.connect() as connection:
                 with connection.begin():
@@ -235,16 +252,18 @@ class DriftDatabase:
                 with connection.begin():
                     # Create table using an empty GeoDataFrame to define schema
                     empty_gdf = gpd.GeoDataFrame({
-                        'image_id': pd.Series(dtype='float64'),
-                        'is_last': pd.Series(dtype='float64'),
+                        'image_id': pd.Series(dtype='int64'),
+                        'is_last': pd.Series(dtype='int64'),
                         'trajectory_id': pd.Series(dtype='float64'),
                         'geometry': gpd.GeoSeries(dtype='geometry'),
                         'descriptors': pd.Series(dtype='object'),
                         'angle': pd.Series(dtype='float64'),
                         'corr': pd.Series(dtype='float64'),
                         'time': pd.Series(dtype='datetime64[ns]'),
-                        'interpolated': pd.Series(dtype='float64'),
-                        'orbit_num': pd.Series(dtype='float64'),
+                        'interpolated': pd.Series(dtype='int64'),
+                        'orbit_num': pd.Series(dtype='int64'),
+                        'stopped': pd.Series(dtype='bool'),
+                        'converged_to': pd.Series(dtype='int64'),
                     }, crs='EPSG:3413')
                     
                     empty_gdf.to_postgis(
@@ -295,6 +314,19 @@ class DriftDatabase:
             raise ValueError(f"Cannot resume: No 'is_last=1' points survived time filter (>= {time_threshold})")
 
         active_points_gdf['descriptors'] = active_points_gdf['descriptors'].apply(self.deserialize_descriptors)
+        # NEW: enforce dtypes for resumed session
+        if 'image_id' in active_points_gdf.columns:
+            active_points_gdf['image_id'] = active_points_gdf['image_id'].astype('int64')
+        if 'is_last' in active_points_gdf.columns:
+            active_points_gdf['is_last'] = active_points_gdf['is_last'].astype('int64')
+        if 'interpolated' in active_points_gdf.columns:
+            active_points_gdf['interpolated'] = active_points_gdf['interpolated'].astype('int64', errors='ignore')
+        if 'orbit_num' in active_points_gdf.columns:
+            active_points_gdf['orbit_num'] = active_points_gdf['orbit_num'].astype('int64', errors='ignore')
+        if 'stopped' in active_points_gdf.columns:
+            active_points_gdf['stopped'] = active_points_gdf['stopped'].astype(bool)
+        if 'converged_to' in active_points_gdf.columns:
+            active_points_gdf['converged_to'] = active_points_gdf['converged_to'].astype('int64')
         points = Keypoints._from_gdf(active_points_gdf)
 
         templates = Templates()

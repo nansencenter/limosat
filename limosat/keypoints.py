@@ -31,21 +31,41 @@ class Keypoints(gpd.GeoDataFrame):
                 'converged_to': [],
             }
             super().__init__(empty_data)
+            if 'image_id' in self.columns:
+                self['image_id'] = self['image_id'].astype('int32')
+            if 'is_last' in self.columns:
+                self['is_last'] = self['is_last'].astype('int32')
             if 'orbit_num' in self.columns:
                 self['orbit_num'] = self['orbit_num'].astype('int32')
             if 'time' in self.columns:
                 self['time'] = pd.to_datetime(self['time'], errors='coerce')
             if 'stopped' in self.columns:
                 self['stopped'] = self['stopped'].astype(bool)
+            if 'interpolated' in self.columns:
+                self['interpolated'] = self['interpolated'].astype('int32')
         else:
             # Initialize with provided data
             super().__init__(*args, **kwargs)
+            # --- Enforce dtypes for existing data ---
+            if 'image_id' in self.columns:
+                self['image_id'] = self['image_id'].astype('int64', errors='ignore')
+            if 'is_last' in self.columns:
+                self['is_last'] = self['is_last'].astype('int64', errors='ignore')
+            if 'stopped' in self.columns:
+                self['stopped'] = self['stopped'].astype(bool)
+            if 'converged_to' in self.columns:
+                self['converged_to'] = self['converged_to'].fillna(-1).astype('int64')
+            if 'interpolated' in self.columns:
+                self['interpolated'] = self['interpolated'].astype('int64', errors='ignore')
+            if 'orbit_num' in self.columns:
+                self['orbit_num'] = self['orbit_num'].astype('int64', errors='ignore')
+
         self.srs = kwargs.get('srs', self.srs)
 
     @property
     def last_image_id(self):
         """Return the highest image_id or 0 if no valid image_ids exist."""
-        return 0 if len(self) == 0 or 'image_id' not in self.columns else (self['image_id'].max() or 0)
+        return 0 if len(self) == 0 or 'image_id' not in self.columns else int(self['image_id'].max() or 0)
 
     @classmethod
     def _from_gdf(cls, gdf):
@@ -122,16 +142,16 @@ class Keypoints(gpd.GeoDataFrame):
         xy = img.transform_points(keypoints[:, 0], keypoints[:, 1], DstToSrc=0, dst_srs=cls.srs)
         N = len(xy[0])
         new_data = {
-            'image_id': np.zeros(N) + image_id,
-            'is_last': np.ones(N),
+            'image_id': np.full(N, image_id, dtype=np.int32),
+            'is_last': np.ones(N, dtype=np.int32),
             'trajectory_id': range(N),
             'geometry': gpd.points_from_xy(xy[0], xy[1]),
             'descriptors': list(descriptors),
             'angle': [img.angle] * N,
             'corr': np.zeros(N),
             'time': [img.date] * N,
-            'interpolated': np.zeros(N),
-            'orbit_num': np.full(N, orbit_num, dtype='int32'),
+            'interpolated': np.zeros(N, dtype=np.int32),   # CHANGED to int
+            'orbit_num': np.full(N, orbit_num, dtype=np.int32),  # already int
             'stopped': np.zeros(N, dtype=bool),
             'converged_to': np.full(N, -1, dtype=np.int64),
         }
