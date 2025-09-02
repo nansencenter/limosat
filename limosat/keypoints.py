@@ -43,6 +43,10 @@ class Keypoints(gpd.GeoDataFrame):
                 self['stopped'] = self['stopped'].astype(bool)
             if 'interpolated' in self.columns:
                 self['interpolated'] = self['interpolated'].astype('int32')
+            if 'trajectory_id' in self.columns:
+                self['trajectory_id'] = self['trajectory_id'].astype('int64')
+            if 'converged_to' in self.columns:
+                self['converged_to'] = self['converged_to'].astype('Int64')
         else:
             # Initialize with provided data
             super().__init__(*args, **kwargs)
@@ -51,10 +55,13 @@ class Keypoints(gpd.GeoDataFrame):
                 self['image_id'] = self['image_id'].astype('int64', errors='ignore')
             if 'is_last' in self.columns:
                 self['is_last'] = self['is_last'].astype('int64', errors='ignore')
+            if 'trajectory_id' in self.columns:
+                self['trajectory_id'] = self['trajectory_id'].astype('int64', errors='ignore')
             if 'stopped' in self.columns:
                 self['stopped'] = self['stopped'].astype(bool)
             if 'converged_to' in self.columns:
-                self['converged_to'] = self['converged_to'].fillna(-1).astype('int64')
+                self.loc[self['converged_to'] == -1, 'converged_to'] = pd.NA
+                self['converged_to'] = self['converged_to'].astype('Int64')
             if 'interpolated' in self.columns:
                 self['interpolated'] = self['interpolated'].astype('int64', errors='ignore')
             if 'orbit_num' in self.columns:
@@ -97,7 +104,7 @@ class Keypoints(gpd.GeoDataFrame):
 
         # Ensure trajectory_ids are integers in self
         if 'trajectory_id' in self.columns:
-            self['trajectory_id'] = self['trajectory_id'].astype(float).astype(int)
+            self['trajectory_id'] = self['trajectory_id'].astype('int64', errors='ignore')
 
         existing_trajectory_ids = set(self['trajectory_id']) if len(self) > 0 else set()
 
@@ -150,9 +157,9 @@ class Keypoints(gpd.GeoDataFrame):
             'angle': [img.angle] * N,
             'corr': np.zeros(N),
             'time': [img.date] * N,
-            'interpolated': np.zeros(N, dtype=np.int32),   # CHANGED to int
-            'orbit_num': np.full(N, orbit_num, dtype=np.int32),  # already int
+            'interpolated': np.zeros(N, dtype=np.int32),
+            'orbit_num': np.full(N, orbit_num, dtype=np.int32),
             'stopped': np.zeros(N, dtype=bool),
-            'converged_to': np.full(N, -1, dtype=np.int64),
+            'converged_to': [None] * N,
         }
         return cls(new_data)

@@ -10,6 +10,9 @@ import pandas as pd
 import geopandas as gpd
 import cv2
 from scipy.spatial import cKDTree
+import time
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
 from skimage.transform import AffineTransform
 from .utils import log_execution_time, logger
 from .database import DriftDatabase
@@ -243,17 +246,18 @@ class ImageProcessor:
                 else:
                     logger.warning("Database save reported failure. Skipping in-memory point pruning to prevent data loss.")
 
+
     def _handle_trajectory_convergence(self, points_matched):
         """
-        Identifies and handles converging trajectories using a k-d tree.
+        Identifies and handles converging trajectories using connected components.
 
-        When multiple trajectories converge to the same area, this method identifies
-        the longest trajectory as the 'winner' and stops the shorter 'loser'
-        trajectories.
+        When multiple trajectories converge, this method finds clusters of nearby points.
+        For each cluster, it identifies a single 'winner' trajectory and marks all
+        others in the cluster as 'losers'. The winner is chosen based on the longest
+        full trajectory history, with tie-breaking by correlation.
 
         Args:
-            points_matched (Keypoints): A GeoDataFrame of points that have been
-                                       successfully matched in the current image.
+            points_matched (Keypoints): A GeoDataFrame of points successfully matched.
 
         Returns:
             Keypoints: The input GeoDataFrame with points from loser trajectories removed.
@@ -261,63 +265,91 @@ class ImageProcessor:
         if len(points_matched) < 2:
             return points_matched
 
-        # Use cKDTree for efficient spatial querying
+        # 1. Find nearby points using cKDTree
         coords = np.vstack(points_matched.geometry.apply(lambda p: (p.x, p.y)))
         tree = cKDTree(coords)
-        # Find all pairs of points within the convergence radius
-        pairs = tree.query_pairs(r=self.convergence_radius_pixels, output_type='set')
+        pairs = tree.query_pairs(r=self.convergence_radius_pixels, output_type='ndarray')
 
-        if not pairs:
+        if pairs.size == 0:
+            return points_matched
+            
+        logger.info(f"Found {pairs.shape[0]} converging trajectory pairs, forming clusters.")
+
+        # 2. Find connected components using the highly efficient SciPy sparse graph tools
+        n_nodes = len(points_matched)
+        adj_matrix = coo_matrix((np.ones(len(pairs)), (pairs[:, 0], pairs[:, 1])), shape=(n_nodes, n_nodes))
+        
+        n_components, labels = connected_components(
+            csgraph=adj_matrix, directed=False, return_labels=True
+        )
+
+        # 3. Group indices by component label, only keeping clusters of size > 1
+        unique_labels, counts = np.unique(labels, return_counts=True)
+        multi_node_labels = unique_labels[counts > 1]
+        
+        if multi_node_labels.size == 0:
             return points_matched
 
-        logger.info(f"Found {len(pairs)} converging trajectory pairs.")
+        # Create a lookup for component indices
+        label_to_indices = {label: np.where(labels == label)[0] for label in multi_node_labels}
+        clusters = list(label_to_indices.values())
 
-        # Get trajectory lengths for all unique trajectories involved in the convergences
-        all_involved_tids = np.unique(points_matched.iloc[list(sum(pairs,()))].trajectory_id.values)
-        
-        # We need to query the main `self.points` dataframe to get the full length
+        # 4. Determine winner/loser for each cluster
+        loser_tids = set()
+        loser_to_winner_map = {} # To store who each loser converged to
+
+        # Pre-fetch all trajectory lengths needed to avoid repeated lookups
+        all_involved_indices = np.concatenate(clusters)
+        all_involved_tids = points_matched.iloc[all_involved_indices].trajectory_id.unique()
         traj_lengths = self.points[self.points['trajectory_id'].isin(all_involved_tids)]['trajectory_id'].value_counts()
 
-        loser_tids = set()
-        
-        # Determine winner/loser for each pair
-        for i, j in pairs:
-            tid_i = points_matched.iloc[i].trajectory_id
-            tid_j = points_matched.iloc[j].trajectory_id
+        for comp_indices in clusters:
+            # Get the dataframe slice for the current cluster
+            cluster_df = points_matched.iloc[comp_indices]
+            tids_in_cluster = cluster_df.trajectory_id.unique()
 
-            if tid_i in loser_tids or tid_j in loser_tids:
-                continue # One of these has already been marked as a loser
+            # Find the winner based on longest trajectory
+            cluster_lengths = traj_lengths.reindex(tids_in_cluster).fillna(1).astype(int)
+            max_len = cluster_lengths.max()
+            longest_tids = cluster_lengths[cluster_lengths == max_len].index.tolist()
 
-            len_i = traj_lengths.get(tid_i, 1)
-            len_j = traj_lengths.get(tid_j, 1)
+            winner_tid = None
+            if len(longest_tids) == 1:
+                winner_tid = longest_tids[0]
+            else:
+                # Tie-break using max correlation within the current points
+                tie_break_df = cluster_df[cluster_df['trajectory_id'].isin(longest_tids)]
+                # Group by tid, find the index of the max correlation for each
+                best_corr_indices = tie_break_df.loc[tie_break_df.groupby('trajectory_id')['corr'].idxmax()]
+                # From those, find the overall winner
+                winner_row = best_corr_indices.loc[best_corr_indices['corr'].idxmax()]
+                winner_tid = winner_row.trajectory_id
 
-            if len_i < len_j:
-                loser_tids.add(tid_i)
-                # Mark the last point of the loser trajectory as stopped
-                mask = self.points['trajectory_id'] == tid_i
-                self.points.loc[mask, ['stopped', 'converged_to']] = [True, tid_j]
-            elif len_j < len_i:
-                loser_tids.add(tid_j)
-                mask = self.points['trajectory_id'] == tid_j
-                self.points.loc[mask, ['stopped', 'converged_to']] = [True, tid_i]
-            # If lengths are equal, use correlation as a tie-breaker
-            elif len_i == len_j:
-                corr_i = points_matched.iloc[i]['corr']
-                corr_j = points_matched.iloc[j]['corr']
-                if corr_i < corr_j:
-                    loser_tids.add(tid_i)
-                    mask = self.points['trajectory_id'] == tid_i
-                    self.points.loc[mask, ['stopped', 'converged_to']] = [True, tid_j]
-                else:
-                    loser_tids.add(tid_j)
-                    mask = self.points['trajectory_id'] == tid_j
-                    self.points.loc[mask, ['stopped', 'converged_to']] = [True, tid_i]
+            # Mark all others in the cluster as losers
+            cluster_losers = set(tids_in_cluster) - {winner_tid}
+            if cluster_losers:
+                loser_tids.update(cluster_losers)
+                for loser in cluster_losers:
+                    loser_to_winner_map[loser] = winner_tid
 
+        # 5. Apply all updates in a single, vectorized operation
         if loser_tids:
             logger.info(f"Stopping {len(loser_tids)} trajectories due to convergence.")
-            # Filter out the loser trajectories from the current set of matched points
+            
+            # Create a mask for all rows in self.points that belong to a loser trajectory
+            mask = self.points['trajectory_id'].isin(loser_tids)
+            
+            # Update 'stopped' status
+            self.points.loc[mask, 'stopped'] = True
+            
+            # Map each loser TID to its corresponding winner TID for the 'converged_to' column
+            # This is much faster than updating inside the loop
+            converged_to_values = self.points.loc[mask, 'trajectory_id'].map(loser_to_winner_map)
+            self.points.loc[mask, 'converged_to'] = converged_to_values
+
+            # Filter the current matched points to remove losers for the next processing step
             return points_matched[~points_matched['trajectory_id'].isin(loser_tids)]
-        
+
         return points_matched
 
     @log_execution_time
