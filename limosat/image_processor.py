@@ -14,6 +14,7 @@ import time
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from skimage.transform import AffineTransform
+import logging
 from .utils import log_execution_time, logger
 from .database import DriftDatabase
 from .deformation import filter_and_interpolate_flipped_triangles
@@ -173,21 +174,68 @@ class ImageProcessor:
         if len(points_poly) == 0:
             logger.info("No overlapping points found")
             points_final = Keypoints()
+            occupancy_points = Keypoints()  # nothing to exclude
         else:
             logger.info(f"{len(points_poly)} overlapping points found")
             points_final = self._match_existing_points(points_poly, img, image_id, img.orbit_num)
             if points_final is None:
                 logger.info("Insufficient match quality, skipping point matching")
                 points_final = Keypoints()
-            else:
-                if 'interpolated' in points_final.columns:
-                    interp_count = points_final['interpolated'].sum()
-                    total_count = len(points_final)
-                    if interp_count > 0:
-                        logger.debug(f"Interpolation stats: {interp_count}/{total_count} points ({interp_count/total_count:.1%}) were interpolated")
 
-        # Process new points
-        self._process_new_points(points_final, img, image_id, basename)
+            # --- Build occupancy set to avoid seeding near ANY active last point (matched or unmatched) ---
+            if not points_poly.empty:
+                # Simplified pre-filter: drop same-orbit and stopped trajectories
+                orbit_num_current = getattr(img, 'orbit_num', None)
+
+                same_orbit_mask = pd.Series(False, index=points_poly.index)
+                if orbit_num_current is not None and 'orbit_num' in points_poly.columns:
+                    same_orbit_mask = (points_poly['orbit_num'] == orbit_num_current)
+
+                stopped_mask = pd.Series(False, index=points_poly.index)
+                if 'stopped' in points_poly.columns:
+                    stopped_mask = points_poly['stopped'].astype(bool)
+
+                combined_exclude_mask = same_orbit_mask | stopped_mask
+                occupancy_candidates = points_poly[~combined_exclude_mask]
+
+                same_orbit_excluded = int(same_orbit_mask.sum())
+                stopped_excluded = int(stopped_mask.sum())
+
+                # Derive unmatched from filtered candidates
+                if points_final.empty:
+                    unmatched_points_gdf = occupancy_candidates
+                else:
+                    matched_tids = set(points_final.trajectory_id.values)
+                    unmatched_points_gdf = occupancy_candidates[~occupancy_candidates.trajectory_id.isin(matched_tids)]
+
+                # Combine matched (updated geom) + unmatched (previous geom)
+                if not points_final.empty:
+                    occ_gdf = pd.concat([points_final, unmatched_points_gdf], ignore_index=True)
+                else:
+                    occ_gdf = unmatched_points_gdf
+
+                occupancy_points = Keypoints._from_gdf(occ_gdf)
+
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "Occupancy build: candidates=%d matched=%d unmatched=%d excl_same_orbit=%d excl_stopped=%d",
+                        len(occupancy_candidates),
+                        len(points_final),
+                        len(unmatched_points_gdf),
+                        same_orbit_excluded,
+                        stopped_excluded
+                    )
+            else:
+                occupancy_points = Keypoints()
+
+            if not points_final.empty and 'interpolated' in points_final.columns:
+                interp_count = points_final['interpolated'].sum()
+                total_count = len(points_final)
+                if interp_count > 0:
+                    logger.debug(f"Interpolation stats: {interp_count}/{total_count} points ({interp_count/total_count:.1%}) were interpolated")
+
+        # Process new points (now excluding both matched and unmatched existing active trajectories)
+        self._process_new_points(points_final, img, image_id, basename, occupancy_points=occupancy_points)
 
         # Template pruning
         if image_id > 0 and image_id % self.pruning_interval == 0 and len(self.templates) > 0:
@@ -257,10 +305,10 @@ class ImageProcessor:
         full trajectory history, with tie-breaking by correlation.
 
         Args:
-            points_matched (Keypoints): A GeoDataFrame of points successfully matched.
+            points_matched (pd.DataFrame): A GeoDataFrame of points successfully matched.
 
         Returns:
-            Keypoints: The input GeoDataFrame with points from loser trajectories removed.
+            pd.DataFrame: The input DataFrame with points from loser trajectories removed.
         """
         if len(points_matched) < 2:
             return points_matched
@@ -272,10 +320,10 @@ class ImageProcessor:
 
         if pairs.size == 0:
             return points_matched
-            
+                
         logger.info(f"Found {pairs.shape[0]} converging trajectory pairs, forming clusters.")
 
-        # 2. Find connected components using the highly efficient SciPy sparse graph tools
+        # 2. Find connected components using SciPy's sparse graph tools
         n_nodes = len(points_matched)
         adj_matrix = coo_matrix((np.ones(len(pairs)), (pairs[:, 0], pairs[:, 1])), shape=(n_nodes, n_nodes))
         
@@ -283,50 +331,46 @@ class ImageProcessor:
             csgraph=adj_matrix, directed=False, return_labels=True
         )
 
-        # 3. Group indices by component label, only keeping clusters of size > 1
+        # 3. Group indices by component label, keeping only clusters of size > 1
         unique_labels, counts = np.unique(labels, return_counts=True)
         multi_node_labels = unique_labels[counts > 1]
         
         if multi_node_labels.size == 0:
             return points_matched
 
-        # Create a lookup for component indices
         label_to_indices = {label: np.where(labels == label)[0] for label in multi_node_labels}
         clusters = list(label_to_indices.values())
 
         # 4. Determine winner/loser for each cluster
         loser_tids = set()
-        loser_to_winner_map = {} # To store who each loser converged to
+        loser_to_winner_map = {}
 
-        # Pre-fetch all trajectory lengths needed to avoid repeated lookups
         all_involved_indices = np.concatenate(clusters)
         all_involved_tids = points_matched.iloc[all_involved_indices].trajectory_id.unique()
         traj_lengths = self.points[self.points['trajectory_id'].isin(all_involved_tids)]['trajectory_id'].value_counts()
 
         for comp_indices in clusters:
-            # Get the dataframe slice for the current cluster
-            cluster_df = points_matched.iloc[comp_indices]
-            tids_in_cluster = cluster_df.trajectory_id.unique()
-
-            # Find the winner based on longest trajectory
-            cluster_lengths = traj_lengths.reindex(tids_in_cluster).fillna(1).astype(int)
-            max_len = cluster_lengths.max()
-            longest_tids = cluster_lengths[cluster_lengths == max_len].index.tolist()
-
-            winner_tid = None
-            if len(longest_tids) == 1:
-                winner_tid = longest_tids[0]
-            else:
-                # Tie-break using max correlation within the current points
-                tie_break_df = cluster_df[cluster_df['trajectory_id'].isin(longest_tids)]
-                # Group by tid, find the index of the max correlation for each
-                best_corr_indices = tie_break_df.loc[tie_break_df.groupby('trajectory_id')['corr'].idxmax()]
-                # From those, find the overall winner
-                winner_row = best_corr_indices.loc[best_corr_indices['corr'].idxmax()]
-                winner_tid = winner_row.trajectory_id
-
+            cluster_df = points_matched.iloc[comp_indices].copy()
+            
+            # Add the 'length' column to this temporary dataframe for sorting
+            cluster_df['length'] = cluster_df['trajectory_id'].map(traj_lengths).fillna(1).astype(int)
+            
+            # Robustly find the winner using multi-level sorting:
+            # 1. Sort by trajectory length (descending).
+            # 2. Then, sort by correlation (descending) to break ties.
+            sorted_cluster = cluster_df.sort_values(
+                by=['length', 'corr'], 
+                ascending=[False, False]
+            )
+            
+            # The winner is unambiguously the first row of the sorted DataFrame.
+            winner_row = sorted_cluster.iloc[0]
+            winner_tid = int(winner_row['trajectory_id'])
+            
             # Mark all others in the cluster as losers
+            tids_in_cluster = cluster_df['trajectory_id'].unique()
             cluster_losers = set(tids_in_cluster) - {winner_tid}
+
             if cluster_losers:
                 loser_tids.update(cluster_losers)
                 for loser in cluster_losers:
@@ -336,28 +380,32 @@ class ImageProcessor:
         if loser_tids:
             logger.info(f"Stopping {len(loser_tids)} trajectories due to convergence.")
             
-            # Create a mask for all rows in self.points that belong to a loser trajectory
             mask = self.points['trajectory_id'].isin(loser_tids)
-            
-            # Update 'stopped' status
             self.points.loc[mask, 'stopped'] = True
             
-            # Map each loser TID to its corresponding winner TID for the 'converged_to' column
-            # This is much faster than updating inside the loop
             converged_to_values = self.points.loc[mask, 'trajectory_id'].map(loser_to_winner_map)
             self.points.loc[mask, 'converged_to'] = converged_to_values
 
-            # Filter the current matched points to remove losers for the next processing step
             return points_matched[~points_matched['trajectory_id'].isin(loser_tids)]
 
         return points_matched
 
     @log_execution_time
-    def _process_new_points(self, points_final, img, image_id, basename):
-        """Process new points, including validation data, and update templates."""
-        # Detect new keypoints (raw)
+    def _process_new_points(self, points_final, img, image_id, basename, occupancy_points=None):
+        """
+        Process new (seeded) points and update templates.
+
+        occupancy_points (Keypoints): Combined set of positions to exclude when seeding:
+            - matched trajectories with updated positions (points_final)
+            - unmatched active trajectories with their previous positions
+            If None, falls back to using points_final (legacy behaviour).
+        """
+        # Use combined occupancy set if provided
+        exclusion_points = occupancy_points if occupancy_points is not None else points_final
+
+        # Detect new keypoints avoiding both matched and unmatched active trajectories
         raw_kps_new = self.keypoint_detector.detect_new_keypoints(
-            points=points_final,
+            points=exclusion_points,
             img=img,
             window_size=self.window_size,
             border_size=self.border_size,
@@ -366,7 +414,7 @@ class ImageProcessor:
             compute_descriptors=False,
             window_border=self.window_border,
         )
-        logger.debug(f"Detected {len(raw_kps_new)} new raw keypoints from image {image_id}")
+        logger.debug(f"Detected {len(raw_kps_new)} new raw keypoints from image {image_id} after occupancy exclusion")
 
         if self.insitu_points is not None:
             matching_insitu_points = self.insitu_points.loc[
@@ -413,9 +461,31 @@ class ImageProcessor:
                     logger.warning(f"Mismatch between surviving_tags ({len(surviving_tags)}) and "
                                    f"appended_points_gdf_reset ({len(appended_points_gdf_reset)}). Skipping insitu linking for this batch.")
 
-            # Add templates for the newly created points
-            self.templates.add(appended_points_gdf, img, self.template_size, band=1)
+            # OPTIONAL: defensive removal of any newly seeded points that slipped within convergence radius
+            if len(appended_points_gdf) > 0 and exclusion_points is not None and not exclusion_points.empty:
+                try:
+                    # Fast spatial culling using cKDTree
+                    new_xy = np.vstack(appended_points_gdf.geometry.apply(lambda p: (p.x, p.y)))
+                    old_xy = np.vstack(exclusion_points.geometry.apply(lambda p: (p.x, p.y)))
+                    tree = cKDTree(old_xy)
+                    nn_dist, _ = tree.query(new_xy, k=1, workers=-1)
+                    keep_mask = nn_dist > self.convergence_radius_pixels
+                    if not np.all(keep_mask):
+                        removed = (~keep_mask).sum()
+                        if removed > 0:
+                            logger.debug(f"Removed {removed} newly seeded points inside convergence radius of existing trajectories")
+                            # Drop from self.points
+                            to_remove_index = appended_points_gdf.index[~keep_mask]
+                            self.points = Keypoints._from_gdf(self.points.drop(index=to_remove_index))
+                            # Reset appended_points_gdf to survivors for template creation / linking
+                            appended_points_gdf = appended_points_gdf.loc[keep_mask]
+                except Exception as e:
+                    logger.warning(f"Proximity purge of new seeds failed: {e}")
 
+            # Add templates only for surviving new points
+            if len(appended_points_gdf) > 0:
+                self.templates.add(appended_points_gdf, img, self.template_size, band=1)
+        # ...existing code...
         if len(points_final) > 0:
             self.points = self.points.update(points_final)
             # Update templates for the points that were successfully matched and updated
