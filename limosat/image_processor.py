@@ -177,14 +177,10 @@ class ImageProcessor:
             occupancy_points = Keypoints()  # nothing to exclude
         else:
             logger.info(f"{len(points_poly)} overlapping points found")
-            points_final = self._match_existing_points(points_poly, img, image_id, img.orbit_num)
-            if points_final is None:
-                logger.info("Insufficient match quality, skipping point matching")
-                points_final = Keypoints()
+            points_final, failed_predictions = self._match_existing_points(points_poly, img, image_id, img.orbit_num)
 
             # --- Build occupancy set to avoid seeding near ANY active last point (matched or unmatched) ---
             if not points_poly.empty:
-                # Simplified pre-filter: drop same-orbit and stopped trajectories
                 orbit_num_current = getattr(img, 'orbit_num', None)
 
                 same_orbit_mask = pd.Series(False, index=points_poly.index)
@@ -196,32 +192,39 @@ class ImageProcessor:
                     stopped_mask = points_poly['stopped'].astype(bool)
 
                 combined_exclude_mask = same_orbit_mask | stopped_mask
-                occupancy_candidates = points_poly[~combined_exclude_mask]
+                candidates = points_poly[~combined_exclude_mask]
 
                 same_orbit_excluded = int(same_orbit_mask.sum())
                 stopped_excluded = int(stopped_mask.sum())
 
-                # Derive unmatched from filtered candidates
                 if points_final.empty:
-                    unmatched_points_gdf = occupancy_candidates
+                    unmatched = candidates
                 else:
                     matched_tids = set(points_final.trajectory_id.values)
-                    unmatched_points_gdf = occupancy_candidates[~occupancy_candidates.trajectory_id.isin(matched_tids)]
+                    unmatched = candidates[~candidates.trajectory_id.isin(matched_tids)]
 
-                # Combine matched (updated geom) + unmatched (previous geom)
+                # Substitute unmatched geometry with failed interpolated predictions when available
+                if isinstance(failed_predictions, pd.DataFrame) and not failed_predictions.empty:
+                    pred_map = dict(zip(failed_predictions['trajectory_id'], failed_predictions['geometry_pred']))
+                    if pred_map and not unmatched.empty:
+                        unmatched = unmatched.copy()
+                        unmatched['geometry'] = unmatched.apply(
+                            lambda r: pred_map.get(r.trajectory_id, r.geometry), axis=1
+                        )
+
                 if not points_final.empty:
-                    occ_gdf = pd.concat([points_final, unmatched_points_gdf], ignore_index=True)
+                    occupancy = pd.concat([points_final, unmatched], ignore_index=True)
                 else:
-                    occ_gdf = unmatched_points_gdf
+                    occupancy = unmatched
 
-                occupancy_points = Keypoints._from_gdf(occ_gdf)
+                occupancy_points = Keypoints._from_gdf(occupancy)
 
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(
                         "Occupancy build: candidates=%d matched=%d unmatched=%d excl_same_orbit=%d excl_stopped=%d",
-                        len(occupancy_candidates),
+                        len(candidates),
                         len(points_final),
-                        len(unmatched_points_gdf),
+                        len(unmatched),
                         same_orbit_excluded,
                         stopped_excluded
                     )
@@ -494,9 +497,9 @@ class ImageProcessor:
     @log_execution_time
     def _match_existing_points(self, points_poly, img, image_id, current_orbit_num):
         """
-        Match points from previous image to current one, with optional interpolation,
-        then apply pattern matching and filter by correlation. This version uses the
-        empirically correct trajectory_id assignment and robust descriptor filtering.
+        Match points and return (final_points, failed_predictions).
+        failed_predictions contains columns ['trajectory_id', 'geometry_pred'] with predicted positions
+        for candidates that were interpolated but failed the recheck.
         """
         # Goal: Filter out points from trajectories that have already been stopped.
         stopped_tids = self.points[self.points['stopped'] == True]['trajectory_id'].unique()
@@ -512,7 +515,7 @@ class ImageProcessor:
         # 1. Check for the prerequisite column.
         if 'orbit_num' not in points_poly.columns:
             logger.error("FATAL: 'orbit_num' column not found in points_poly. Cannot apply orbit filter.")
-            return Keypoints() # Return an empty Keypoints object
+            return Keypoints(), pd.DataFrame(columns=["trajectory_id", "geometry_pred"]) 
 
         # 2. Create and apply the filter mask.
         previous_orbit_nums = points_poly['orbit_num']
@@ -526,7 +529,7 @@ class ImageProcessor:
                 f"Found {total_candidates_in_buffer} points in buffer, but all were from the same orbit ({current_orbit_num}). "
                 "Skipping matching."
             )
-            return Keypoints() # Exit early
+            return Keypoints(), pd.DataFrame(columns=["trajectory_id", "geometry_pred"]) 
         else:
             logger.info(
                 f"{len(points_poly_filtered)} valid candidate points found for matching from previous orbits."
@@ -543,7 +546,7 @@ class ImageProcessor:
 
         if keypoints_coords_arr_grid is None or descriptors_grid is None:
             logger.warning("Failed to compute descriptors for grid points. Skipping matching.")
-            return None
+            return Keypoints(), pd.DataFrame(columns=["trajectory_id", "geometry_pred"]) 
 
         points_grid = Keypoints.create(keypoints_coords_arr_grid, descriptors_grid, img, image_id=image_id, orbit_num=img.orbit_num)
 
@@ -555,7 +558,7 @@ class ImageProcessor:
 
         if points_fg1 is None or points_fg2 is None or points_fg1.empty or points_fg2.empty:
             logger.info("Insufficient match quality or no matches found, skipping point matching step.")
-            return Keypoints()
+            return Keypoints(), pd.DataFrame(columns=["trajectory_id", "geometry_pred"]) 
 
         # Assign trajectory IDs to matched points
         points_fg2['trajectory_id'] = points_fg1.trajectory_id.values
@@ -628,7 +631,7 @@ class ImageProcessor:
             points_matched = self._handle_trajectory_convergence(points_matched)
             if points_matched.empty:
                 logger.info("All points removed after convergence handling.")
-                return Keypoints()
+                return Keypoints(), pd.DataFrame(columns=["trajectory_id", "geometry_pred"]) 
 
         # Filter out points that don't have templates
         all_traj_ids = points_matched.trajectory_id.values
@@ -641,7 +644,7 @@ class ImageProcessor:
             
         if points_matched.empty:
             logger.debug("No points remaining after template filtering.")
-            return Keypoints() 
+            return Keypoints(), pd.DataFrame(columns=["trajectory_id", "geometry_pred"]) 
 
         # Get original points and templates for pattern matching
         points_orig = points_poly_filtered[points_poly_filtered.trajectory_id.isin(all_traj_ids)]
@@ -652,7 +655,7 @@ class ImageProcessor:
                         f"points_matched: {len(points_matched)}, "
                         f"points_orig: {len(points_orig)}, "
                         f"templates_all: {len(templates_all.trajectory_id)}")
-            return Keypoints() 
+            return Keypoints(), pd.DataFrame(columns=["trajectory_id", "geometry_pred"]) 
 
         # Perform pattern matching
         keypoints_corrected_xy, keypoints_corrected_rc, corr_values = pattern_matching(
@@ -672,7 +675,7 @@ class ImageProcessor:
         
         if not np.any(correlation_mask):
             logger.debug("No points passed correlation filter.")
-            return Keypoints()
+            return Keypoints(), pd.DataFrame(columns=["trajectory_id", "geometry_pred"]) 
 
         # Apply correlation filter
         points_matched = points_matched[correlation_mask]
@@ -702,6 +705,8 @@ class ImageProcessor:
         rc_good = keypoints_corrected_rc[correlation_mask][good_mask]
 
         # Handle points that need re-checking
+        failed_predictions = pd.DataFrame(columns=["trajectory_id", "geometry_pred"])  # collect failed recheck predictions
+
         if np.any(was_interpolated_mask):
             logger.info(f"Re-validating {np.sum(was_interpolated_mask)} interpolated vectors...")
             
@@ -714,8 +719,8 @@ class ImageProcessor:
 
             xy_rechecked, rc_rechecked, corr_rechecked = pattern_matching(
                 points_to_recheck,
-                img, 
-                templates_recheck, 
+                img,
+                templates_recheck,
                 points_fg1_recheck,
                 hs=self.template_size,
                 border_matched=self.border_matched,
@@ -725,9 +730,20 @@ class ImageProcessor:
             
             recheck_passed_mask = corr_rechecked >= self.min_correlation
 
+            # collect failed (interpolated but did not pass recheck)
+            if (~recheck_passed_mask).any():
+                failed_tids = points_to_recheck.loc[~recheck_passed_mask, 'trajectory_id'].values
+                xs = x1_interp[was_interpolated_mask][~recheck_passed_mask]
+                ys = y1_interp[was_interpolated_mask][~recheck_passed_mask]
+                failed_geom = gpd.points_from_xy(xs, ys).tolist()
+                failed_predictions = pd.DataFrame({
+                    'trajectory_id': failed_tids,
+                    'geometry_pred': failed_geom
+                })
+
             num_passed = np.sum(recheck_passed_mask)
             logger.debug(f"Re-validation: {num_passed}/{len(points_to_recheck)} interpolated vectors passed.")
-            
+
             # Combine survivors from both groups
             points_rechecked = points_to_recheck[recheck_passed_mask]
             points_rechecked['corr'] = corr_rechecked[recheck_passed_mask]
@@ -745,7 +761,7 @@ class ImageProcessor:
         # Final checks
         if points_matched.empty:
             logger.debug("No points survived filtering.")
-            return Keypoints()
+            return Keypoints(), failed_predictions
                         
         # Update geometry with corrected positions
         points_matched = points_matched.drop(columns=['geometry_orig'])
@@ -770,8 +786,6 @@ class ImageProcessor:
         else:
             new_descriptors = None
 
-        # Filter points based on successful descriptor computation
-
         original_count = len(points_matched)
 
         if new_descriptors is not None and len(new_descriptors) == len(points_matched):
@@ -792,7 +806,7 @@ class ImageProcessor:
             self.templates.update(points_matched, img, self.template_size, band=1)
 
         logger.debug(f"Returning {len(points_matched)} final points")
-        return points_matched
+        return points_matched, failed_predictions
 
     def ensure_final_persistence(self):
         """Ensure final persistence of any remaining unprocessed data."""
