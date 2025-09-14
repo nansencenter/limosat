@@ -198,7 +198,7 @@ def pattern_matching(
 
 
     for i in range(len(points)):
-        point_row = points.iloc[i] # This is from 'points' (current estimates)
+        point_row = points.iloc[i]
         current_tid = point_row.trajectory_id
 
         c1_initial, r1_initial = colsrows[i, 0], colsrows[i, 1]
