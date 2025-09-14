@@ -18,6 +18,7 @@ import pandas as pd
 import geopandas as gpd
 import xarray as xr
 from sqlalchemy import text, Float, Text, DateTime, inspect, Integer
+from sqlalchemy import Boolean
 from .utils import logger, log_execution_time
 
 class DriftDatabase:
@@ -37,16 +38,18 @@ class DriftDatabase:
 
         # Define database column types
         self.dtype = {
-            'image_id': Float(),
-            'is_last': Float(),
-            'trajectory_id': Float(),
+            'image_id': Integer(),
+            'is_last': Integer(),
+            'trajectory_id': Integer(), 
             'geometry': 'geometry',
             'descriptors': Text(),
             'angle': Float(),
             'corr': Float(),
             'time': DateTime(timezone=False),
-            'interpolated': Float(),
-            'orbit_num': Integer()
+            'interpolated': Integer(),
+            'orbit_num': Integer(),
+            'stopped': Boolean(),
+            'converged_to': Integer(),
         }
 
     def prepare_run_state(self, clear_existing_data=False, temporal_window_days=None):
@@ -95,12 +98,11 @@ class DriftDatabase:
                       return False
              return True
 
-
         try:
             # --- 1. Prepare Points Delta ---
-            points_image_id_series = points['image_id'].astype(float)
-            last_persisted_id_float = float(last_persisted_id)
-            mask_series = points_image_id_series > last_persisted_id_float
+            points_image_id_series = points['image_id'].astype(int)
+            last_persisted_id_int = int(last_persisted_id)
+            mask_series = points_image_id_series > last_persisted_id_int
             points_delta = points.loc[mask_series].copy()
 
             if points_delta.empty:
@@ -114,20 +116,20 @@ class DriftDatabase:
             logger.info(f"Processing {len(points_delta)} new/updated points for persistence.")
             points_delta = points_delta.set_crs('EPSG:3413')
             if 'descriptors' in points_delta.columns:
-                # To save space, only persist descriptors for the last known point of a trajectory.
                 points_delta['descriptors'] = points_delta.apply(
                     lambda row: self._serialize_descriptors(row['descriptors']) if row['is_last'] == 1 else None,
                     axis=1
                 )
 
+
             with self.engine.connect() as connection:
                 with connection.begin():
-                    updated_traj_ids = points_delta['trajectory_id'].unique().tolist()
-                    updated_traj_ids = [int(tid) for tid in updated_traj_ids if pd.notna(tid)]
-
+                    updated_traj_ids = [
+                        int(tid) for tid in points_delta['trajectory_id'].unique().tolist()
+                        if pd.notna(tid)
+                    ]
                     inspector = inspect(connection.engine)
                     table_exists = inspector.has_table(self.run_name, schema=connection.dialect.default_schema_name)
-
                     if updated_traj_ids and table_exists:
                         update_sql = text(f"""
                             UPDATE {self.run_name}
@@ -235,16 +237,18 @@ class DriftDatabase:
                 with connection.begin():
                     # Create table using an empty GeoDataFrame to define schema
                     empty_gdf = gpd.GeoDataFrame({
-                        'image_id': pd.Series(dtype='float64'),
-                        'is_last': pd.Series(dtype='float64'),
-                        'trajectory_id': pd.Series(dtype='float64'),
+                        'image_id': pd.Series(dtype='int64'),
+                        'is_last': pd.Series(dtype='int64'),
+                        'trajectory_id': pd.Series(dtype='int64'),
                         'geometry': gpd.GeoSeries(dtype='geometry'),
                         'descriptors': pd.Series(dtype='object'),
                         'angle': pd.Series(dtype='float64'),
                         'corr': pd.Series(dtype='float64'),
                         'time': pd.Series(dtype='datetime64[ns]'),
-                        'interpolated': pd.Series(dtype='float64'),
-                        'orbit_num': pd.Series(dtype='float64'),
+                        'interpolated': pd.Series(dtype='int64'),
+                        'orbit_num': pd.Series(dtype='int64'),
+                        'stopped': pd.Series(dtype='bool'),
+                        'converged_to': pd.Series(dtype='Int64'),
                     }, crs='EPSG:3413')
                     
                     empty_gdf.to_postgis(
@@ -302,6 +306,6 @@ class DriftDatabase:
             templates.data = ds["template_data"].load()
             if templates.data.trajectory_id.size > 0:
                 templates._initialized = True
-        
+
         logger.info(f"Resume successful: Loaded {len(points)} points and {len(templates)} templates.")
         return points, templates

@@ -250,7 +250,7 @@ class Matcher:
                 f'{self.estimation_method_name}: Found {rc_idx0.size} inliers from {len(matches)} initial candidates.'
             )
             
-            if self.plot: # Your existing plot call
+            if self.plot:
                 self.plot_quiver(pos0[rc_idx0], pos1[rc_idx1], residuals)
                 
             return rc_idx0, rc_idx1, residuals

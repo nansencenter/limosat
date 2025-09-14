@@ -126,7 +126,7 @@ class KeypointDetector:
         step=None,
         adjust_keypoint_angle=True,
         compute_descriptors=True,
-        gaussian_sigma_factor: float = 0.5,  # If <=0: disable Gaussian center weighting
+        window_border: int = 0,
     ):
         """
         Detect new keypoints in an image avoiding areas with existing keypoints.
@@ -134,20 +134,25 @@ class KeypointDetector:
         Parameters:
             points (Keypoints): Existing keypoints
             img (Image): Image to detect keypoints in
+            octave (int): Octave value for cv2.KeyPoint.octave
             window_size (int): Size of detection windows
-            border_size (int): Border to exclude
-            step (int): Step size between windows
-            adjust_keypoint_angle (bool): Whether to adjust keypoint angles
-            gaussian_sigma_factor (float): >0 applies Gaussian center weighting (sigma = window_size * factor);
-                                           <=0 uses plain max response selection.
-
+            border_size (int): Border (pixels) to exclude from final keypoints
+            response_threshold (float): Minimum raw detector response
+            step (int): Step size between windows (defaults to window_size)
+            adjust_keypoint_angle (bool): Whether to set keypoint angle to img.angle
+            compute_descriptors (bool): Whether to compute descriptors at the end
+            window_border (int): If > 0, apply flat-center + tapered-edge weighting mask.
+                                 If <= 0, select keypoint with highest raw response.
         Returns:
-            tuple: (keypoint_coords, descriptors, surviving_tags)
+            tuple or list: (keypoint_coords, descriptors, surviving_tags) or list of (cv2.KeyPoint, tag)
         """
+        if not hasattr(self, "_cache"):
+            self._cache = {}
+
         img0 = img[1]
         img0[np.isnan(img0)] = 0
-        
-        # TODO: generalise preprocessing to create boolean landmask
+
+        # land mask
         if img.bands().get(2, {'name': 'none'}).get('name') == 'mask':
             landmask = img[2]
             img0[landmask == 2] = 0
@@ -155,7 +160,7 @@ class KeypointDetector:
         if step is None:
             step = window_size
 
-        # Extract the coordinates of these points and transform them into image coordinates
+        # Prepare existing keypoints (to limit density)
         if not points.empty:
             points_poly_kp = np.array([(geom.x, geom.y) for geom in points.geometry])
             cols, rows = img.transform_points(
@@ -168,90 +173,94 @@ class KeypointDetector:
         else:
             existing_keypoints_coords = np.empty((0, 2))
 
-        # Divide the image into windows
+        # Create sliding windows
         windows = view_as_windows(
             img0, window_shape=(window_size, window_size), step=step
         )
-
-        # Get the number of windows
         n_windows_row, n_windows_col, _, _ = windows.shape
 
         keypoints = []
+        max_kp_per_window = 1
 
         for i in range(n_windows_row):
             for j in range(n_windows_col):
-                # Define window coordinates
-                x_start = j * (step)
+                x_start = j * step
                 x_end = x_start + window_size
-                y_start = i * (step)
+                y_start = i * step
                 y_end = y_start + window_size
 
-                # Check existing keypoint density in this window
+                # Skip window if already filled with enough existing keypoints
                 num_existing_kp = np.sum(
                     (existing_keypoints_coords[:, 0] >= x_start)
                     & (existing_keypoints_coords[:, 0] < x_end)
                     & (existing_keypoints_coords[:, 1] >= y_start)
                     & (existing_keypoints_coords[:, 1] < y_end)
                 )
-
-                max_kp_per_window = 1  # Maximum allowed keypoints per window
                 if num_existing_kp >= max_kp_per_window:
-                    continue  # Skip detection in this window
+                    continue
 
                 window = windows[i, j]
-                # Detect keypoints in the window
+
+                # Detect candidates
                 kps = self.model.detect(window, None)
-                
                 if not kps:
                     continue
-                    
+
+                # Filter by response
                 kps = [kp for kp in kps if kp.response > response_threshold]
                 if not kps:
                     continue
 
-                # Select a "local champion" keypoint in this window.
-                if gaussian_sigma_factor and gaussian_sigma_factor > 0:
-                    # Precompute (or retrieve) Gaussian mask for this (window_size, gaussian_sigma_factor)
-                    cache_key = (window_size, float(gaussian_sigma_factor))
-                    gaussian_mask = self._gaussian_cache.get(cache_key)
-                    if gaussian_mask is None:
-                        sigma = max(1e-6, window_size * gaussian_sigma_factor)
-                        coords = np.arange(window_size, dtype=np.float32)
-                        xx, yy = np.meshgrid(coords, coords)
-                        cx = window_size / 2.0
-                        cy = window_size / 2.0
-                        dx = xx - cx
-                        dy = yy - cy
-                        gaussian_mask = np.exp(-(dx * dx + dy * dy) / (2.0 * sigma * sigma))
-                        self._gaussian_cache[cache_key] = gaussian_mask
+                # Choose best keypoint
+                if window_border > 0:
+                    cache_key = (window_size, int(window_border))
+                    weighting_mask = self._cache.get(cache_key)
 
-                    # Vectorized composite score: response * gaussian(center-weight)
-                    # Round kp locations to nearest integer indices for lookup.
+                    if weighting_mask is None:
+                        center = (window_size - 1) / 2.0
+                        coords = np.arange(window_size)
+                        xx, yy = np.meshgrid(coords, coords)
+                        radial_distance = np.sqrt((xx - center) ** 2 + (yy - center) ** 2)
+
+                        # Safe (flat) radius
+                        safe_radius = (window_size / 2.0) - window_border
+                        if safe_radius < 0:
+                            safe_radius = 0.0
+
+                        weighting_mask = np.ones((window_size, window_size), dtype=np.float32)
+                        taper_zone = radial_distance > safe_radius
+
+                        if np.any(taper_zone):
+                            norm_dist = (radial_distance[taper_zone] - safe_radius) / max(window_border, 1e-6)
+                            taper_values = 0.5 * (1 + np.cos(np.pi * np.clip(norm_dist, 0, 1)))
+                            weighting_mask[taper_zone] = taper_values
+
+                        self._cache[cache_key] = weighting_mask
+
                     responses = np.array([kp.response for kp in kps], dtype=np.float32)
-                    # (y, x) indices after rounding
                     iy = np.array([int(round(kp.pt[1])) for kp in kps], dtype=np.int32)
                     ix = np.array([int(round(kp.pt[0])) for kp in kps], dtype=np.int32)
-                    # Clamp to valid range (safety, should already be within window bounds)
                     np.clip(iy, 0, window_size - 1, out=iy)
                     np.clip(ix, 0, window_size - 1, out=ix)
-                    weights = gaussian_mask[iy, ix]
+                    weights = weighting_mask[iy, ix]
                     composite_scores = responses * weights
                     best_idx = int(np.argmax(composite_scores))
                     best_kp_in_window = kps[best_idx]
                 else:
-                    # Fallback: original behavior (choose maximum response)
+                    # Raw response selection
                     best_kp_in_window = max(kps, key=lambda kp: kp.response)
 
-                # Adjust keypoint coordinates to the original image coordinates
-                x_offset = x_start
-                y_offset = y_start
-                best_kp_in_window.pt = (best_kp_in_window.pt[0] + x_offset, best_kp_in_window.pt[1] + y_offset)
+                # Offset to image coords
+                best_kp_in_window.pt = (
+                    best_kp_in_window.pt[0] + x_start,
+                    best_kp_in_window.pt[1] + y_start,
+                )
                 if adjust_keypoint_angle:
                     best_kp_in_window.angle = img.angle
                 best_kp_in_window.octave = octave
                 keypoints.append((best_kp_in_window, None))
 
-        # Filter keypoints to remove ones too close to the image edges
+        # Enforce outer border exclusion
         filtered_keypoints_with_tags = [
             item
             for item in keypoints
@@ -260,7 +269,7 @@ class KeypointDetector:
                 and border_size <= item[0].pt[1] <= img0.shape[0] - border_size
             )
         ]
-        
+
         if not compute_descriptors:
             return filtered_keypoints_with_tags
 
