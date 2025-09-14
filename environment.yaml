@@ -6,6 +6,7 @@ dependencies:
   - pip
   - cartopy=0.23.0
   - geopandas
+  - gdal 
   - netcdf4
   - ca-certificates
   - certifi
