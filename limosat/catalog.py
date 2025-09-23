@@ -18,6 +18,7 @@ import geopandas as gpd
 import glob
 import concurrent.futures
 import shapely
+import hashlib  # added
 
 def process_single_image(file):
     """
@@ -71,13 +72,25 @@ def process_single_image(file):
 
     return None
 
-def create_image_gdf(idir, max_workers=None):
+# NEW: stable geometry hash helper
+def _geom_sha1(geom):
+    try:
+        if geom is None:
+            return None
+        # shapely 2.x: to_wkb is the stable way; returns bytes when hex=False
+        wkb = shapely.to_wkb(geom, hex=False)
+        return hashlib.sha1(wkb).hexdigest()
+    except Exception:
+        return None
+
+def create_image_gdf(idir, max_workers=None, deduplicate=True):
     """
-    Create a GeoDataFrame with metadata and geometry from a directory of files
+    Create a GeoDataFrame with metadata and geometry from one or more sources.
 
     Parameters:
-    - idir: Directory containing files
+    - idir: Directory path, glob pattern, or an iterable of directory paths / glob patterns
     - max_workers: Number of workers (None uses system default)
+    - deduplicate: If True, drop duplicate scenes by (geom_hash, timestamp) if available, else by (geom_hash)
 
     Returns:
     - GeoDataFrame with metadata and geometry
@@ -87,7 +100,23 @@ def create_image_gdf(idir, max_workers=None):
         match = re.search(r"(\d{8}T\d{6})", os.path.basename(filename))
         return datetime.strptime(match.group(1), "%Y%m%dT%H%M%S") if match else datetime.min
 
-    files = glob.glob(os.path.join(idir, "*.tiff"))
+    # Collect files from single dir/pattern or list of dirs/patterns; include .tif and .tiff
+    if isinstance(idir, (list, tuple, set)):
+        search_items = list(idir)
+    else:
+        search_items = [idir]
+
+    files = []
+    for item in search_items:
+        if os.path.isdir(item):
+            files.extend(glob.glob(os.path.join(item, "*.tif")))
+            files.extend(glob.glob(os.path.join(item, "*.tiff")))
+        else:
+            # Treat as a glob pattern (supports '**' when recursive)
+            files.extend(glob.glob(item, recursive=True))
+
+    # Deduplicate and keep only .tif/.tiff
+    files = [f for f in set(files) if f.lower().endswith((".tif", ".tiff"))]
     files = sorted(files, key=extract_s1_date)
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
@@ -105,4 +134,42 @@ def create_image_gdf(idir, max_workers=None):
     # Sort by timestamp
     image_gdf = image_gdf.sort_values('timestamp').reset_index(drop=True)
 
+    # NEW: de-duplication by geometry (and timestamp if present)
+    if deduplicate and not image_gdf.empty and 'geometry' in image_gdf.columns:
+        gdf = image_gdf[image_gdf.geometry.notnull()].copy()
+        gdf['geom_hash'] = gdf.geometry.apply(_geom_sha1)
+
+        # Build subset key
+        if 'timestamp' in gdf.columns:
+            subset_key = ['geom_hash', 'timestamp']
+        else:
+            subset_key = ['geom_hash']
+
+        # Keep first occurrence
+        before = len(gdf)
+        gdf = gdf.drop_duplicates(subset=subset_key, keep='first')
+        gdf = gdf.drop(columns=['geom_hash'])
+
+        # Reassign
+        image_gdf = gdf.reset_index(drop=True)
+
     return image_gdf
+
+def build_geojson(sources, out_geojson, max_workers=None, deduplicate=True):
+    """
+    Build a GeoJSON by scanning one or more directories or glob patterns.
+
+    Parameters:
+    - sources: Directory path, glob pattern, or iterable of them
+    - out_geojson: Output GeoJSON file path
+    - max_workers: Process pool size
+    - deduplicate: Pass-through to create_image_gdf
+
+    Returns:
+    - The GeoDataFrame that was written to GeoJSON
+    """
+    gdf = create_image_gdf(sources, max_workers=max_workers, deduplicate=deduplicate)
+    # Ensure parent dir exists if needed
+    os.makedirs(os.path.dirname(out_geojson) or ".", exist_ok=True)
+    gdf.to_file(out_geojson, driver="GeoJSON")
+    return gdf
