@@ -61,6 +61,8 @@ matcher_params:
   spatial_distance_max: 100000
   model_threshold: 10000
   plot_matches: false
+  use_dynamic_velocity_filter: true
+  max_valid_speed_m_per_day: 50000.0
   geometric_model:
     type: "AffineTransform"
     use_model_estimation: true

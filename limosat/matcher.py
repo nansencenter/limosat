@@ -5,6 +5,7 @@
 # Licensed under the MIT License. See the LICENSE file in the project root for full details.
 
 import numpy as np
+import pandas as pd
 import cv2
 from skimage.transform import AffineTransform
 from matplotlib import pyplot as plt
@@ -28,6 +29,10 @@ class Matcher:
                  # Lowe's ratio test parameter
                  lowe_ratio=0.9,
                  knn_k=4,
+
+                 # Dynamic velocity filter parameters
+                 use_dynamic_velocity_filter=True,
+                 max_valid_speed_m_per_day=50000.0,
 
                  # Visualization
                  plot=False):
@@ -55,6 +60,10 @@ class Matcher:
         self.lowe_ratio = lowe_ratio
         self.knn_k = knn_k
         self.plot = plot
+        
+        # Dynamic velocity filter parameters
+        self.use_dynamic_velocity_filter = use_dynamic_velocity_filter
+        self.max_valid_speed_m_per_day = max_valid_speed_m_per_day
 
     def plot_quiver(self, pos0, pos1, dist):
         u = pos1[:, 0] - pos0[:, 0]
@@ -104,7 +113,9 @@ class Matcher:
         # 4. Loop through each group and apply the 'filter' function
         all_inliers_idx0, all_inliers_idx1, all_residuals = [], [], []
         for image_id, group_matches in matches_by_group.items():
-            rc_idx0_group, rc_idx1_group, residuals_group = self.filter(group_matches, pos0, pos1)
+            rc_idx0_group, rc_idx1_group, residuals_group = self.filter(
+                group_matches, pos0, pos1, points_poly, points_grid
+            )
             
             if rc_idx0_group is not None and rc_idx0_group.size > 0:
                 all_inliers_idx0.append(rc_idx0_group)
@@ -183,7 +194,7 @@ class Matcher:
         return combined_matches
 
     @log_execution_time
-    def filter(self, matches, pos0, pos1):
+    def filter(self, matches, pos0, pos1, points_poly=None, points_grid=None):
         bf_idx0 = np.array([m.queryIdx for m in matches]) # Indices into pos0 for ALL 'matches'
         bf_idx1 = np.array([m.trainIdx for m in matches]) # Indices into pos1 for ALL 'matches'
 
@@ -197,10 +208,49 @@ class Matcher:
             if not self.use_model_estimation: return dd_idx0, dd_idx1, None
             return None, None, None
         
-        # Filter by spatial distance
-        # Calculate spatial distances ONLY for those that passed the descriptor distance filter
+        # Calculate spatial distances for filtering
         current_spatial_distances = np.hypot(pos1[dd_idx1, 0] - pos0[dd_idx0, 0], 
                                             pos1[dd_idx1, 1] - pos0[dd_idx0, 1])
+        
+        # Dynamic velocity filter (if enabled and data available)
+        if self.use_dynamic_velocity_filter and points_poly is not None and points_grid is not None:
+            # Check if necessary columns exist
+            if 'time' in points_poly.columns and 'time' in points_grid.columns:
+                # Get time information for matched points
+                time_prev = points_poly.iloc[dd_idx0]['time'].values
+                time_curr = points_grid.iloc[dd_idx1]['time'].values
+                
+                # Calculate time difference in days
+                time_diff_days = (pd.to_datetime(time_curr) - pd.to_datetime(time_prev)).total_seconds() / 86400.0
+                
+                # Calculate speed (distance / time)
+                speed_m_per_day = np.divide(
+                    current_spatial_distances,
+                    time_diff_days,
+                    out=np.full_like(time_diff_days, np.inf, dtype=float),
+                    where=time_diff_days > 1e-9
+                )
+                
+                # Apply dynamic velocity filter
+                velocity_filter_mask = speed_m_per_day <= self.max_valid_speed_m_per_day
+                num_removed_by_velocity = np.sum(~velocity_filter_mask)
+                
+                if num_removed_by_velocity > 0:
+                    logger.debug(
+                        f"Dynamic velocity filter: Removed {num_removed_by_velocity} outlier matches "
+                        f"exceeding {self.max_valid_speed_m_per_day} m/day from this group."
+                    )
+                
+                # Apply the velocity filter
+                dd_idx0 = dd_idx0[velocity_filter_mask]
+                dd_idx1 = dd_idx1[velocity_filter_mask]
+                current_spatial_distances = current_spatial_distances[velocity_filter_mask]
+                
+                if dd_idx0.size == 0:
+                    if not self.use_model_estimation: return dd_idx0, dd_idx1, None
+                    return None, None, None
+        
+        # Filter by spatial distance (can be used as a backup/additional filter)
         gpi1_spatial_filter_mask = current_spatial_distances < self.spatial_distance_max # Mask relative to dd_idx arrays
         md_idx0 = dd_idx0[gpi1_spatial_filter_mask] # Indices of points passing spatial (and descriptor) filter
         md_idx1 = dd_idx1[gpi1_spatial_filter_mask]
