@@ -306,6 +306,7 @@ class KeypointDetector:
         img0[np.isnan(img0)] = 0
         
         # TODO: generalise preprocessing to create boolean landmask
+        landmask = None
         if img.bands().get(2, {'name': 'none'}).get('name') == 'mask':
             landmask = img[2]
             img0[landmask == 2] = 0
@@ -314,6 +315,9 @@ class KeypointDetector:
         keypoints = []
         for r in range(0, img0.shape[0], stride):
             for c in range(0, img0.shape[1], stride):
+                if landmask is not None and landmask[r, c] == 2:
+                    continue  # skip land cells
+
                 # The size parameter is required, but will be overwritten by the detector's patch size
                 kp = cv2.KeyPoint(c, r, size=31, octave=octave, angle=img.angle)
 
