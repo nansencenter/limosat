@@ -24,7 +24,6 @@ def interpolate_drift(points_poly, points_fg1, points_fg2, img,
                                         ):
     """
     Interpolates drift for unmatched points using per-source-image affine transforms.
-    (Corrected minimalist style)
     """
     points_result = points_fg2.copy()
     points_result['interpolated'] = 0
@@ -56,7 +55,6 @@ def interpolate_drift(points_poly, points_fg1, points_fg2, img,
         anchor_dest_group = points_fg2[points_fg2['trajectory_id'].isin(tids_group)]
         
         # Ensure perfect alignment for transform estimation
-        # This merge is local to the loop and thus safe and correct.
         local_anchors = pd.merge(
             anchor_group[['trajectory_id', 'geometry']],
             anchor_dest_group[['trajectory_id', 'geometry']],
@@ -102,7 +100,7 @@ def interpolate_drift(points_poly, points_fg1, points_fg2, img,
             interpolated_coords_np[:, 0], interpolated_coords_np[:, 1], crs=filtered_unmatched.crs
         )
 
-        # d. Final boundary checks (speed check removed)
+        # d. Final boundary checks
         cols, rows = img.transform_points(interpolated_coords_np[:, 0], interpolated_coords_np[:, 1], DstToSrc=1, dst_srs=img.srs)
         pixel_bounds_ok = (cols >= border_size) & (cols < img.shape()[1] - border_size) & \
                           (rows >= border_size) & (rows < img.shape()[0] - border_size) & \
