@@ -112,15 +112,30 @@ class Matcher:
 
         # 4. Loop through each group and apply the 'filter' function
         all_inliers_idx0, all_inliers_idx1, all_residuals = [], [], []
+        total_velocity_filtered = 0
+        total_before_velocity_filter = 0
+        
         for image_id, group_matches in matches_by_group.items():
-            rc_idx0_group, rc_idx1_group, residuals_group = self.filter(
+            rc_idx0_group, rc_idx1_group, residuals_group, velocity_stats = self.filter(
                 group_matches, pos0, pos1, points_poly, points_grid
             )
+            
+            # Accumulate velocity filter statistics
+            if velocity_stats is not None:
+                total_before_velocity_filter += velocity_stats.get('before', 0)
+                total_velocity_filtered += velocity_stats.get('removed', 0)
             
             if rc_idx0_group is not None and rc_idx0_group.size > 0:
                 all_inliers_idx0.append(rc_idx0_group)
                 all_inliers_idx1.append(rc_idx1_group)
                 all_residuals.append(residuals_group)
+        
+        # Log aggregate velocity filter statistics
+        if self.use_dynamic_velocity_filter and total_velocity_filtered > 0:
+            logger.info(
+                f"Dynamic velocity filter: Removed {total_velocity_filtered}/{total_before_velocity_filter} "
+                f"outlier matches exceeding {self.max_valid_speed_m_per_day} m/day."
+            )
 
         # 5. Check if any valid groups were found at all
         if not all_inliers_idx0:
@@ -197,6 +212,9 @@ class Matcher:
     def filter(self, matches, pos0, pos1, points_poly=None, points_grid=None):
         bf_idx0 = np.array([m.queryIdx for m in matches]) # Indices into pos0 for ALL 'matches'
         bf_idx1 = np.array([m.trainIdx for m in matches]) # Indices into pos1 for ALL 'matches'
+        
+        # Initialize velocity filter statistics
+        velocity_stats = None
 
         # Filter by descriptor distance
         # descriptor_distance is already calculated for ALL 'matches' (initial crosscheck)
@@ -205,8 +223,8 @@ class Matcher:
         dd_idx0 = bf_idx0[gpi0_desc_filter_mask] # Indices of points passing descriptor distance filter
         dd_idx1 = bf_idx1[gpi0_desc_filter_mask]
         if dd_idx0.size == 0: # No points passed descriptor distance filter
-            if not self.use_model_estimation: return dd_idx0, dd_idx1, None
-            return None, None, None
+            if not self.use_model_estimation: return dd_idx0, dd_idx1, None, velocity_stats
+            return None, None, None, velocity_stats
         
         # Calculate spatial distances for filtering
         current_spatial_distances = np.hypot(pos1[dd_idx1, 0] - pos0[dd_idx0, 0], 
@@ -216,6 +234,9 @@ class Matcher:
         if self.use_dynamic_velocity_filter and points_poly is not None and points_grid is not None:
             # Check if necessary columns exist
             if 'time' in points_poly.columns and 'time' in points_grid.columns:
+                # Track statistics before filtering
+                num_before_velocity_filter = len(dd_idx0)
+                
                 # Get time information for matched points
                 time_prev = pd.to_datetime(points_poly.iloc[dd_idx0]['time'].values)
                 time_curr = pd.to_datetime(points_grid.iloc[dd_idx1]['time'].values)
@@ -237,6 +258,12 @@ class Matcher:
                 velocity_filter_mask = speed_m_per_day <= self.max_valid_speed_m_per_day
                 num_removed_by_velocity = np.sum(~velocity_filter_mask)
                 
+                # Store statistics for aggregation
+                velocity_stats = {
+                    'before': num_before_velocity_filter,
+                    'removed': num_removed_by_velocity
+                }
+                
                 if num_removed_by_velocity > 0:
                     logger.debug(
                         f"Dynamic velocity filter: Removed {num_removed_by_velocity} outlier matches "
@@ -249,8 +276,8 @@ class Matcher:
                 current_spatial_distances = current_spatial_distances[velocity_filter_mask]
                 
                 if dd_idx0.size == 0:
-                    if not self.use_model_estimation: return dd_idx0, dd_idx1, None
-                    return None, None, None
+                    if not self.use_model_estimation: return dd_idx0, dd_idx1, None, velocity_stats
+                    return None, None, None, velocity_stats
         
         # Filter by spatial distance (can be used as a backup/additional filter)
         gpi1_spatial_filter_mask = current_spatial_distances < self.spatial_distance_max # Mask relative to dd_idx arrays
@@ -258,11 +285,11 @@ class Matcher:
         md_idx1 = dd_idx1[gpi1_spatial_filter_mask]
 
         if not self.use_model_estimation:
-            return md_idx0, md_idx1, None # md_idx0, md_idx1 are the final indices if no model estimation
+            return md_idx0, md_idx1, None, velocity_stats # md_idx0, md_idx1 are the final indices if no model estimation
 
         if md_idx0.size < 4:
             logger.warning("Warning: Insufficient matches for model estimation (minimum 4 required)")
-            return None, None, None
+            return None, None, None, velocity_stats
 
         try:
             # H, inliers is your gpi2, applied to md_idx0/md_idx1
@@ -283,7 +310,7 @@ class Matcher:
 
             if H is None:
                 logger.warning("Warning: Model estimation failed")
-                return None, None, None
+                return None, None, None, velocity_stats
             
             inliers_mask_homography_relative = inliers_mask_homography_relative.ravel().astype(bool)
 
@@ -294,7 +321,7 @@ class Matcher:
 
             if rc_idx0.size < self.min_homography_inliers:
                 logger.warning(f"Warning: Not enough inliers after homography estimation (minimum {self.min_homography_inliers} required)")
-                return None, None, None
+                return None, None, None, velocity_stats
                 
             model = self.model(H) # Assuming self.model is AffineTransform class
             residuals = model.residuals(pos0[rc_idx0], pos1[rc_idx1])
@@ -305,11 +332,11 @@ class Matcher:
             if self.plot:
                 self.plot_quiver(pos0[rc_idx0], pos1[rc_idx1], residuals)
                 
-            return rc_idx0, rc_idx1, residuals
+            return rc_idx0, rc_idx1, residuals, velocity_stats
 
         except cv2.error as e:
             logger.error(f"Warning: OpenCV error during model estimation: {str(e)}")
-            return None, None, None
+            return None, None, None, velocity_stats
         except Exception as e:
             logger.error(f"Warning: Unexpected error during model estimation: {str(e)}")
-            return None, None, None
+            return None, None, None, velocity_stats
