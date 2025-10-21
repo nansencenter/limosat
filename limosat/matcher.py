@@ -217,11 +217,13 @@ class Matcher:
             # Check if necessary columns exist
             if 'time' in points_poly.columns and 'time' in points_grid.columns:
                 # Get time information for matched points
-                time_prev = points_poly.iloc[dd_idx0]['time'].values
-                time_curr = points_grid.iloc[dd_idx1]['time'].values
+                time_prev = pd.to_datetime(points_poly.iloc[dd_idx0]['time'].values)
+                time_curr = pd.to_datetime(points_grid.iloc[dd_idx1]['time'].values)
                 
                 # Calculate time difference in days
-                time_diff_days = (pd.to_datetime(time_curr) - pd.to_datetime(time_prev)).total_seconds() / 86400.0
+                # Use numpy operations for arrays of timestamps
+                time_diff_seconds = (time_curr - time_prev) / np.timedelta64(1, 's')
+                time_diff_days = time_diff_seconds / 86400.0
                 
                 # Calculate speed (distance / time)
                 speed_m_per_day = np.divide(
