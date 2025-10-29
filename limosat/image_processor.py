@@ -472,7 +472,7 @@ class ImageProcessor:
                 self.templates.add(appended_points_gdf, img, self.template_size, band=1)
         if len(points_final) > 0:
             self.points = self.points.update(points_final)
-            # Update templates for the points that were successfully matched and updated
+            # Refresh templates so they stay aligned with the updated trajectories
             self.templates.update(points_final, img, self.template_size, band=1)
             
     @log_execution_time
@@ -755,10 +755,6 @@ class ImageProcessor:
         elif original_count > 0:
             logger.warning("Descriptor computation failed; removing all remaining points.")
             points_matched = points_matched.iloc[0:0]  # Empty DataFrame
-
-        # Update templates for surviving points
-        if not points_matched.empty:
-            self.templates.update(points_matched, img, self.template_size, band=1)
 
         logger.debug(f"Returning {len(points_matched)} final points")
         return points_matched, failed_predictions
