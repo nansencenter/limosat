@@ -4,29 +4,30 @@ channels:
 dependencies:
   - python=3.11.3
   - pip
-  - cartopy==0.23.0
+  - cartopy=0.23.0
   - geopandas
+  - gdal 
   - netcdf4
   - ca-certificates
   - certifi
   - openssl
   - psycopg2
   - shapely
+  - matplotlib=3.8.0
+  - numpy
+  - opencv
+  - pandas
+  - pytest
+  - pytz
+  - scikit-image
+  - scikit-learn
+  - scipy
+  - xarray
+  - ipykernel
+  - parameterized
+  - plotly
+  - sqlalchemy
+  - geoalchemy2
+  - zarr
   - pip:
-      - matplotlib==3.8.0
-      - numpy
-      - opencv-python
-      - pandas
-      - pytest
-      - pytz
-      - scikit-image
-      - scikit-learn
-      - scipy
-      - xarray
-      - ipykernel
-      - parameterized
-      - plotly
-      - sqlalchemy
-      - geoalchemy2
-      - zarr
       - nansat

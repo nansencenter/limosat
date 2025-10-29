@@ -4,17 +4,34 @@ on:
   push:
     branches:
       - main
+      - develop
   pull_request:
     branches:
       - main
+      - develop
   workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag, or SHA to checkout (optional)'
+        required: false
+        default: ''
+      markers:
+        description: 'Pytest -m expression (e.g., "smoke or unit", "unit"; leave empty for all)'
+        required: false
+        default: ''
+      pytest_args:
+        description: 'Additional pytest args (e.g., -q, -vv, -k pattern)'
+        required: false
+        default: '-q'
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || '' }}
 
       - name: Set up Miniconda
         uses: conda-incubator/setup-miniconda@v2
@@ -34,4 +51,9 @@ jobs:
 
       - name: Run tests
         shell: bash -l {0}
-        run: python -m pytest tests/tests.py -v
+        run: |
+          if [ -n "${{ inputs.markers }}" ]; then
+            pytest ${{ inputs.pytest_args }} -m '${{ inputs.markers }}'
+          else
+            pytest ${{ inputs.pytest_args }}
+          fi
