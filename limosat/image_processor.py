@@ -481,6 +481,8 @@ class ImageProcessor:
 
         failed_predictions: predicted positions for interpolated vectors failing revalidation.
         """
+        overlap_total = len(points_poly)
+        removed_stopped = 0
         # Remove already stopped trajectories
         stopped_tids = self.points[self.points['stopped'] == True]['trajectory_id'].unique()
         if len(stopped_tids) > 0:
@@ -488,6 +490,7 @@ class ImageProcessor:
             points_poly = points_poly[~points_poly['trajectory_id'].isin(stopped_tids)]
             removed = num_before_stop_filter - len(points_poly)
             if removed > 0:
+                removed_stopped = removed
                 logger.info(f"Removed {removed} points from stopped trajectories.")
 
         # Orbit filter (avoid matching within same orbit)
@@ -497,6 +500,15 @@ class ImageProcessor:
 
         orbit_filter_mask = points_poly['orbit_num'] != current_orbit_num
         points_poly_filtered = points_poly[orbit_filter_mask]
+        removed_same_orbit = len(points_poly) - len(points_poly_filtered)
+
+        logger.info(
+            "Match funnel: overlap=%d, removed_stopped=%d, removed_same_orbit=%d, valid=%d",
+            overlap_total,
+            removed_stopped,
+            removed_same_orbit,
+            len(points_poly_filtered),
+        )
 
         if points_poly_filtered.empty:
             logger.info(
