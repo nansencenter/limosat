@@ -8,6 +8,7 @@ import numpy as np
 import cv2
 from skimage.transform import AffineTransform
 from matplotlib import pyplot as plt
+from matplotlib.lines import Line2D
 from collections import defaultdict
 from .utils import log_execution_time, logger
 
@@ -56,14 +57,90 @@ class Matcher:
         self.knn_k = knn_k
         self.plot = plot
 
-    def plot_quiver(self, pos0, pos1, dist):
-        u = pos1[:, 0] - pos0[:, 0]
-        v = pos1[:, 1] - pos0[:, 1]
-        spd = np.hypot(u,v)
-        fig, axs = plt.subplots(1, 2, figsize=(10, 5))
-        axs[0].plot(dist, spd, '.', alpha=0.5)
-        qui = axs[1].quiver(pos0[:, 0], pos0[:, 1], pos1[:, 0] - pos0[:, 0], pos1[:, 1] - pos0[:, 1], dist, cmap='jet', clim=np.percentile(dist, [1, 99]), angles='xy', scale_units='xy', scale=1)
-        plt.colorbar(qui, ax=axs[0], shrink=0.5)
+    def plot_filter_steps(self,
+                          all_pos0, all_pos1,
+                          desc_survive_pos0, desc_survive_pos1, desc_removed_pos0, desc_removed_pos1,
+                          spatial_survive_pos0, spatial_survive_pos1, spatial_removed_pos0, spatial_removed_pos1,
+                          post_pos0=None, post_pos1=None, post_residuals=None):
+        """
+        Multi-panel figure showing pipeline steps with shared axes and a shared legend:
+        Panels:
+          (a) Initial matching        -> shows all initial matches in the valid color
+          (b) Descriptor distance filter -> valid (same highlight color) vs removed (grey)
+          (c) Spatial distance filter    -> valid (same highlight color) vs removed (grey)
+          (d) MAGSAC inliers             -> post_pos colored by residuals (viridis)
+        Legend: two entries for the whole figure: 'valid matches' (proceed to next step) and 'removed' (grey).
+        """
+        def has(a): return (a is not None) and (getattr(a, "size", 0) > 0)
+
+        fig, axs = plt.subplots(1, 4, figsize=(22, 6), sharex=True, sharey=True)
+        titles = [
+            "(a) Initial matching",
+            "(b) Descriptor distance filter",
+            "(c) Spatial distance filter",
+            "(d) MAGSAC inliers"
+        ]
+
+        for ax, title in zip(axs, titles):
+            ax.set_title(title, fontsize=12)
+            ax.set_xlabel("x")
+        axs[0].set_ylabel("y")
+
+        # Color choices: use the same highlight color for valid matches across the first three panels
+        valid_color = 'tab:blue'
+        removed_color = 'lightgray'
+
+        # Panel (a): initial matching — draw all initial matches in the valid color (no split)
+        if has(all_pos0) and has(all_pos1):
+            u_all = all_pos1[:, 0] - all_pos0[:, 0]
+            v_all = all_pos1[:, 1] - all_pos0[:, 1]
+            axs[0].quiver(all_pos0[:, 0], all_pos0[:, 1], u_all, v_all,
+                          color=valid_color, alpha=0.85, angles='xy', scale_units='xy', scale=1, linewidth=0.7)
+
+        # Panel (b): descriptor filter
+        # - survivors: desc_survive_pos (valid_color)
+        # - removed: desc_removed_pos (grey)
+        if has(desc_removed_pos0):
+            u_dr = desc_removed_pos1[:, 0] - desc_removed_pos0[:, 0]
+            v_dr = desc_removed_pos1[:, 1] - desc_removed_pos0[:, 1]
+            axs[1].quiver(desc_removed_pos0[:, 0], desc_removed_pos0[:, 1], u_dr, v_dr,
+                          color=removed_color, alpha=0.6, angles='xy', scale_units='xy', scale=1, linewidth=0.4)
+        if has(desc_survive_pos0):
+            u_ds = desc_survive_pos1[:, 0] - desc_survive_pos0[:, 0]
+            v_ds = desc_survive_pos1[:, 1] - desc_survive_pos0[:, 1]
+            axs[1].quiver(desc_survive_pos0[:, 0], desc_survive_pos0[:, 1], u_ds, v_ds,
+                          color=valid_color, alpha=0.85, angles='xy', scale_units='xy', scale=1, linewidth=0.7)
+
+        # Panel (c): spatial filter
+        # - survivors: spatial_survive_pos (valid_color)
+        # - removed: spatial_removed_pos (grey)
+        if has(spatial_removed_pos0):
+            u_sr = spatial_removed_pos1[:, 0] - spatial_removed_pos0[:, 0]
+            v_sr = spatial_removed_pos1[:, 1] - spatial_removed_pos0[:, 1]
+            axs[2].quiver(spatial_removed_pos0[:, 0], spatial_removed_pos0[:, 1], u_sr, v_sr,
+                          color=removed_color, alpha=0.6, angles='xy', scale_units='xy', scale=1, linewidth=0.4)
+        if has(spatial_survive_pos0):
+            u_ss = spatial_survive_pos1[:, 0] - spatial_survive_pos0[:, 0]
+            v_ss = spatial_survive_pos1[:, 1] - spatial_survive_pos0[:, 1]
+            axs[2].quiver(spatial_survive_pos0[:, 0], spatial_survive_pos0[:, 1], u_ss, v_ss,
+                          color=valid_color, alpha=0.85, angles='xy', scale_units='xy', scale=1, linewidth=0.7)
+
+        # Panel (d): final model inliers colored by residuals
+        if has(post_pos0) and has(post_pos1) and has(post_residuals):
+            u_post = post_pos1[:, 0] - post_pos0[:, 0]
+            v_post = post_pos1[:, 1] - post_pos0[:, 1]
+            clim = np.percentile(post_residuals, [1, 99]) if post_residuals.size > 2 else (post_residuals.min(), post_residuals.max())
+            qui = axs[3].quiver(post_pos0[:, 0], post_pos0[:, 1], u_post, v_post, post_residuals,
+                                cmap='viridis', clim=clim, angles='xy', scale_units='xy', scale=1)
+            cbar = fig.colorbar(qui, ax=axs[3], shrink=0.9)
+            cbar.set_label('Residuals (m)', fontsize=10)
+
+        # Create a shared legend with exactly two entries: valid matches (proceed) and removed (grey)
+        proxy_valid = Line2D([0], [0], color=valid_color, linewidth=6, label='valid matches')
+        proxy_removed = Line2D([0], [0], color=removed_color, linewidth=6, label='removed')
+        axs[-1].legend(handles=[proxy_valid, proxy_removed], loc='lower right', fontsize=10, frameon=False)
+
+        plt.tight_layout()
         plt.show()
 
     @log_execution_time
@@ -195,6 +272,21 @@ class Matcher:
         dd_idx1 = bf_idx1[gpi0_desc_filter_mask]
         if dd_idx0.size == 0: # No points passed descriptor distance filter
             if not self.use_model_estimation: return dd_idx0, dd_idx1, None
+            # Prepare arrays for plotting (initial + descriptor results) if requested
+            if self.plot:
+                all_pos0 = pos0[bf_idx0] if bf_idx0.size else np.empty((0,2))
+                all_pos1 = pos1[bf_idx1] if bf_idx1.size else np.empty((0,2))
+                desc_survive_pos0 = np.empty((0,2))
+                desc_survive_pos1 = np.empty((0,2))
+                desc_removed_pos0 = all_pos0.copy()
+                desc_removed_pos1 = all_pos1.copy()
+                spatial_survive_pos0 = np.empty((0,2))
+                spatial_survive_pos1 = np.empty((0,2))
+                spatial_removed_pos0 = np.empty((0,2))
+                spatial_removed_pos1 = np.empty((0,2))
+                self.plot_filter_steps(all_pos0, all_pos1,
+                                       desc_survive_pos0, desc_survive_pos1, desc_removed_pos0, desc_removed_pos1,
+                                       spatial_survive_pos0, spatial_survive_pos1, spatial_removed_pos0, spatial_removed_pos1)
             return None, None, None
         
         # Filter by spatial distance
@@ -205,11 +297,57 @@ class Matcher:
         md_idx0 = dd_idx0[gpi1_spatial_filter_mask] # Indices of points passing spatial (and descriptor) filter
         md_idx1 = dd_idx1[gpi1_spatial_filter_mask]
 
+        # Prepare arrays and index sets for plotting
+        all_idx0, all_idx1 = bf_idx0, bf_idx1
+        desc_idx0, desc_idx1 = dd_idx0, dd_idx1
+        spatial_idx0, spatial_idx1 = md_idx0, md_idx1
+
+        # Removed at descriptor stage: present in all but not in desc
+        desc_removed_idx0 = np.setdiff1d(all_idx0, desc_idx0, assume_unique=False)
+        # Build map from query index to train index for all matches
+        query_to_train = dict(zip(bf_idx0.tolist(), bf_idx1.tolist()))
+        if desc_removed_idx0.size:
+            desc_removed_idx1 = np.array([query_to_train[i] for i in desc_removed_idx0])
+        else:
+            desc_removed_idx1 = np.empty((0,), dtype=int)
+
+        # Removed at spatial stage: present in desc but not in spatial
+        spatial_removed_idx0 = np.setdiff1d(desc_idx0, spatial_idx0, assume_unique=False)
+        if spatial_removed_idx0.size:
+            spatial_removed_idx1 = np.array([query_to_train[i] for i in spatial_removed_idx0])
+        else:
+            spatial_removed_idx1 = np.empty((0,), dtype=int)
+
+        # Prepare position arrays
+        # all positions (for panel a fallback)
+        all_pos0 = pos0[all_idx0] if all_idx0.size else np.empty((0,2))
+        all_pos1 = pos1[all_idx1] if all_idx1.size else np.empty((0,2))
+
+        # descriptor survivors and removed
+        desc_survive_pos0 = pos0[desc_idx0] if desc_idx0.size else np.empty((0,2))
+        desc_survive_pos1 = pos1[desc_idx1] if desc_idx1.size else np.empty((0,2))
+        desc_removed_pos0 = pos0[desc_removed_idx0] if desc_removed_idx0.size else np.empty((0,2))
+        desc_removed_pos1 = pos1[desc_removed_idx1] if desc_removed_idx1.size else np.empty((0,2))
+
+        # spatial survivors and removed
+        spatial_survive_pos0 = pos0[spatial_idx0] if spatial_idx0.size else np.empty((0,2))
+        spatial_survive_pos1 = pos1[spatial_idx1] if spatial_idx1.size else np.empty((0,2))
+        spatial_removed_pos0 = pos0[spatial_removed_idx0] if spatial_removed_idx0.size else np.empty((0,2))
+        spatial_removed_pos1 = pos1[spatial_removed_idx1] if spatial_removed_idx1.size else np.empty((0,2))
+
         if not self.use_model_estimation:
+            if self.plot:
+                self.plot_filter_steps(all_pos0, all_pos1,
+                                       desc_survive_pos0, desc_survive_pos1, desc_removed_pos0, desc_removed_pos1,
+                                       spatial_survive_pos0, spatial_survive_pos1, spatial_removed_pos0, spatial_removed_pos1)
             return md_idx0, md_idx1, None # md_idx0, md_idx1 are the final indices if no model estimation
 
         if md_idx0.size < 4:
             logger.warning("Warning: Insufficient matches for model estimation (minimum 4 required)")
+            if self.plot:
+                self.plot_filter_steps(all_pos0, all_pos1,
+                                       desc_survive_pos0, desc_survive_pos1, desc_removed_pos0, desc_removed_pos1,
+                                       spatial_survive_pos0, spatial_survive_pos1, spatial_removed_pos0, spatial_removed_pos1)
             return None, None, None
 
         try:
@@ -231,6 +369,10 @@ class Matcher:
 
             if H is None:
                 logger.warning("Warning: Model estimation failed")
+                if self.plot:
+                    self.plot_filter_steps(all_pos0, all_pos1,
+                                           desc_survive_pos0, desc_survive_pos1, desc_removed_pos0, desc_removed_pos1,
+                                           spatial_survive_pos0, spatial_survive_pos1, spatial_removed_pos0, spatial_removed_pos1)
                 return None, None, None
             
             inliers_mask_homography_relative = inliers_mask_homography_relative.ravel().astype(bool)
@@ -242,6 +384,10 @@ class Matcher:
 
             if rc_idx0.size < self.min_homography_inliers:
                 logger.warning(f"Warning: Not enough inliers after homography estimation (minimum {self.min_homography_inliers} required)")
+                if self.plot:
+                    self.plot_filter_steps(all_pos0, all_pos1,
+                                           desc_survive_pos0, desc_survive_pos1, desc_removed_pos0, desc_removed_pos1,
+                                           spatial_survive_pos0, spatial_survive_pos1, spatial_removed_pos0, spatial_removed_pos1)
                 return None, None, None
                 
             model = self.model(H) # Assuming self.model is AffineTransform class
@@ -251,13 +397,28 @@ class Matcher:
             )
             
             if self.plot:
-                self.plot_quiver(pos0[rc_idx0], pos1[rc_idx1], residuals)
+                # final post arrays
+                post_pos0 = pos0[rc_idx0]
+                post_pos1 = pos1[rc_idx1]
+                post_residuals = residuals
+                self.plot_filter_steps(all_pos0, all_pos1,
+                                       desc_survive_pos0, desc_survive_pos1, desc_removed_pos0, desc_removed_pos1,
+                                       spatial_survive_pos0, spatial_survive_pos1, spatial_removed_pos0, spatial_removed_pos1,
+                                       post_pos0, post_pos1, post_residuals)
                 
             return rc_idx0, rc_idx1, residuals
 
         except cv2.error as e:
             logger.error(f"Warning: OpenCV error during model estimation: {str(e)}")
+            if self.plot:
+                self.plot_filter_steps(all_pos0, all_pos1,
+                                       desc_survive_pos0, desc_survive_pos1, desc_removed_pos0, desc_removed_pos1,
+                                       spatial_survive_pos0, spatial_survive_pos1, spatial_removed_pos0, spatial_removed_pos1)
             return None, None, None
         except Exception as e:
             logger.error(f"Warning: Unexpected error during model estimation: {str(e)}")
+            if self.plot:
+                self.plot_filter_steps(all_pos0, all_pos1,
+                                       desc_survive_pos0, desc_survive_pos1, desc_removed_pos0, desc_removed_pos1,
+                                       spatial_survive_pos0, spatial_survive_pos1, spatial_removed_pos0, spatial_removed_pos1)
             return None, None, None
