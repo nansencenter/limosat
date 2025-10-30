@@ -31,3 +31,4 @@ dependencies:
   - zarr
   - pip:
       - nansat
+      - pystac>=1.8.4
