@@ -1,239 +1,199 @@
-# MIT License
-#
-# Copyright (c) 2025 Sean Minhui Tashi Chua, and Anton Korosov
-#
-# Licensed under the MIT License. See the LICENSE file in the project root for full details.
-
-"""
-catalog.py
-
-File handling functions for preparing remote sensing data for processing by limosat
-"""
-
 import os
 import re
+import json
 from datetime import datetime, timezone
-from .image import Image
+from typing import Iterable, Optional, Literal, List, Dict, Any
 import geopandas as gpd
-import glob
-import concurrent.futures
-import shapely
 import pystac
-from shapely.geometry import mapping
 
-def process_single_image(file):
+# Sentinel-1 filename pattern:
+# S1B_EW_GRDM_1SDH_20200101T015602_20200101T015706_019617_025132_32F2.tiff
+_S1_PATTERN = re.compile(
+    r"^S1[AB]_EW_GRDM_1SDH_"
+    r"(?P<start>\d{8}T\d{6})_"
+    r"(?P<end>\d{8}T\d{6})_"
+    r"(?P<orbit>\d{6})_"
+    r"(?P<take>\w{6})_"
+    r"(?P<uid>\w{4})"
+    r"\.tiff$"
+)
+
+def _parse_s1_meta(path: str):
+    """Parse S1 filename to extract start datetime (UTC), product unique id, and orbit number."""
+    base = os.path.basename(path)
+    m = _S1_PATTERN.match(base)
+    if not m:
+        return None, None, None
+    dt = datetime.strptime(m.group("start"), "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
+    uid = m.group("uid")
+    orbit = int(m.group("orbit"))
+    return dt, uid, orbit
+
+
+GeometryMode = Literal["none", "bbox"]
+
+def build_stac_item_collection(
+    files: Iterable[str],
+    out_path: Optional[str] = None,
+    check_exists: bool = False,
+) -> pystac.ItemCollection:
     """
-    Process a single image file to extract metadata and bounds.
-
-    Parameters:
-    - file: Path to the image file
-    - verbose: Whether to print error details
-
-    Returns:
-    - Dictionary with image metadata and bounds, or None if processing fails
+    Build a STAC ItemCollection. If out_path is provided,
+    also write a single JSON file.
     """
-
-    base_name = os.path.basename(file)
-    pattern = (
-        r"S1[AB]_EW_GRDM_1SDH_"  # Sentinel-1 mission identifiers
-        r"(\d{8}T\d{6})_"  # Start time
-        r"(\d{8}T\d{6})_"  # End time
-        r"(\d{6})_"  # Orbit number
-        r"(\w{6})_"  # Mission data take ID
-        r"(\w{4})"  # Product unique ID
-    )
-    match = re.match(pattern, base_name)
-
-    if match:
-        start_time_str, end_time_str, orbit_num, mission_data_take_id, unique_id = match.groups()
-        start_time = datetime.strptime(start_time_str, "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
-
-        # Get image bounds
-        img = Image(file)
-        polygon = shapely.from_geojson(img.get_border_geojson())
-        img_bounds_4326 = gpd.GeoDataFrame({'geometry': [polygon]}, crs='EPSG:4326')
-        # Reproject to EPSG:3413
-        img_bounds_3413 = img_bounds_4326.to_crs(epsg=3413)
-        bounds = img_bounds_3413.geometry.bounds.iloc[0]
-        minx = bounds['minx']
-        miny = bounds['miny']
-        maxx = bounds['maxx']
-        maxy = bounds['maxy']
-
-        return {
-            'filename': file,
-            'timestamp': start_time,
-            'minx': minx,
-            'miny': miny,
-            'maxx': maxx,
-            'maxy': maxy,
-            'orbit_num': orbit_num,
-            'geometry': img_bounds_3413.geometry.iloc[0],
-        }
-
-    return None
-
-def create_image_gdf(idir, max_workers=None):
-    """
-    Create a GeoDataFrame with metadata and geometry from a directory of files
-
-    Parameters:
-    - idir: Directory containing files
-    - max_workers: Number of workers (None uses system default)
-
-    Returns:
-    - GeoDataFrame with metadata and geometry
-    """
-    # Get all files and sort
-    def extract_s1_date(filename):
-        match = re.search(r"(\d{8}T\d{6})", os.path.basename(filename))
-        return datetime.strptime(match.group(1), "%Y%m%dT%H%M%S") if match else datetime.min
-
-    files = glob.glob(os.path.join(idir, "*.tiff"))
-    files = sorted(files, key=extract_s1_date)
-
-    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-        # Use map to process files in parallel
-        results = list(executor.map(process_single_image, files))
-
-    # Filter out None results
-    valid_results = [r for r in results if r is not None]
-
-    polygons = [r['geometry'] for r in valid_results]
-
-    # Create GeoDataFrame
-    image_gdf = gpd.GeoDataFrame(valid_results, geometry=polygons, crs="EPSG:3413")
-
-    # Sort by timestamp
-    image_gdf = image_gdf.sort_values('timestamp').reset_index(drop=True)
-
-    return image_gdf
-
-def create_stac_item_collection(files, out_path="catalog.json"):
-    """
-    Create a STAC ItemCollection from a list of image files.
-    
-    This function generates a single catalog.json (STAC ItemCollection) for the given
-    list of image files. Each STAC Item contains:
-    - properties.image_id: monotonic integer (1..N) assigned by sorting (timestamp asc, then filename asc)
-    - properties.filename: basename only
-    - properties.filepath: current path/URL
-    - item.id: product unique id parsed from filename (dedupe key)
-    - asset 'image' with href = current path/URL and media_type = image/tiff
-    - geometry/bbox in WGS84
-    
-    Duplicates are identified by product unique id from filename and skipped (first occurrence kept).
-    
-    Parameters:
-    - files: List of file paths to process
-    - out_path: Output path for the STAC ItemCollection JSON file (default: "catalog.json")
-    
-    Returns:
-    - out_path: The path where the catalog was written
-    
-    Raises:
-    - ValueError: If files list is empty
-    - FileNotFoundError: If any file in the list does not exist
-    
-    Example:
-        >>> create_stac_item_collection(["/path/image1.tiff", "/path/image2.tiff"], "catalog.json")
-        'catalog.json'
-    """
-    # Validate inputs
+    files = list(files)
     if not files:
-        raise ValueError("Files list cannot be empty")
-    
-    # S1 filename pattern for parsing metadata
-    pattern = (
-        r"S1[AB]_EW_GRDM_1SDH_"  # Sentinel-1 mission identifiers
-        r"(\d{8}T\d{6})_"  # Start time
-        r"(\d{8}T\d{6})_"  # End time
-        r"(\d{6})_"  # Orbit number
-        r"(\w{6})_"  # Mission data take ID
-        r"(\w{4})"  # Product unique ID
-    )
-    
-    # Parse metadata for each file
-    records = []
+        raise ValueError("No files provided to build_stac_item_collection.")
+
+    records: List[Dict[str, Any]] = []
     seen_uids = set()
-    
-    for file in files:
-        # Check file exists
-        if not os.path.exists(file):
-            raise FileNotFoundError(f"File not found: {file}")
-        
-        base_name = os.path.basename(file)
-        match = re.match(pattern, base_name)
-        
-        if match:
-            start_time_str, end_time_str, orbit_num, mission_data_take_id, unique_id = match.groups()
-            start_time = datetime.strptime(start_time_str, "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
-            product_uid = unique_id
-        else:
-            # Fallback: use basename as product_uid if pattern doesn't match
-            start_time = datetime.min.replace(tzinfo=timezone.utc)
-            product_uid = base_name
-        
-        # Dedupe by product unique id
-        if product_uid in seen_uids:
+
+    for p in files:
+        if check_exists and not os.path.exists(p):
+            raise FileNotFoundError(f"Missing file: {p}")
+
+        dt, uid, orbit = _parse_s1_meta(p)
+        if dt is None or uid is None or uid in seen_uids:
+            # Skip non-matching filenames or duplicates by unique id
             continue
-        seen_uids.add(product_uid)
-        
-        # Get geometry in WGS84
-        img = Image(file)
-        polygon = shapely.from_geojson(img.get_border_geojson())
-        
-        records.append({
-            'filepath': file,
-            'filename': base_name,
-            'timestamp': start_time,
-            'product_uid': product_uid,
-            'geometry': polygon,
-        })
-    
-    # Sort by timestamp then filename
-    records.sort(key=lambda r: (r['timestamp'], r['filename']))
-    
-    # Create STAC Items with assigned image_id
-    items = []
-    for idx, record in enumerate(records, start=1):
-        # Convert shapely geometry to GeoJSON
-        geom = mapping(record['geometry'])
-        
-        # Calculate bbox from geometry
-        bounds = record['geometry'].bounds
-        bbox = [bounds[0], bounds[1], bounds[2], bounds[3]]  # [minx, miny, maxx, maxy]
-        
-        # Create STAC Item
-        item = pystac.Item(
-            id=record['product_uid'],
-            geometry=geom,
-            bbox=bbox,
-            datetime=record['timestamp'],
-            properties={
-                'image_id': idx,
-                'filename': record['filename'],
-                'filepath': record['filepath'],
+        seen_uids.add(uid)
+
+        records.append(
+            {
+                "path": p,
+                "basename": os.path.basename(p),
+                "dt": dt,
+                "uid": uid,
+                "orbit": orbit,
             }
         )
-        
-        # Add image asset
-        item.add_asset(
-            'image',
-            pystac.Asset(
-                href=record['filepath'],
-                media_type='image/tiff'
-            )
+
+    # Deterministic order for integer image_id assignment
+    records.sort(key=lambda r: (r["dt"], r["basename"]))
+
+    items: List[pystac.Item] = []
+    for idx, rec in enumerate(records, start=1):
+        it = pystac.Item(
+            id=str(rec["uid"]),
+            geometry=None,  # minimal: no geometry
+            bbox=None,      # minimal: no bbox
+            datetime=rec["dt"],
+            properties={},
         )
-        
-        items.append(item)
-    
-    # Create ItemCollection
-    item_collection = pystac.ItemCollection(items)
-    
-    # Write atomically (write to temp file then replace)
-    tmp_path = out_path + '.tmp'
-    item_collection.save_object(tmp_path)
-    os.replace(tmp_path, out_path)
-    
-    return out_path
+        it.properties["image_id"] = int(idx)
+        it.properties["filename"] = rec["basename"]
+        it.properties["filepath"] = rec["path"]
+        if rec.get("orbit") is not None:
+            it.properties["orbit_num"] = int(rec["orbit"])
+        it.add_asset(
+            "image",
+            pystac.Asset(href=rec["path"], media_type="image/tiff", roles=["data"]),
+        )
+        items.append(it)
+
+    coll = pystac.ItemCollection(items)
+
+    if out_path:
+        tmp = f"{out_path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(coll.to_dict(), f, ensure_ascii=False)
+        os.replace(tmp, out_path)
+    return coll
+
+
+def stac_item_collection_to_gdf(
+    coll: pystac.ItemCollection,
+    target_crs: str = "EPSG:3413",
+    max_workers: Optional[int] = None,
+    chunksize: int = 64,
+) -> gpd.GeoDataFrame:
+    """
+    Convert an in-memory STAC ItemCollection to a GeoDataFrame.
+    - Computes exact footprints (optionally in parallel) to mimic previous geometry setup.
+    - Reprojects to target_crs (default EPSG:3413).
+    - Adds orbit_num (6-digit string) and per-row bounds minx, miny, maxx, maxy in target_crs.
+
+    Columns:
+        image_id, filename (basename), filepath (full path), timestamp,
+        orbit_num, minx, miny, maxx, maxy, geometry
+    """
+    from concurrent.futures import ProcessPoolExecutor
+    from limosat.image import Image
+    import shapely
+
+    def compute_footprint_wgs84(path: str):
+        gj = Image(path).get_border_geojson()  # WGS84 GeoJSON string
+        return shapely.from_geojson(gj)
+
+    items = list(getattr(coll, "items", []))
+    if not items:
+        return gpd.GeoDataFrame(
+            columns=[
+                "image_id", "filename", "filepath", "timestamp",
+                "orbit_num", "minx", "miny", "maxx", "maxy", "geometry"
+            ],
+            geometry="geometry",
+            crs=target_crs,
+        )
+
+    props_list = [it.properties or {} for it in items]
+    image_ids = [int(p.get("image_id")) for p in props_list]
+    basenames = [p.get("filename") for p in props_list]
+    filepaths = [p.get("filepath") for p in props_list]
+    timestamps = [it.datetime for it in items]
+
+    # Orbit number: keep as zero-padded 6-char string to match prior output style (e.g., "019617")
+    raw_orbits = [p.get("orbit_num") for p in props_list]
+    orbit_nums = []
+    for o in raw_orbits:
+        if o is None:
+            orbit_nums.append(None)
+        else:
+            try:
+                orbit_nums.append(f"{int(o):06d}")
+            except Exception:
+                # If not numeric, keep as string
+                orbit_nums.append(str(o))
+
+    # Compute footprints (WGS84). Parallelize if max_workers is provided.
+    if max_workers and max_workers > 1:
+        with ProcessPoolExecutor(max_workers=max_workers) as ex:
+            geoms = list(ex.map(compute_footprint_wgs84, filepaths, chunksize=chunksize))
+    else:
+        geoms = [compute_footprint_wgs84(p) for p in filepaths]
+
+    # Build GeoDataFrame in WGS84, then reproject to target_crs
+    gdf = gpd.GeoDataFrame(
+        {
+            "image_id": image_ids,
+            "filename": basenames,
+            "filepath": filepaths,
+            "timestamp": timestamps,
+            "orbit_num": orbit_nums,
+            "geometry": geoms,
+        },
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+
+    if target_crs:
+        gdf = gdf.to_crs(target_crs)
+
+    # Per-row bounds in target_crs
+    b = gdf.geometry.bounds  # DataFrame with columns: minx, miny, maxx, maxy
+    gdf["minx"] = b["minx"]
+    gdf["miny"] = b["miny"]
+    gdf["maxx"] = b["maxx"]
+    gdf["maxy"] = b["maxy"]
+
+    # Stable ordering
+    gdf = gdf.sort_values("image_id").reset_index(drop=True)
+
+    # Reorder columns to match your example (keeping filepath as an extra, useful field)
+    ordered_cols = [
+        "filename", "timestamp", "minx", "miny", "maxx", "maxy", "orbit_num",
+        "image_id", "filepath", "geometry"
+    ]
+    # Only keep columns that exist (in case of schema drift)
+    ordered_cols = [c for c in ordered_cols if c in gdf.columns]
+    return gdf[ordered_cols]
