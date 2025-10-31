@@ -271,5 +271,24 @@ def _inject_limosat_stubs():
         ip.ImageProcessor = ImageProcessor
         sys.modules['limosat.image_processor'] = ip
 
+    # catalog - load real module if present
+    if 'limosat.catalog' not in sys.modules:
+        try:
+            import importlib.util
+            # Add parent directory to path to allow importing real limosat
+            repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            if repo_root not in sys.path:
+                sys.path.insert(0, repo_root)
+            # Import the real catalog module
+            catalog_path = os.path.join(repo_root, 'limosat', 'catalog.py')
+            if os.path.exists(catalog_path):
+                spec = importlib.util.spec_from_file_location('limosat.catalog', catalog_path)
+                catalog = importlib.util.module_from_spec(spec)
+                sys.modules['limosat.catalog'] = catalog
+                spec.loader.exec_module(catalog)
+        except Exception:
+            # If real module can't be loaded, create a stub
+            pass
+
 
 _inject_limosat_stubs()
