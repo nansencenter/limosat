@@ -9,7 +9,6 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 import cv2
-import xarray as xr
 from scipy.spatial import cKDTree
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
@@ -47,20 +46,7 @@ class ImageProcessor:
                  **kwargs
                 ):
         self.points = points
-        if templates is None:
-            self.templates = Templates()
-        elif isinstance(templates, Templates):
-            self.templates = templates
-        else:
-            # Handle case where raw xarray DataArray is passed (backward compatibility)
-            if isinstance(templates, xr.DataArray):
-                temp_obj = Templates()
-                temp_obj.data = templates
-                if templates.trajectory_id.size > 0:
-                    temp_obj._initialized = True
-                self.templates = temp_obj
-            else:
-                raise TypeError(f"templates must be None, Templates object, or xarray.DataArray, got {type(templates)}")
+        self.templates = templates if templates is not None else Templates()
         self.model = model
         self.matcher = matcher
         self.run_name = run_name
