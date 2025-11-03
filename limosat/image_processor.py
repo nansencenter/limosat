@@ -42,10 +42,11 @@ class ImageProcessor:
                  run_name=None,
                  insitu_points=None,
                  return_insitu_points_on_completion=False,
+                 templates=None,
                  **kwargs
                 ):
         self.points = points
-        self.templates = Templates()
+        self.templates = templates if templates is not None else Templates()
         self.model = model
         self.matcher = matcher
         self.run_name = run_name
