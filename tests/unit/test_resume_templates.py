@@ -63,3 +63,23 @@ def test_resume_preserves_templates():
     assert len(proc.templates) == 5
     assert proc.templates is templates
     assert np.array_equal(proc.templates.trajectory_ids, [0, 1, 2, 3, 4])
+
+
+def test_image_processor_accepts_xarray_dataarray():
+    """Test backward compatibility: ImageProcessor accepts xarray.DataArray."""
+    points_gdf = make_keypoints(n=3, image_id=0, t0='2025-01-01 00:00:00')
+    points = Keypoints._from_gdf(points_gdf)
+    
+    templates_data = make_templates(tids=[0, 1, 2], hs=16)
+    
+    proc = ImageProcessor(
+        points=points,
+        model=None,
+        matcher=None,
+        templates=templates_data,
+        persist_updates=False
+    )
+    
+    assert len(proc.templates) == 3
+    assert isinstance(proc.templates, Templates)
+    assert np.array_equal(proc.templates.trajectory_ids, [0, 1, 2])

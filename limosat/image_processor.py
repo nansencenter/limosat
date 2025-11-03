@@ -46,7 +46,21 @@ class ImageProcessor:
                  **kwargs
                 ):
         self.points = points
-        self.templates = templates if templates is not None else Templates()
+        if templates is None:
+            self.templates = Templates()
+        elif isinstance(templates, Templates):
+            self.templates = templates
+        else:
+            # Handle case where raw xarray DataArray is passed (backward compatibility)
+            import xarray as xr
+            if isinstance(templates, xr.DataArray):
+                temp_obj = Templates()
+                temp_obj.data = templates
+                if templates.trajectory_id.size > 0:
+                    temp_obj._initialized = True
+                self.templates = temp_obj
+            else:
+                raise TypeError(f"templates must be None, Templates object, or xarray.DataArray, got {type(templates)}")
         self.model = model
         self.matcher = matcher
         self.run_name = run_name
