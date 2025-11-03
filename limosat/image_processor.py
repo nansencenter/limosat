@@ -45,6 +45,13 @@ class ImageProcessor:
                  templates=None,
                  **kwargs
                 ):
+        """Initialize ImageProcessor.
+        
+        Args:
+            templates: Templates object containing stored template images for pattern matching.
+                      If None, creates empty Templates(). Used when resuming runs to restore
+                      previously tracked features.
+        """
         self.points = points
         self.templates = templates if templates is not None else Templates()
         self.model = model
