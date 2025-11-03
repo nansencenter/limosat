@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 import cv2
+import xarray as xr
 from scipy.spatial import cKDTree
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
@@ -52,7 +53,6 @@ class ImageProcessor:
             self.templates = templates
         else:
             # Handle case where raw xarray DataArray is passed (backward compatibility)
-            import xarray as xr
             if isinstance(templates, xr.DataArray):
                 temp_obj = Templates()
                 temp_obj.data = templates
