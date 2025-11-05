@@ -30,7 +30,6 @@ class Templates:
             name="template_data"
         )
         self._initialized = False
-        logger.debug("Initialized empty Templates object.")
 
     @staticmethod
     @log_execution_time
