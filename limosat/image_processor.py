@@ -760,8 +760,18 @@ class ImageProcessor:
                 logger.info(
                     f"Performing final persistence for remaining {images_since_persist} images"
                 )
+                
+                # Apply same in-memory filter as periodic persistence:
+                # Persist only trajectories with >1 observations (matched at least once)
+                traj_id_counts = self.points['trajectory_id'].value_counts()
+                matched_traj_ids = traj_id_counts[traj_id_counts > 1].index
+                points_to_persist = self.points[self.points['trajectory_id'].isin(matched_traj_ids)]
+                logger.info(
+                    f"Final persistence: Found {len(matched_traj_ids)} matched trajectories. Persisting {len(points_to_persist)} points."
+                )
+                
                 save_successful = self.db.save(
-                    points=self.points,
+                    points=points_to_persist,
                     templates=self.templates,
                     last_persisted_id=self._last_persisted_id,
                     insitu_points=self.insitu_points

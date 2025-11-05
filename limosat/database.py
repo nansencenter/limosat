@@ -121,34 +121,80 @@ class DriftDatabase:
                     axis=1
                 )
 
-
+            # --- 2. Compute Combined Trajectory Counts (DB + Delta) ---
             with self.engine.connect() as connection:
                 with connection.begin():
-                    updated_traj_ids = [
+                    delta_traj_ids = [
                         int(tid) for tid in points_delta['trajectory_id'].unique().tolist()
                         if pd.notna(tid)
                     ]
                     inspector = inspect(connection.engine)
                     table_exists = inspector.has_table(self.run_name, schema=connection.dialect.default_schema_name)
-                    if updated_traj_ids and table_exists:
+                    
+                    # Count trajectories in delta
+                    delta_counts = points_delta['trajectory_id'].value_counts().to_dict()
+                    
+                    # Fetch existing counts from DB if table exists
+                    if table_exists and delta_traj_ids:
+                        count_sql = text(f"""
+                            SELECT trajectory_id, COUNT(*) as count
+                            FROM {self.run_name}
+                            WHERE trajectory_id = ANY(:traj_ids)
+                            GROUP BY trajectory_id
+                        """)
+                        result = connection.execute(count_sql, {"traj_ids": delta_traj_ids})
+                        db_counts = {int(row[0]): int(row[1]) for row in result}
+                    else:
+                        db_counts = {}
+                    
+                    # Combine counts: DB count + delta count
+                    combined_counts = {}
+                    for tid in delta_traj_ids:
+                        db_count = db_counts.get(tid, 0)
+                        delta_count = delta_counts.get(tid, 0)
+                        combined_counts[tid] = db_count + delta_count
+                    
+                    # Filter: only persist trajectories with combined_count > 1
+                    matched_traj_ids = [tid for tid, count in combined_counts.items() if count > 1]
+                    
+                    if not matched_traj_ids:
+                        logger.info("No matched trajectories (length > 1) to persist after combined filtering.")
+                        # Still save templates if available
+                        if templates is not None and templates.trajectory_ids.size > 0 and self.zarr_path:
+                            templates_to_save = templates.data.copy()
+                            if hasattr(templates_to_save, 'encoding') and 'chunks' in templates_to_save.encoding:
+                                del templates_to_save.encoding['chunks']
+                            templates_to_save.to_dataset(name="template_data").to_zarr(self.zarr_path, mode="w")
+                            logger.debug("Saved templates to Zarr (no matched trajectories to persist).")
+                        return True
+                    
+                    # Filter points_delta to only matched trajectories
+                    points_delta_filtered = points_delta[points_delta['trajectory_id'].isin(matched_traj_ids)].copy()
+                    logger.info(
+                        f"Filtered {len(points_delta)} delta points to {len(points_delta_filtered)} "
+                        f"points from {len(matched_traj_ids)} matched trajectories (combined DB+delta count > 1)."
+                    )
+                    
+                    # Update is_last flag only for matched trajectory_ids
+                    if matched_traj_ids and table_exists:
                         update_sql = text(f"""
                             UPDATE {self.run_name}
                             SET is_last = 0
                             WHERE is_last = 1 AND trajectory_id = ANY(:traj_ids)
                         """)
-                        result = connection.execute(update_sql, {"traj_ids": updated_traj_ids})
+                        result = connection.execute(update_sql, {"traj_ids": matched_traj_ids})
                         logger.debug(f"Updated is_last=0 for {result.rowcount} previous points in DB.")
-                    elif updated_traj_ids:
+                    elif matched_traj_ids:
                         logger.debug(f"Table '{self.run_name}' does not exist yet. It will be created.")
 
-                    points_delta.to_postgis(
+                    points_delta_filtered.to_postgis(
                         self.run_name,
                         connection,
                         if_exists='append',
                         index=False,
                         dtype=self.dtype
                     )
-                    logger.debug(f"Appended {len(points_delta)} points to database.")
+                    logger.debug(f"Appended {len(points_delta_filtered)} points to database.")
 
             if templates is not None and templates.trajectory_ids.size > 0:
                 templates_to_save = templates.data.copy()
@@ -160,7 +206,7 @@ class DriftDatabase:
             if insitu_points is not None:
                 self._save_validation_metadata(insitu_points)
 
-            logger.info(f"Successfully appended {len(points_delta)} points and saved templates.")
+            logger.info(f"Successfully appended {len(points_delta_filtered)} points and saved templates.")
             return True
 
         except Exception as e:

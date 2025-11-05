@@ -266,7 +266,12 @@ def _inject_limosat_stubs():
 
             def ensure_final_persistence(self):
                 if self.persist_updates and self.db is not None:
-                    self.db.save(self.points, self.templates, self._last_persisted_id)
+                    # Apply same in-memory filter as periodic persistence:
+                    # Persist only trajectories with >1 observations (matched at least once)
+                    traj_id_counts = self.points['trajectory_id'].value_counts()
+                    matched_traj_ids = traj_id_counts[traj_id_counts > 1].index
+                    points_to_persist = self.points[self.points['trajectory_id'].isin(matched_traj_ids)]
+                    self.db.save(points=points_to_persist, templates=self.templates, last_persisted_id=self._last_persisted_id)
 
         ip.ImageProcessor = ImageProcessor
         sys.modules['limosat.image_processor'] = ip
