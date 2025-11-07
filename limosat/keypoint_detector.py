@@ -355,7 +355,7 @@ class KeypointDetector:
             points_gdf_for_current_image, # GDF of buoy points for *this* image
             octave,          # Passed by ImageProcessor, for cv2.KeyPoint.octave
             img,              # Nansat image object for the current image
-            response_threshold
+            response_threshold,
         ):
         """
         Dynamically finds the best ORB feature near each buoy point using a method similar to detect_new_keypoints
@@ -364,12 +364,15 @@ class KeypointDetector:
         # This method detects keypoints but does NOT compute their descriptors,
         # as it's part of a specific workflow in ImageProcessor where descriptors
         # are computed later in a batch.
-        # this is the window it searches
-        window_size_for_detection = 16
-        keypoints_with_indices = []
         orb_model = self.model
+        patch_size = int(orb_model.getPatchSize())
+        window_size_for_detection = max(32, patch_size + 16)
+
+        keypoints_with_indices = []
         img_band_data = img[1]
         img_height, img_width = img_band_data.shape
+
+        max_center_distance_m = 300.0
 
         for original_idx, point_row in points_gdf_for_current_image.iterrows():
             buoy_geom = point_row.geometry
@@ -426,6 +429,30 @@ class KeypointDetector:
                             orb_desc_computation_half_patch <= kp_final_r < img_height - orb_desc_computation_half_patch):
                         continue
 
+                    center_c = c0 + patch_center_x
+                    center_r = r0 + patch_center_y
+                    try:
+                        cand_x, cand_y = img.transform_points(
+                            [kp_final_c],
+                            [kp_final_r],
+                            DstToSrc=0,
+                            dst_srs=img.srs,
+                        )
+                        center_x, center_y = img.transform_points(
+                            [center_c],
+                            [center_r],
+                            DstToSrc=0,
+                            dst_srs=img.srs,
+                        )
+                        dx = cand_x[0] - center_x[0]
+                        dy = cand_y[0] - center_y[0]
+                        center_distance = float(np.hypot(dx, dy))
+                    except Exception:
+                        center_distance = None
+
+                    if center_distance is not None and center_distance > max_center_distance_m:
+                        continue
+
                     final_kp_to_add = cv2.KeyPoint(
                         x=float(kp_final_c),
                         y=float(kp_final_r),
@@ -439,5 +466,5 @@ class KeypointDetector:
             except Exception as e:
                 logger.info(f"Error processing point original_idx {original_idx} (input index {point_row.name}): {e}")
                 pass 
-                
+        
         return keypoints_with_indices
