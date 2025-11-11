@@ -439,13 +439,29 @@ class ImageProcessor:
             if self.insitu_points is not None and surviving_tags is not None and not appended_points_gdf.empty:
                 appended_points_gdf_reset = appended_points_gdf.reset_index(drop=True)
                 
+                # Ensure seed metadata columns exist in insitu_points
+                if 'seed_kp_geometry' not in self.insitu_points.columns:
+                    self.insitu_points['seed_kp_geometry'] = None
+                if 'seed_time' not in self.insitu_points.columns:
+                    self.insitu_points['seed_time'] = pd.NaT
+                if 'seed_image_id' not in self.insitu_points.columns:
+                    self.insitu_points['seed_image_id'] = pd.NA
+                    self.insitu_points['seed_image_id'] = self.insitu_points['seed_image_id'].astype(pd.Int64Dtype())
+                
                 if len(surviving_tags) == len(appended_points_gdf_reset):
                     for i, original_df_idx_tag in enumerate(surviving_tags):
                         if original_df_idx_tag is not None: # Check if the tag is an actual index
                             final_tid = appended_points_gdf_reset.iloc[i]['trajectory_id']
+                            seed_kp = appended_points_gdf_reset.iloc[i]
+                            
+                            # Capture seed keypoint metadata
                             self.insitu_points.loc[original_df_idx_tag, 'trajectory_id'] = final_tid
+                            self.insitu_points.loc[original_df_idx_tag, 'seed_kp_geometry'] = seed_kp['geometry']
+                            self.insitu_points.loc[original_df_idx_tag, 'seed_time'] = seed_kp['time']
+                            self.insitu_points.loc[original_df_idx_tag, 'seed_image_id'] = seed_kp['image_id']
+                            
                             logger.debug(
-                                f"Linked insitu_point (original index {original_df_idx_tag}) to trajectory_id {final_tid}"
+                                f"Linked insitu_point (original index {original_df_idx_tag}) to trajectory_id {final_tid} with seed metadata"
                             )
                 else:
                     logger.warning(

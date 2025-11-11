@@ -113,6 +113,39 @@ class DriftDatabase:
                     return True
                 return True
 
+            # --- 1a. Include seed rows for newly-matched trajectories ---
+            # Identify trajectories in points_delta that may need their seed included
+            traj_ids_in_delta = points_delta['trajectory_id'].unique()
+            
+            # For each trajectory in delta, check if its seed (earliest observation) has image_id <= last_persisted_id
+            # If so, and this is the first time we're persisting >1 observation for this trajectory, include the seed
+            seed_rows_to_add = []
+            for tid in traj_ids_in_delta:
+                if pd.isna(tid):
+                    continue
+                # Get all observations for this trajectory
+                traj_points = points[points['trajectory_id'] == tid]
+                if len(traj_points) <= 1:
+                    # Singleton trajectory, skip (not eligible for persistence)
+                    continue
+                
+                # Find the seed (earliest observation by image_id)
+                seed_row = traj_points.loc[traj_points['image_id'].idxmin()]
+                seed_image_id = int(seed_row['image_id'])
+                
+                # If seed is before the last_persisted_id boundary, it needs to be included
+                if seed_image_id <= last_persisted_id_int:
+                    seed_rows_to_add.append(seed_row)
+            
+            if seed_rows_to_add:
+                logger.info(f"Including {len(seed_rows_to_add)} seed rows for newly-matched trajectories.")
+                seeds_df = pd.DataFrame(seed_rows_to_add)
+                # Ensure it's a GeoDataFrame with proper CRS
+                seeds_gdf = gpd.GeoDataFrame(seeds_df, geometry='geometry', crs=points.crs)
+                points_delta = pd.concat([points_delta, seeds_gdf], ignore_index=True)
+                # Remove duplicates if a seed was already in points_delta
+                points_delta = points_delta.drop_duplicates(subset=['trajectory_id', 'image_id'], keep='first')
+
             logger.info(f"Processing {len(points_delta)} new/updated points for persistence.")
             points_delta = points_delta.set_crs('EPSG:3413')
             if 'descriptors' in points_delta.columns:
