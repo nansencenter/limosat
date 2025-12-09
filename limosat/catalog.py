@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Iterable, Optional, Literal, List, Dict, Any
 import geopandas as gpd
 import pystac
+import shapely
 
 # Sentinel-1 filename pattern:
 # S1B_EW_GRDM_1SDH_20200101T015602_20200101T015706_019617_025132_32F2.tiff
@@ -101,6 +102,16 @@ def build_stac_item_collection(
     return coll
 
 
+def compute_footprint_wgs84(path: str):
+    """
+    Compute image footprint in WGS84 as a shapely geometry.
+    Separated from stac_item_collection_to_gdf so ProcessPoolExecutor can pickle it.
+    """
+    from limosat.image import Image
+    gj = Image(path).get_border_geojson()  # WGS84 GeoJSON string
+    return shapely.from_geojson(gj)
+
+
 def stac_item_collection_to_gdf(
     coll: pystac.ItemCollection,
     target_crs: str = "EPSG:3413",
@@ -118,12 +129,6 @@ def stac_item_collection_to_gdf(
         orbit_num, minx, miny, maxx, maxy, geometry
     """
     from concurrent.futures import ProcessPoolExecutor
-    from limosat.image import Image
-    import shapely
-
-    def compute_footprint_wgs84(path: str):
-        gj = Image(path).get_border_geojson()  # WGS84 GeoJSON string
-        return shapely.from_geojson(gj)
 
     items = list(getattr(coll, "items", []))
     if not items:
