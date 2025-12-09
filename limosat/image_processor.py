@@ -73,8 +73,7 @@ class ImageProcessor:
             'use_interpolation': True,
             'max_interpolation_time_gap_hours': 25,
             'max_valid_speed_m_per_day': 50000.0,
-            'window_border': 0,
-            'buoy_max_center_distance_m': None,
+            'window_border': 0
         }
 
         # Start with defaults, update from config, then from kwargs
@@ -103,7 +102,6 @@ class ImageProcessor:
         self.max_interpolation_time_gap_hours = proc_params['max_interpolation_time_gap_hours']
         self.max_valid_speed_m_per_day = proc_params['max_valid_speed_m_per_day']
         self.window_border = proc_params['window_border']  # 0 disables weighting
-        self.buoy_max_center_distance_m = proc_params['buoy_max_center_distance_m']
         self._last_persisted_id = 0
         
         # Initialize the KeypointDetector
@@ -410,7 +408,6 @@ class ImageProcessor:
                     octave=self.octave,
                     img=img,
                     response_threshold=self.response_threshold,
-                    max_center_distance_m=self.buoy_max_center_distance_m,
                 )
                 if buoy_kps is None:
                     logger.error("keypoint_from_point returned None unexpectedly!")
@@ -435,17 +432,28 @@ class ImageProcessor:
             appended_points_gdf = self.points.iloc[current_self_points_len:]
             logger.info(f"Added {len(appended_points_gdf)} new points (total: {len(self.points)})")
 
-            # Link insitu_points to final trajectory_ids using surviving_tags
+            # Link insitu_points to final trajectory_ids using surviving_tags and store seed geometry metadata
             if self.insitu_points is not None and surviving_tags is not None and not appended_points_gdf.empty:
                 appended_points_gdf_reset = appended_points_gdf.reset_index(drop=True)
-                
+
+                # Ensure columns exist (created lazily if missing)
+                for col in ['seed_kp_geometry', 'seed_image_id', 'seed_time']:
+                    if col not in self.insitu_points.columns:
+                        self.insitu_points[col] = pd.NA
+
                 if len(surviving_tags) == len(appended_points_gdf_reset):
                     for i, original_df_idx_tag in enumerate(surviving_tags):
-                        if original_df_idx_tag is not None: # Check if the tag is an actual index
+                        if original_df_idx_tag is not None:  # tag is index in self.insitu_points
                             final_tid = appended_points_gdf_reset.iloc[i]['trajectory_id']
+                            seed_geom = appended_points_gdf_reset.iloc[i]['geometry']
+
                             self.insitu_points.loc[original_df_idx_tag, 'trajectory_id'] = final_tid
+                            self.insitu_points.loc[original_df_idx_tag, 'seed_kp_geometry'] = seed_geom
+                            self.insitu_points.loc[original_df_idx_tag, 'seed_image_id'] = image_id
+                            self.insitu_points.loc[original_df_idx_tag, 'seed_time'] = img.date
+
                             logger.debug(
-                                f"Linked insitu_point (original index {original_df_idx_tag}) to trajectory_id {final_tid}"
+                                f"Linked insitu_point (original index {original_df_idx_tag}) to trajectory_id {final_tid} and stored seed_kp_geometry"
                             )
                 else:
                     logger.warning(

@@ -86,60 +86,92 @@ class DriftDatabase:
     @log_execution_time
     def save(self, points, templates, last_persisted_id, insitu_points=None):
         if points.empty:
-             logger.info("No points to save.")
-             if templates is not None and templates.trajectory_ids.size > 0 and self.zarr_path:
-                 try:
-                      logger.info("Saving empty points state, but saving templates...")
-                      templates.data.to_dataset(name="template_data").to_zarr(self.zarr_path, mode="w")
-                      logger.info(f"Successfully persisted {templates.trajectory_ids.size} templates (with 0 new points).")
-                      return True
-                 except Exception as e:
-                      logger.error(f"Failed to save templates even with no points: {e}", exc_info=True)
-                      return False
-             return True
+            logger.info("No points to save.")
+            if templates is not None and templates.trajectory_ids.size > 0 and self.zarr_path:
+                try:
+                    logger.info("Saving empty points state, but saving templates...")
+                    templates.data.to_dataset(name="template_data").to_zarr(self.zarr_path, mode="w")
+                    logger.info(f"Successfully persisted {templates.trajectory_ids.size} templates (with 0 new points).")
+                    return True
+                except Exception as e:
+                    logger.error(f"Failed to save templates even with no points: {e}", exc_info=True)
+                    return False
+            return True
 
         try:
-            # --- 1. Prepare Points Delta ---
-            points_image_id_series = points['image_id'].astype(int)
+            points = points.copy()
+            points = points.set_crs('EPSG:3413')
+
+            # Identify existing trajectories in DB
+            with self.engine.connect() as connection:
+                inspector = inspect(connection.engine)
+                table_exists = inspector.has_table(self.run_name, schema=connection.dialect.default_schema_name)
+
+                if table_exists:
+                    try:
+                        existing_traj_ids_df = pd.read_sql(
+                            text(f'SELECT DISTINCT "trajectory_id" FROM "{self.run_name}"'),
+                            con=connection
+                        )
+                        existing_traj_ids = set(existing_traj_ids_df['trajectory_id'].dropna().astype(int).tolist())
+                    except Exception as e:
+                        logger.warning(f"Could not fetch existing trajectory ids: {e}. Assuming none.")
+                        existing_traj_ids = set()
+                else:
+                    existing_traj_ids = set()
+
+            points['trajectory_id'] = points['trajectory_id'].astype('Int64')
+
+            # New trajectories are those not present in DB yet
+            is_new_traj = ~points['trajectory_id'].isin(existing_traj_ids)
+            is_new_traj = is_new_traj.fillna(False)
+
+            # For existing trajectories, keep only rows newer than last_persisted_id
             last_persisted_id_int = int(last_persisted_id)
-            mask_series = points_image_id_series > last_persisted_id_int
-            points_delta = points.loc[mask_series].copy()
+            is_newer_than_last = points['image_id'].astype(int) > last_persisted_id_int
+
+            # Build delta:
+            #  - include ALL rows for brand new trajectories (so we include the seed row),
+            #  - include ONLY newer rows for already-known trajectories
+            points_delta = pd.concat([
+                points[is_new_traj],
+                points[~is_new_traj & is_newer_than_last]
+            ], ignore_index=True)
 
             if points_delta.empty:
                 logger.info("No new points detected since last save.")
                 if templates is not None and templates.trajectory_ids.size > 0 and self.zarr_path:
                     logger.info("Saving templates only (no new points).")
-                    templates.data.to_dataset(name="template_data").to_zarr(self.zarr_path, mode="w") 
+                    templates.data.to_dataset(name="template_data").to_zarr(self.zarr_path, mode="w")
                     return True
                 return True
 
-            logger.info(f"Processing {len(points_delta)} new/updated points for persistence.")
-            points_delta = points_delta.set_crs('EPSG:3413')
+            # Serialize descriptors only for is_last rows
             if 'descriptors' in points_delta.columns:
                 points_delta['descriptors'] = points_delta.apply(
-                    lambda row: self._serialize_descriptors(row['descriptors']) if row['is_last'] == 1 else None,
+                    lambda row: self._serialize_descriptors(row['descriptors']) if row.get('is_last', 0) == 1 else None,
                     axis=1
                 )
-
 
             with self.engine.connect() as connection:
                 with connection.begin():
                     updated_traj_ids = [
-                        int(tid) for tid in points_delta['trajectory_id'].unique().tolist()
-                        if pd.notna(tid)
+                        int(tid) for tid in points_delta['trajectory_id'].dropna().unique().tolist()
                     ]
+
                     inspector = inspect(connection.engine)
                     table_exists = inspector.has_table(self.run_name, schema=connection.dialect.default_schema_name)
+
                     if updated_traj_ids and table_exists:
                         update_sql = text(f"""
-                            UPDATE {self.run_name}
+                            UPDATE "{self.run_name}"
                             SET is_last = 0
                             WHERE is_last = 1 AND trajectory_id = ANY(:traj_ids)
                         """)
                         result = connection.execute(update_sql, {"traj_ids": updated_traj_ids})
                         logger.debug(f"Updated is_last=0 for {result.rowcount} previous points in DB.")
                     elif updated_traj_ids:
-                        logger.debug(f"Table '{self.run_name}' does not exist yet. It will be created.")
+                        logger.debug(f'Table "{self.run_name}" does not exist yet. It will be created.')
 
                     points_delta.to_postgis(
                         self.run_name,
