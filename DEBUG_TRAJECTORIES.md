@@ -37,6 +37,65 @@ debug:
 
 ## Usage
 
+### CLI / Script Usage
+
+If you have your own run script (e.g., `run_limosat.py`), you need to:
+
+1. **Add debug config to your YAML file:**
+   ```yaml
+   debug:
+     trajectories_enabled: true
+     output_path: "./data/debug/{run_name}_debug.feather"
+   ```
+
+2. **Load config and create debug recorder in your script:**
+   ```python
+   import yaml
+   from limosat.debug_recorder import DebugRecorder, NoOpDebugRecorder
+   
+   # Load your config
+   with open('config.yaml', 'r') as f:
+       config = yaml.safe_load(f)
+   
+   # Create debug recorder based on config
+   debug_enabled = config.get('debug', {}).get('trajectories_enabled', False)
+   if debug_enabled:
+       debug_recorder = DebugRecorder(enabled=True)
+   else:
+       debug_recorder = NoOpDebugRecorder()
+   ```
+
+3. **Pass debug_recorder to Matcher and ImageProcessor:**
+   ```python
+   # Create matcher WITH debug recorder
+   matcher = Matcher(
+       norm=cv2.NORM_HAMMING2,
+       descriptor_distance_max=120,
+       # ... other params ...
+       debug_recorder=debug_recorder  # Add this
+   )
+   
+   # Create processor WITH debug recorder
+   processor = ImageProcessor(
+       points=points,
+       model=orb_model,
+       matcher=matcher,
+       config=config,  # Pass config so it can access debug.output_path
+       debug_recorder=debug_recorder,  # Add this
+       # ... other parameters ...
+   )
+   ```
+
+4. **Run your script normally:**
+   ```bash
+   python run_limosat.py config.yaml
+   
+   # Or with nohup:
+   nohup python run_limosat.py config.yaml > run_debug.log 2>&1 &
+   ```
+
+**Complete example script:** See `examples/run_limosat_with_debug.py` for a full working example.
+
 ### Programmatic Usage
 
 ```python
