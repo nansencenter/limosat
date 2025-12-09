@@ -65,3 +65,7 @@ matcher_params:
     type: "AffineTransform"
     use_model_estimation: true
     estimation_method: "USAC_MAGSAC"
+
+debug:
+  trajectories_enabled: false  # Enable detailed debug recording for trajectory analysis
+  output_path: "./data/debug/{run_name}_debug.feather"  # Path for debug feather file (supports {run_name} and {run_id} placeholders)
