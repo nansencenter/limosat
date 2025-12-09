@@ -43,6 +43,7 @@ class ImageProcessor:
                  insitu_points=None,
                  return_insitu_points_on_completion=False,
                  templates=None,
+                 debug_recorder=None,
                  **kwargs
                 ):
         self.points = points
@@ -52,6 +53,7 @@ class ImageProcessor:
         self.run_name = run_name
         self.insitu_points = insitu_points
         self.return_insitu_points_on_completion = return_insitu_points_on_completion
+        self.debug_recorder = debug_recorder
 
         # Define default parameters
         default_params = {
@@ -104,8 +106,12 @@ class ImageProcessor:
         self.window_border = proc_params['window_border']  # 0 disables weighting
         self._last_persisted_id = 0
         
-        # Initialize the KeypointDetector
-        self.keypoint_detector = KeypointDetector(model=model)
+        # Initialize the KeypointDetector with debug recorder
+        self.keypoint_detector = KeypointDetector(model=model, debug_recorder=self.debug_recorder)
+        
+        # Pass debug recorder to matcher if it doesn't have one
+        if hasattr(self.matcher, 'debug_recorder') and self.matcher.debug_recorder is None:
+            self.matcher.debug_recorder = self.debug_recorder
 
         # Initialize trajectory_id column in insitu_points if in validation mode
         if self.insitu_points is not None:
@@ -368,6 +374,32 @@ class ImageProcessor:
             
             converged_to_values = self.points.loc[mask, 'trajectory_id'].map(loser_to_winner_map)
             self.points.loc[mask, 'converged_to'] = converged_to_values
+            
+            # Record trajectory terminations
+            if self.debug_recorder:
+                for loser_tid, winner_tid in loser_to_winner_map.items():
+                    traj_points = self.points[self.points['trajectory_id'] == loser_tid]
+                    if not traj_points.empty:
+                        num_obs = len(traj_points)
+                        times = traj_points['time'].dropna()
+                        duration_days = None
+                        if len(times) > 1:
+                            duration_days = (times.max() - times.min()).total_seconds() / 86400.0
+                        
+                        # Get current step from points_matched
+                        step = None
+                        matched_point = points_matched[points_matched['trajectory_id'] == loser_tid]
+                        if not matched_point.empty and 'image_id' in matched_point.columns:
+                            step = matched_point['image_id'].iloc[0]
+                        
+                        self.debug_recorder.record_trajectory_termination(
+                            trajectory_id=loser_tid,
+                            step=step,
+                            reason=f"trajectory converged to winner trajectory {winner_tid}",
+                            num_observations=num_obs,
+                            duration_days=duration_days,
+                            converged_to=winner_tid,
+                        )
 
             return points_matched[~points_matched['trajectory_id'].isin(loser_tids)]
 
@@ -540,6 +572,24 @@ class ImageProcessor:
 
         if points_fg1 is None or points_fg2 is None or points_fg1.empty or points_fg2.empty:
             logger.info("Insufficient match quality or no matches found, skipping point matching step.")
+            if self.debug_recorder:
+                # Record termination for all candidate trajectories
+                for tid in points_poly_filtered['trajectory_id'].unique():
+                    traj_points = self.points[self.points['trajectory_id'] == tid]
+                    if not traj_points.empty:
+                        num_obs = len(traj_points)
+                        times = traj_points['time'].dropna()
+                        duration_days = None
+                        if len(times) > 1:
+                            duration_days = (times.max() - times.min()).total_seconds() / 86400.0
+                        
+                        self.debug_recorder.record_trajectory_termination(
+                            trajectory_id=tid,
+                            step=image_id,
+                            reason="no matches found after descriptor matching and filtering",
+                            num_observations=num_obs,
+                            duration_days=duration_days,
+                        )
             return Keypoints(), pd.DataFrame(columns=["trajectory_id", "geometry_pred"]) 
 
         points_fg2['trajectory_id'] = points_fg1.trajectory_id.values
@@ -633,6 +683,20 @@ class ImageProcessor:
         
         if not np.any(correlation_mask):
             logger.debug("No points passed correlation filter.")
+            if self.debug_recorder:
+                # Record termination for all trajectories that failed correlation
+                for idx, row in points_matched.iterrows():
+                    tid = row['trajectory_id']
+                    corr = row['corr']
+                    self.debug_recorder.record(
+                        stage="pattern_match",
+                        event_type="failure",
+                        message=f"correlation below threshold: {corr:.3f} < {self.min_correlation}",
+                        trajectory_id=tid,
+                        step=image_id,
+                        correlation=corr,
+                        min_correlation=self.min_correlation,
+                    )
             return Keypoints(), pd.DataFrame(columns=["trajectory_id", "geometry_pred"]) 
 
         points_matched = points_matched[correlation_mask]
@@ -787,3 +851,32 @@ class ImageProcessor:
                     )
                 else:
                     logger.error("Final persistence FAILED. _last_persisted_id not updated.")
+        
+        # Write debug feather file if debug recording is enabled
+        if self.debug_recorder and self.debug_recorder.enabled:
+            try:
+                # Generate default path if not provided
+                import os
+                debug_path = getattr(self, 'debug_output_path', None)
+                if debug_path is None:
+                    debug_dir = "./data/debug"
+                    os.makedirs(debug_dir, exist_ok=True)
+                    run_identifier = self.run_name or self.debug_recorder.run_id
+                    debug_path = os.path.join(debug_dir, f"{run_identifier}_debug.feather")
+                else:
+                    # Support placeholders in path
+                    debug_path = debug_path.replace("{run_name}", self.run_name or "unknown")
+                    debug_path = debug_path.replace("{run_id}", self.debug_recorder.run_id)
+                    # Ensure directory exists
+                    debug_dir = os.path.dirname(debug_path)
+                    if debug_dir:
+                        os.makedirs(debug_dir, exist_ok=True)
+                
+                self.debug_recorder.to_feather(debug_path)
+                logger.info(f"Debug data written to: {debug_path}")
+                
+                # Log summary
+                summary = self.debug_recorder.get_summary()
+                logger.info(f"Debug summary: {summary['total_events']} events recorded for {summary['trajectories_tracked']} trajectories")
+            except Exception as e:
+                logger.error(f"Failed to write debug feather file: {e}", exc_info=True)
