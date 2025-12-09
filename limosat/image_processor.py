@@ -54,6 +54,7 @@ class ImageProcessor:
         self.insitu_points = insitu_points
         self.return_insitu_points_on_completion = return_insitu_points_on_completion
         self.debug_recorder = debug_recorder
+        self.config = config  # Store config for later access (e.g., debug output path)
 
         # Define default parameters
         default_params = {
@@ -855,9 +856,9 @@ class ImageProcessor:
         # Write debug feather file if debug recording is enabled
         if self.debug_recorder and self.debug_recorder.enabled:
             try:
-                # Generate default path if not provided
-                import os
-                debug_path = getattr(self, 'debug_output_path', None)
+                # Get debug output path from config or use default
+                debug_config = self.config.get('debug', {}) if self.config and isinstance(self.config, dict) else {}
+                debug_path = debug_config.get('output_path', None)
                 if debug_path is None:
                     debug_dir = "./data/debug"
                     os.makedirs(debug_dir, exist_ok=True)

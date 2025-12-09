@@ -12,7 +12,7 @@ enabling detailed analysis of trajectory termination and matching failures.
 """
 
 import uuid
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 import pandas as pd
@@ -246,15 +246,16 @@ class DebugRecorder:
         Write all recorded events to a feather file.
         
         Args:
-            path: Output path for feather file
+            path: Output path for feather file (will append .feather if not present)
         """
         df = self.to_dataframe()
         if df.empty:
             logger.warning(f"No debug events to write to {path}")
             return
         
-        # Ensure the path ends with .feather
+        # Ensure the path ends with .feather extension
         if not path.endswith('.feather'):
+            logger.info(f"Appending .feather extension to path: {path}")
             path = f"{path}.feather"
         
         df.to_feather(path)

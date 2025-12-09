@@ -125,6 +125,7 @@ class Matcher:
         # 4. Loop through each group and apply the 'filter' function
         all_inliers_idx0, all_inliers_idx1, all_residuals = [], [], []
         for image_id, group_matches in matches_by_group.items():
+            # image_id here represents the source image of points_poly for this group, used for debug recording
             rc_idx0_group, rc_idx1_group, residuals_group = self.filter(group_matches, pos0, pos1, image_id=image_id)
             
             if rc_idx0_group is not None and rc_idx0_group.size > 0:
@@ -275,6 +276,9 @@ class Matcher:
                     min_homography_inliers=self.min_homography_inliers,
                     estimation_method=self.estimation_method_name,
                 )
+            if not self.use_model_estimation:
+                return md_idx0, md_idx1, None
+            return None, None, None
 
         if not self.use_model_estimation:
             return md_idx0, md_idx1, None # md_idx0, md_idx1 are the final indices if no model estimation

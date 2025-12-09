@@ -232,5 +232,4 @@ def test_debug_recorder_disabled():
     assert recorder.get_event_count() == 0
 
 
-if __name__ == '__main__':
-    pytest.main([__file__, '-v'])
+
