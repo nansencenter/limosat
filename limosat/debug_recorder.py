@@ -149,6 +149,9 @@ class DebugRecorder:
         model_threshold: Optional[float] = None,
         min_homography_inliers: Optional[int] = None,
         estimation_method: Optional[str] = None,
+        inlier_ratio: Optional[float] = None,
+        residual_median: Optional[float] = None,
+        residual_mean: Optional[float] = None,
     ):
         """
         Record a matcher filter event with standardized fields.
@@ -170,6 +173,9 @@ class DebugRecorder:
             model_threshold=model_threshold,
             min_homography_inliers=min_homography_inliers,
             estimation_method=estimation_method,
+            inlier_ratio=inlier_ratio,
+            residual_median=residual_median,
+            residual_mean=residual_mean,
         )
     
     def record_keypoint_detection(
