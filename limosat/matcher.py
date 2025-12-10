@@ -219,6 +219,7 @@ class Matcher:
         bf_idx1 = np.array([m.trainIdx for m in matches]) # Indices into pos1 for ALL 'matches'
         
         num_initial = len(matches)
+        inlier_ratio = 0.0  # initialize for logging
 
         # Filter by descriptor distance
         # descriptor_distance is already calculated for ALL 'matches' (initial crosscheck)
@@ -245,6 +246,7 @@ class Matcher:
                     model_threshold=self.model_threshold,
                     min_homography_inliers=self.min_homography_inliers,
                     estimation_method=self.estimation_method_name,
+                    inlier_ratio=inlier_ratio,
                 )
             if not self.use_model_estimation: return dd_idx0, dd_idx1, None
             return None, None, None
@@ -257,7 +259,8 @@ class Matcher:
         md_idx0 = dd_idx0[gpi1_spatial_filter_mask] # Indices of points passing spatial (and descriptor) filter
         md_idx1 = dd_idx1[gpi1_spatial_filter_mask]
         num_spatial_passed = md_idx0.size
-        
+        inlier_ratio = 0.0  # default, updated later
+
         if md_idx0.size == 0:
             if self.debug_recorder:
                 self.debug_recorder.record_matcher_filter(
@@ -275,6 +278,7 @@ class Matcher:
                     model_threshold=self.model_threshold,
                     min_homography_inliers=self.min_homography_inliers,
                     estimation_method=self.estimation_method_name,
+                    inlier_ratio=inlier_ratio,
                 )
             if not self.use_model_estimation:
                 return md_idx0, md_idx1, None
@@ -301,6 +305,7 @@ class Matcher:
                     model_threshold=self.model_threshold,
                     min_homography_inliers=self.min_homography_inliers,
                     estimation_method=self.estimation_method_name,
+                    inlier_ratio=inlier_ratio,
                 )
             return None, None, None
 
@@ -349,6 +354,10 @@ class Matcher:
             rc_idx0 = md_idx0[inliers_mask_homography_relative]
             rc_idx1 = md_idx1[inliers_mask_homography_relative]
             num_homography_inliers = rc_idx0.size
+            if num_spatial_passed > 0:
+                inlier_ratio = num_homography_inliers / num_spatial_passed
+            else:
+                inlier_ratio = 0.0
 
             if rc_idx0.size < self.min_homography_inliers:
                 logger.warning(f"Warning: Not enough inliers after homography estimation (minimum {self.min_homography_inliers} required)")
@@ -368,11 +377,14 @@ class Matcher:
                         model_threshold=self.model_threshold,
                         min_homography_inliers=self.min_homography_inliers,
                         estimation_method=self.estimation_method_name,
+                        inlier_ratio=inlier_ratio,
                     )
                 return None, None, None
                 
             model = self.model(H) # Assuming self.model is AffineTransform class
             residuals = model.residuals(pos0[rc_idx0], pos1[rc_idx1])
+            residual_median = float(np.median(residuals)) if residuals is not None and len(residuals) > 0 else None
+            residual_mean = float(np.mean(residuals)) if residuals is not None and len(residuals) > 0 else None
             logger.info(
                 f'{self.estimation_method_name}: Found {rc_idx0.size} inliers from {len(matches)} initial candidates.'
             )
@@ -394,6 +406,9 @@ class Matcher:
                     model_threshold=self.model_threshold,
                     min_homography_inliers=self.min_homography_inliers,
                     estimation_method=self.estimation_method_name,
+                    inlier_ratio=inlier_ratio,
+                    residual_median=residual_median,
+                    residual_mean=residual_mean,
                 )
             
             if self.plot:

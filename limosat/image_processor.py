@@ -475,19 +475,49 @@ class ImageProcessor:
                         self.insitu_points[col] = pd.NA
 
                 if len(surviving_tags) == len(appended_points_gdf_reset):
-                    for i, original_df_idx_tag in enumerate(surviving_tags):
-                        if original_df_idx_tag is not None:  # tag is index in self.insitu_points
-                            final_tid = appended_points_gdf_reset.iloc[i]['trajectory_id']
-                            seed_geom = appended_points_gdf_reset.iloc[i]['geometry']
+                    # Ensure optional metadata columns exist before assignment
+                    for col in ['seed_kp_response', 'seed_kp_composite_score']:
+                        if col not in self.insitu_points.columns:
+                            self.insitu_points[col] = pd.NA
 
-                            self.insitu_points.loc[original_df_idx_tag, 'trajectory_id'] = final_tid
-                            self.insitu_points.loc[original_df_idx_tag, 'seed_kp_geometry'] = seed_geom
-                            self.insitu_points.loc[original_df_idx_tag, 'seed_image_id'] = image_id
-                            self.insitu_points.loc[original_df_idx_tag, 'seed_time'] = img.date
+                    for i, tag in enumerate(surviving_tags):
+                        if tag is None:
+                            continue
 
-                            logger.debug(
-                                f"Linked insitu_point (original index {original_df_idx_tag}) to trajectory_id {final_tid} and stored seed_kp_geometry"
-                            )
+                        # Tags from keypoint_from_point are dicts containing the original index and response metadata
+                        if isinstance(tag, dict):
+                            insitu_idx = tag.get('original_index')
+                            seed_response = tag.get('response')
+                            seed_composite = tag.get('composite_score')
+                            # Ignore non-insitu tags (e.g., standard detections carrying only response data)
+                            if insitu_idx is None:
+                                continue
+                        else:
+                            insitu_idx = tag
+                            seed_response = None
+                            seed_composite = None
+
+                        if insitu_idx is None or insitu_idx not in self.insitu_points.index:
+                            continue
+
+                        final_tid = appended_points_gdf_reset.iloc[i]['trajectory_id']
+                        seed_geom = appended_points_gdf_reset.iloc[i]['geometry']
+
+                        self.insitu_points.loc[insitu_idx, 'trajectory_id'] = final_tid
+                        self.insitu_points.loc[insitu_idx, 'seed_kp_geometry'] = seed_geom
+                        self.insitu_points.loc[insitu_idx, 'seed_image_id'] = image_id
+                        self.insitu_points.loc[insitu_idx, 'seed_time'] = img.date
+
+                        if seed_response is not None:
+                            self.insitu_points.loc[insitu_idx, 'seed_kp_response'] = seed_response
+                        if seed_composite is not None:
+                            self.insitu_points.loc[insitu_idx, 'seed_kp_composite_score'] = seed_composite
+
+                        logger.debug(
+                            "Linked insitu_point index %s to trajectory_id %s and stored seed metadata",
+                            insitu_idx,
+                            final_tid,
+                        )
                 else:
                     logger.warning(
                         "Mismatch between surviving_tags (%d) and appended_points_gdf_reset (%d). Skipping linking.",
@@ -685,20 +715,45 @@ class ImageProcessor:
         if not np.any(correlation_mask):
             logger.debug("No points passed correlation filter.")
             if self.debug_recorder:
-                # Record termination for all trajectories that failed correlation
+                # Record failure for all trajectories that failed correlation
                 for idx, row in points_matched.iterrows():
                     tid = row['trajectory_id']
-                    corr = row['corr']
+                    corr = float(row['corr'])
                     self.debug_recorder.record(
                         stage="pattern_match",
                         event_type="failure",
-                        message=f"correlation below threshold: {corr:.3f} < {self.min_correlation}",
+                        message="correlation below threshold",
                         trajectory_id=tid,
                         step=image_id,
                         correlation=corr,
                         min_correlation=self.min_correlation,
                     )
             return Keypoints(), pd.DataFrame(columns=["trajectory_id", "geometry_pred"]) 
+
+        if self.debug_recorder:
+            for tid, corr in zip(points_matched.loc[correlation_mask, 'trajectory_id'], corr_values[correlation_mask]):
+                self.debug_recorder.record(
+                    stage="pattern_match",
+                    event_type="info",
+                    message="correlation passed",
+                    trajectory_id=tid,
+                    step=image_id,
+                    correlation=float(corr),
+                    min_correlation=self.min_correlation,
+                )
+
+        # Record dropped trajectories that failed correlation while allowing others to continue
+        if self.debug_recorder and (~correlation_mask).any():
+            for tid, corr in zip(points_matched.loc[~correlation_mask, 'trajectory_id'], corr_values[~correlation_mask]):
+                self.debug_recorder.record(
+                    stage="pattern_match",
+                    event_type="failure",
+                    message="correlation below threshold",
+                    trajectory_id=tid,
+                    step=image_id,
+                    correlation=float(corr),
+                    min_correlation=self.min_correlation,
+                )
 
         points_matched = points_matched[correlation_mask]
         keypoints_corrected_xy = keypoints_corrected_xy[correlation_mask]
@@ -752,6 +807,17 @@ class ImageProcessor:
             # collect failed (interpolated but did not pass recheck)
             if (~recheck_passed_mask).any():
                 failed_tids = points_to_recheck.loc[~recheck_passed_mask, 'trajectory_id'].values
+                if self.debug_recorder:
+                    for tid, corr in zip(failed_tids, corr_rechecked[~recheck_passed_mask]):
+                        self.debug_recorder.record(
+                            stage="pattern_match",
+                            event_type="failure",
+                            message="correlation below threshold (recheck)",
+                            trajectory_id=tid,
+                            step=image_id,
+                            correlation=float(corr),
+                            min_correlation=self.min_correlation,
+                        )
                 xs = x1_interp[was_interpolated_mask][~recheck_passed_mask]
                 ys = y1_interp[was_interpolated_mask][~recheck_passed_mask]
                 failed_geom = gpd.points_from_xy(xs, ys).tolist()
@@ -766,6 +832,17 @@ class ImageProcessor:
             # Combine survivors from both groups
             points_rechecked = points_to_recheck[recheck_passed_mask]
             points_rechecked['corr'] = corr_rechecked[recheck_passed_mask]
+            if self.debug_recorder and np.any(recheck_passed_mask):
+                for tid, corr in zip(points_rechecked['trajectory_id'], corr_rechecked[recheck_passed_mask]):
+                    self.debug_recorder.record(
+                        stage="pattern_match",
+                        event_type="info",
+                        message="correlation passed (recheck)",
+                        trajectory_id=tid,
+                        step=image_id,
+                        correlation=float(corr),
+                        min_correlation=self.min_correlation,
+                    )
 
             # Combine final results
             points_matched = pd.concat([points_good, points_rechecked], ignore_index=True)
