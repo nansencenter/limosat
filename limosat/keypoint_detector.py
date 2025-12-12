@@ -281,6 +281,20 @@ class KeypointDetector:
             )
         ]
 
+        # Log response summary for newly detected keypoints
+        if self.debug_recorder and filtered_keypoints_with_tags:
+            responses = [tag.get('response') for _, tag in filtered_keypoints_with_tags if isinstance(tag, dict) and tag and 'response' in tag]
+            if responses:
+                self.debug_recorder.record(
+                    stage="keypoint_detection",
+                    event_type="info",
+                    message="response summary",
+                    min_response=float(np.min(responses)),
+                    mean_response=float(np.mean(responses)),
+                    max_response=float(np.max(responses)),
+                    count=len(responses),
+                )
+
         if not compute_descriptors:
             return filtered_keypoints_with_tags
 

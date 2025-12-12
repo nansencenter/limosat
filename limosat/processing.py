@@ -20,7 +20,8 @@ def interpolate_drift(points_poly, points_fg1, points_fg2, img,
                                          max_interpolation_time_gap_hours,
                                          border_size,
                                          model_type=AffineTransform,
-                                         max_anchor_distance_km=0
+                                         max_anchor_distance_km=0,
+                                         debug_recorder=None
                                         ):
     """
     Interpolates drift for unmatched points using per-source-image affine transforms.
@@ -29,14 +30,39 @@ def interpolate_drift(points_poly, points_fg1, points_fg2, img,
     points_result['interpolated'] = 0
     
     MIN_SAMPLES_FOR_AFFINE = 10
-    if len(points_fg1) < MIN_SAMPLES_FOR_AFFINE:
-        logger.info(f"Not enough matched points ({len(points_fg1)}) for interpolation. Min: {MIN_SAMPLES_FOR_AFFINE}.")
+    num_anchor_points = len(points_fg1)
+    num_unmatched_total = len(points_poly) - len(points_fg1)
+
+    if num_anchor_points < MIN_SAMPLES_FOR_AFFINE:
+        logger.info(f"Not enough matched points ({num_anchor_points}) for interpolation. Min: {MIN_SAMPLES_FOR_AFFINE}.")
+        if debug_recorder:
+            debug_recorder.record(
+                stage="interpolate_drift",
+                event_type="info",
+                message="not enough anchors for interpolation",
+                num_anchor_points=num_anchor_points,
+                min_samples_for_affine=MIN_SAMPLES_FOR_AFFINE,
+                num_unmatched_points=num_unmatched_total,
+                groups_interpolated=0,
+                num_interpolated_points=0,
+            )
         return points_result
 
     # 1. Identify unmatched points and group all points by source image_id
     unmatched_points = points_poly[~points_poly['trajectory_id'].isin(points_fg1['trajectory_id'])]
     if unmatched_points.empty:
         logger.debug("No unmatched points to consider for interpolation.")
+        if debug_recorder:
+            debug_recorder.record(
+                stage="interpolate_drift",
+                event_type="info",
+                message="no unmatched points for interpolation",
+                num_anchor_points=num_anchor_points,
+                min_samples_for_affine=MIN_SAMPLES_FOR_AFFINE,
+                num_unmatched_points=num_unmatched_total,
+                groups_interpolated=0,
+                num_interpolated_points=0,
+            )
         return points_result
         
     anchor_groups = points_fg1.groupby('image_id')
@@ -122,14 +148,50 @@ def interpolate_drift(points_poly, points_fg1, points_fg2, img,
         points_interpolated_group.geometry = final_points_to_add['interpolated_geom'].values
         
         all_interpolated_points.append(points_interpolated_group)
+        if debug_recorder:
+            for tid in points_interpolated_group['trajectory_id']:
+                debug_recorder.record(
+                    stage="interpolate_drift",
+                    event_type="info",
+                    message="interpolated point added",
+                    trajectory_id=int(tid),
+                    groups_interpolated=1,
+                )
         logger.info(f"Group {source_id}: Successfully interpolated and kept {len(points_interpolated_group)} points.")
 
     # 3. Aggregate results
     if not all_interpolated_points:
         logger.info("No points were successfully interpolated across any group.")
+        if debug_recorder:
+            debug_recorder.record(
+                stage="interpolate_drift",
+                event_type="info",
+                message="interpolation produced zero points",
+                num_anchor_points=num_anchor_points,
+                min_samples_for_affine=MIN_SAMPLES_FOR_AFFINE,
+                num_unmatched_points=num_unmatched_total,
+                groups_interpolated=0,
+                num_interpolated_points=0,
+            )
         return points_result
 
-    return Keypoints._from_gdf(pd.concat([points_result] + all_interpolated_points, ignore_index=True))
+    interpolated_total = sum(len(p) for p in all_interpolated_points)
+    result = Keypoints._from_gdf(pd.concat([points_result] + all_interpolated_points, ignore_index=True))
+
+    if debug_recorder:
+        debug_recorder.record(
+            stage="interpolate_drift",
+            event_type="info",
+            message="interpolation successful",
+            num_anchor_points=num_anchor_points,
+            min_samples_for_affine=MIN_SAMPLES_FOR_AFFINE,
+            num_unmatched_points=num_unmatched_total,
+            groups_interpolated=len(all_interpolated_points),
+            num_interpolated_points=interpolated_total,
+            total_points_after_interpolation=len(result),
+        )
+
+    return result
 
 @log_execution_time
 def pattern_matching(

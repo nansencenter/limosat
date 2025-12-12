@@ -152,6 +152,10 @@ class DebugRecorder:
         inlier_ratio: Optional[float] = None,
         residual_median: Optional[float] = None,
         residual_mean: Optional[float] = None,
+        num_traj_descriptor: Optional[int] = None,
+        num_traj_spatial: Optional[int] = None,
+        num_traj_inliers: Optional[int] = None,
+        trajectory_ids_sample: Optional[List[int]] = None,
     ):
         """
         Record a matcher filter event with standardized fields.
@@ -176,6 +180,10 @@ class DebugRecorder:
             inlier_ratio=inlier_ratio,
             residual_median=residual_median,
             residual_mean=residual_mean,
+            num_traj_descriptor=num_traj_descriptor,
+            num_traj_spatial=num_traj_spatial,
+            num_traj_inliers=num_traj_inliers,
+            trajectory_ids_sample=trajectory_ids_sample,
         )
     
     def record_keypoint_detection(

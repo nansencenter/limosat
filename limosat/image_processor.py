@@ -463,12 +463,33 @@ class ImageProcessor:
             self.points = self.points.append(points_new) # This assigns final trajectory_ids to the points_new portion
             
             appended_points_gdf = self.points.iloc[current_self_points_len:]
+            appended_points_gdf_reset = appended_points_gdf.reset_index(drop=True)
             logger.info(f"Added {len(appended_points_gdf)} new points (total: {len(self.points)})")
+
+            # Log seed responses per trajectory (for new points)
+            if self.debug_recorder and surviving_tags is not None:
+                for i, tag in enumerate(surviving_tags):
+                    if isinstance(tag, dict) and tag and 'response' in tag:
+                        try:
+                            tid = int(appended_points_gdf_reset.iloc[i]['trajectory_id'])
+                            self.debug_recorder.record(
+                                stage="seed_response",
+                                event_type="info",
+                                message="seed response recorded",
+                                trajectory_id=tid,
+                                step=image_id,
+                                response=float(tag.get('response')),
+                                composite_score=(
+                                    float(tag.get('composite_score'))
+                                    if tag.get('composite_score') is not None
+                                    else None
+                                ),
+                            )
+                        except Exception:
+                            logger.debug("Failed to log seed response for index %s", i)
 
             # Link insitu_points to final trajectory_ids using surviving_tags and store seed geometry metadata
             if self.insitu_points is not None and surviving_tags is not None and not appended_points_gdf.empty:
-                appended_points_gdf_reset = appended_points_gdf.reset_index(drop=True)
-
                 # Ensure columns exist (created lazily if missing)
                 for col in ['seed_kp_geometry', 'seed_image_id', 'seed_time']:
                     if col not in self.insitu_points.columns:
@@ -636,7 +657,8 @@ class ImageProcessor:
                 img=img,
                 max_interpolation_time_gap_hours=self.max_interpolation_time_gap_hours,
                 border_size=self.border_size,
-                model_type=AffineTransform
+                model_type=AffineTransform,
+                debug_recorder=self.debug_recorder
             )
             if points_matched is None or points_matched.empty:
                 logger.warning("Interpolation resulted in no valid points. Proceeding with only matched points.")
@@ -663,6 +685,8 @@ class ImageProcessor:
                 out=np.full_like(time_diff_days, np.inf),
                 where=time_diff_days > 1e-9
             )
+            candidates_with_history = candidates_with_history.copy()
+            candidates_with_history['speed_m_per_day'] = speed_m_per_day
             speed_filter_mask = speed_m_per_day <= self.max_valid_speed_m_per_day
             valid_trajectory_ids = candidates_with_history.loc[speed_filter_mask, 'trajectory_id']
             points_matched = points_matched[points_matched['trajectory_id'].isin(valid_trajectory_ids)]
@@ -670,6 +694,20 @@ class ImageProcessor:
                 logger.info(
                     f"Global velocity filter: Removed {num_before_speed_filter - len(points_matched)} outlier points exceeding {self.max_valid_speed_m_per_day} m/day."
                 )
+                if self.debug_recorder:
+                    removed = candidates_with_history.loc[~speed_filter_mask]
+                    for _, row in removed.iterrows():
+                        speed_val = row['speed_m_per_day'] if 'speed_m_per_day' in row else None
+                        self.debug_recorder.record(
+                            stage="speed_filter",
+                            event_type="failure",
+                            message="removed for excessive speed",
+                            step=image_id,
+                            trajectory_id=int(row['trajectory_id']),
+                            speed_m_per_day=float(speed_val) if speed_val is not None else None,
+                            max_valid_speed_m_per_day=self.max_valid_speed_m_per_day,
+                            observations=obs_counts.get(int(row['trajectory_id']), None) if 'obs_counts' in locals() else None,
+                        )
 
         # Convergence filtering
         if not points_matched.empty:
@@ -683,6 +721,17 @@ class ImageProcessor:
         available_traj_ids = self.templates.trajectory_ids
         has_template_mask = np.isin(all_traj_ids, available_traj_ids)
         if not np.all(has_template_mask):
+            if self.debug_recorder:
+                dropped_ids = all_traj_ids[~has_template_mask]
+                for tid in dropped_ids:
+                    self.debug_recorder.record(
+                        stage="template_filter",
+                        event_type="failure",
+                        message="missing template for trajectory",
+                        step=image_id,
+                        trajectory_id=int(tid),
+                        observations=obs_counts.get(int(tid), None) if 'obs_counts' in locals() else None,
+                    )
             points_matched = points_matched[has_template_mask]
             all_traj_ids = points_matched.trajectory_id.values
         if points_matched.empty:
@@ -711,6 +760,8 @@ class ImageProcessor:
 
         points_matched['corr'] = corr_values
         correlation_mask = corr_values >= self.min_correlation
+        # Current observation counts per trajectory
+        obs_counts = self.points['trajectory_id'].value_counts().to_dict() if len(self.points) > 0 else {}
         
         if not np.any(correlation_mask):
             logger.debug("No points passed correlation filter.")
@@ -727,6 +778,7 @@ class ImageProcessor:
                         step=image_id,
                         correlation=corr,
                         min_correlation=self.min_correlation,
+                        observations=obs_counts.get(int(tid), None),
                     )
             return Keypoints(), pd.DataFrame(columns=["trajectory_id", "geometry_pred"]) 
 
@@ -740,6 +792,7 @@ class ImageProcessor:
                     step=image_id,
                     correlation=float(corr),
                     min_correlation=self.min_correlation,
+                    observations=obs_counts.get(int(tid), None),
                 )
 
         # Record dropped trajectories that failed correlation while allowing others to continue
@@ -753,6 +806,7 @@ class ImageProcessor:
                     step=image_id,
                     correlation=float(corr),
                     min_correlation=self.min_correlation,
+                    observations=obs_counts.get(int(tid), None),
                 )
 
         points_matched = points_matched[correlation_mask]
@@ -817,6 +871,7 @@ class ImageProcessor:
                             step=image_id,
                             correlation=float(corr),
                             min_correlation=self.min_correlation,
+                            observations=obs_counts.get(int(tid), None),
                         )
                 xs = x1_interp[was_interpolated_mask][~recheck_passed_mask]
                 ys = y1_interp[was_interpolated_mask][~recheck_passed_mask]
@@ -842,6 +897,7 @@ class ImageProcessor:
                         step=image_id,
                         correlation=float(corr),
                         min_correlation=self.min_correlation,
+                        observations=obs_counts.get(int(tid), None),
                     )
 
             # Combine final results
