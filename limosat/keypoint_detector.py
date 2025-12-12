@@ -19,15 +19,16 @@ class KeypointDetector:
     including new keypoint detection and gridded detection.
     """
 
-    def __init__(self, model):
+    def __init__(self, model, debug_recorder=None):
         """
         Initialize the keypoint detector.
 
         Parameters:
             model: Feature detection model (e.g., SIFT, ORB)
-            octave (int): The octave value for keypoints
+            debug_recorder: Optional debug recorder for trajectory analysis
         """
         self.model = model
+        self.debug_recorder = debug_recorder
         self.pc = ccrs.PlateCarree()
         central_longitude = -45
         true_scale_latitude = 70
@@ -246,9 +247,19 @@ class KeypointDetector:
                     composite_scores = responses * weights
                     best_idx = int(np.argmax(composite_scores))
                     best_kp_in_window = kps[best_idx]
+                    # Store response metadata in tag
+                    response_tag = {
+                        'response': float(best_kp_in_window.response),
+                        'composite_score': float(composite_scores[best_idx]),
+                    }
                 else:
                     # Raw response selection
                     best_kp_in_window = max(kps, key=lambda kp: kp.response)
+                    # Store response metadata in tag
+                    response_tag = {
+                        'response': float(best_kp_in_window.response),
+                        'composite_score': None,
+                    }
 
                 # Offset to image coords
                 best_kp_in_window.pt = (
@@ -258,7 +269,7 @@ class KeypointDetector:
                 if adjust_keypoint_angle:
                     best_kp_in_window.angle = img.angle
                 best_kp_in_window.octave = octave
-                keypoints.append((best_kp_in_window, None))
+                keypoints.append((best_kp_in_window, response_tag))
 
         # Enforce outer border exclusion
         filtered_keypoints_with_tags = [
@@ -269,6 +280,20 @@ class KeypointDetector:
                 and border_size <= item[0].pt[1] <= img0.shape[0] - border_size
             )
         ]
+
+        # Log response summary for newly detected keypoints
+        if self.debug_recorder and filtered_keypoints_with_tags:
+            responses = [tag.get('response') for _, tag in filtered_keypoints_with_tags if isinstance(tag, dict) and tag and 'response' in tag]
+            if responses:
+                self.debug_recorder.record(
+                    stage="keypoint_detection",
+                    event_type="info",
+                    message="response summary",
+                    min_response=float(np.min(responses)),
+                    mean_response=float(np.mean(responses)),
+                    max_response=float(np.max(responses)),
+                    count=len(responses),
+                )
 
         if not compute_descriptors:
             return filtered_keypoints_with_tags
@@ -461,7 +486,12 @@ class KeypointDetector:
                         angle=float(img.angle),
                         response=float(best_kp_in_patch.response)
                     )
-                    keypoints_with_indices.append((final_kp_to_add, point_row.name))
+                    # Store response in tag along with original index
+                    response_tag = {
+                        'original_index': point_row.name,
+                        'response': float(best_kp_in_patch.response),
+                    }
+                    keypoints_with_indices.append((final_kp_to_add, response_tag))
                 
             except Exception as e:
                 logger.info(f"Error processing point original_idx {original_idx} (input index {point_row.name}): {e}")

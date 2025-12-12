@@ -43,6 +43,7 @@ class ImageProcessor:
                  insitu_points=None,
                  return_insitu_points_on_completion=False,
                  templates=None,
+                 debug_recorder=None,
                  **kwargs
                 ):
         self.points = points
@@ -52,6 +53,8 @@ class ImageProcessor:
         self.run_name = run_name
         self.insitu_points = insitu_points
         self.return_insitu_points_on_completion = return_insitu_points_on_completion
+        self.debug_recorder = debug_recorder
+        self.config = config  # Store config for later access (e.g., debug output path)
 
         # Define default parameters
         default_params = {
@@ -104,8 +107,12 @@ class ImageProcessor:
         self.window_border = proc_params['window_border']  # 0 disables weighting
         self._last_persisted_id = 0
         
-        # Initialize the KeypointDetector
-        self.keypoint_detector = KeypointDetector(model=model)
+        # Initialize the KeypointDetector with debug recorder
+        self.keypoint_detector = KeypointDetector(model=model, debug_recorder=self.debug_recorder)
+        
+        # Pass debug recorder to matcher if it doesn't have one
+        if hasattr(self.matcher, 'debug_recorder') and self.matcher.debug_recorder is None:
+            self.matcher.debug_recorder = self.debug_recorder
 
         # Initialize trajectory_id column in insitu_points if in validation mode
         if self.insitu_points is not None:
@@ -368,6 +375,32 @@ class ImageProcessor:
             
             converged_to_values = self.points.loc[mask, 'trajectory_id'].map(loser_to_winner_map)
             self.points.loc[mask, 'converged_to'] = converged_to_values
+            
+            # Record trajectory terminations
+            if self.debug_recorder:
+                for loser_tid, winner_tid in loser_to_winner_map.items():
+                    traj_points = self.points[self.points['trajectory_id'] == loser_tid]
+                    if not traj_points.empty:
+                        num_obs = len(traj_points)
+                        times = traj_points['time'].dropna()
+                        duration_days = None
+                        if len(times) > 1:
+                            duration_days = (times.max() - times.min()).total_seconds() / 86400.0
+                        
+                        # Get current step from points_matched
+                        step = None
+                        matched_point = points_matched[points_matched['trajectory_id'] == loser_tid]
+                        if not matched_point.empty and 'image_id' in matched_point.columns:
+                            step = matched_point['image_id'].iloc[0]
+                        
+                        self.debug_recorder.record_trajectory_termination(
+                            trajectory_id=loser_tid,
+                            step=step,
+                            reason=f"trajectory converged to winner trajectory {winner_tid}",
+                            num_observations=num_obs,
+                            duration_days=duration_days,
+                            converged_to=winner_tid,
+                        )
 
             return points_matched[~points_matched['trajectory_id'].isin(loser_tids)]
 
@@ -430,31 +463,82 @@ class ImageProcessor:
             self.points = self.points.append(points_new) # This assigns final trajectory_ids to the points_new portion
             
             appended_points_gdf = self.points.iloc[current_self_points_len:]
+            appended_points_gdf_reset = appended_points_gdf.reset_index(drop=True)
             logger.info(f"Added {len(appended_points_gdf)} new points (total: {len(self.points)})")
+
+            # Log seed responses per trajectory (for new points)
+            if self.debug_recorder and surviving_tags is not None:
+                for i, tag in enumerate(surviving_tags):
+                    if isinstance(tag, dict) and tag and 'response' in tag:
+                        try:
+                            tid = int(appended_points_gdf_reset.iloc[i]['trajectory_id'])
+                            self.debug_recorder.record(
+                                stage="seed_response",
+                                event_type="info",
+                                message="seed response recorded",
+                                trajectory_id=tid,
+                                step=image_id,
+                                response=float(tag.get('response')),
+                                composite_score=(
+                                    float(tag.get('composite_score'))
+                                    if tag.get('composite_score') is not None
+                                    else None
+                                ),
+                            )
+                        except Exception:
+                            logger.debug("Failed to log seed response for index %s", i)
 
             # Link insitu_points to final trajectory_ids using surviving_tags and store seed geometry metadata
             if self.insitu_points is not None and surviving_tags is not None and not appended_points_gdf.empty:
-                appended_points_gdf_reset = appended_points_gdf.reset_index(drop=True)
-
                 # Ensure columns exist (created lazily if missing)
                 for col in ['seed_kp_geometry', 'seed_image_id', 'seed_time']:
                     if col not in self.insitu_points.columns:
                         self.insitu_points[col] = pd.NA
 
                 if len(surviving_tags) == len(appended_points_gdf_reset):
-                    for i, original_df_idx_tag in enumerate(surviving_tags):
-                        if original_df_idx_tag is not None:  # tag is index in self.insitu_points
-                            final_tid = appended_points_gdf_reset.iloc[i]['trajectory_id']
-                            seed_geom = appended_points_gdf_reset.iloc[i]['geometry']
+                    # Ensure optional metadata columns exist before assignment
+                    for col in ['seed_kp_response', 'seed_kp_composite_score']:
+                        if col not in self.insitu_points.columns:
+                            self.insitu_points[col] = pd.NA
 
-                            self.insitu_points.loc[original_df_idx_tag, 'trajectory_id'] = final_tid
-                            self.insitu_points.loc[original_df_idx_tag, 'seed_kp_geometry'] = seed_geom
-                            self.insitu_points.loc[original_df_idx_tag, 'seed_image_id'] = image_id
-                            self.insitu_points.loc[original_df_idx_tag, 'seed_time'] = img.date
+                    for i, tag in enumerate(surviving_tags):
+                        if tag is None:
+                            continue
 
-                            logger.debug(
-                                f"Linked insitu_point (original index {original_df_idx_tag}) to trajectory_id {final_tid} and stored seed_kp_geometry"
-                            )
+                        # Tags from keypoint_from_point are dicts containing the original index and response metadata
+                        if isinstance(tag, dict):
+                            insitu_idx = tag.get('original_index')
+                            seed_response = tag.get('response')
+                            seed_composite = tag.get('composite_score')
+                            # Ignore non-insitu tags (e.g., standard detections carrying only response data)
+                            if insitu_idx is None:
+                                continue
+                        else:
+                            insitu_idx = tag
+                            seed_response = None
+                            seed_composite = None
+
+                        if insitu_idx is None or insitu_idx not in self.insitu_points.index:
+                            continue
+
+                        final_tid = appended_points_gdf_reset.iloc[i]['trajectory_id']
+                        seed_geom = appended_points_gdf_reset.iloc[i]['geometry']
+
+                        self.insitu_points.loc[insitu_idx, 'trajectory_id'] = final_tid
+                        self.insitu_points.loc[insitu_idx, 'seed_kp_geometry'] = seed_geom
+                        self.insitu_points.loc[insitu_idx, 'seed_image_id'] = image_id
+                        self.insitu_points.loc[insitu_idx, 'seed_time'] = img.date
+
+                        if seed_response is not None:
+                            self.insitu_points.loc[insitu_idx, 'seed_kp_response'] = seed_response
+                        if seed_composite is not None:
+                            self.insitu_points.loc[insitu_idx, 'seed_kp_composite_score'] = seed_composite
+
+                        logger.debug(
+                            "Linked insitu_point index %s to trajectory_id %s and stored seed metadata",
+                            insitu_idx,
+                            final_tid,
+                        )
                 else:
                     logger.warning(
                         "Mismatch between surviving_tags (%d) and appended_points_gdf_reset (%d). Skipping linking.",
@@ -540,6 +624,24 @@ class ImageProcessor:
 
         if points_fg1 is None or points_fg2 is None or points_fg1.empty or points_fg2.empty:
             logger.info("Insufficient match quality or no matches found, skipping point matching step.")
+            if self.debug_recorder:
+                # Record termination for all candidate trajectories
+                for tid in points_poly_filtered['trajectory_id'].unique():
+                    traj_points = self.points[self.points['trajectory_id'] == tid]
+                    if not traj_points.empty:
+                        num_obs = len(traj_points)
+                        times = traj_points['time'].dropna()
+                        duration_days = None
+                        if len(times) > 1:
+                            duration_days = (times.max() - times.min()).total_seconds() / 86400.0
+                        
+                        self.debug_recorder.record_trajectory_termination(
+                            trajectory_id=tid,
+                            step=image_id,
+                            reason="no matches found after descriptor matching and filtering",
+                            num_observations=num_obs,
+                            duration_days=duration_days,
+                        )
             return Keypoints(), pd.DataFrame(columns=["trajectory_id", "geometry_pred"]) 
 
         points_fg2['trajectory_id'] = points_fg1.trajectory_id.values
@@ -555,7 +657,8 @@ class ImageProcessor:
                 img=img,
                 max_interpolation_time_gap_hours=self.max_interpolation_time_gap_hours,
                 border_size=self.border_size,
-                model_type=AffineTransform
+                model_type=AffineTransform,
+                debug_recorder=self.debug_recorder
             )
             if points_matched is None or points_matched.empty:
                 logger.warning("Interpolation resulted in no valid points. Proceeding with only matched points.")
@@ -582,6 +685,8 @@ class ImageProcessor:
                 out=np.full_like(time_diff_days, np.inf),
                 where=time_diff_days > 1e-9
             )
+            candidates_with_history = candidates_with_history.copy()
+            candidates_with_history['speed_m_per_day'] = speed_m_per_day
             speed_filter_mask = speed_m_per_day <= self.max_valid_speed_m_per_day
             valid_trajectory_ids = candidates_with_history.loc[speed_filter_mask, 'trajectory_id']
             points_matched = points_matched[points_matched['trajectory_id'].isin(valid_trajectory_ids)]
@@ -589,6 +694,20 @@ class ImageProcessor:
                 logger.info(
                     f"Global velocity filter: Removed {num_before_speed_filter - len(points_matched)} outlier points exceeding {self.max_valid_speed_m_per_day} m/day."
                 )
+                if self.debug_recorder:
+                    removed = candidates_with_history.loc[~speed_filter_mask]
+                    for _, row in removed.iterrows():
+                        speed_val = row['speed_m_per_day'] if 'speed_m_per_day' in row else None
+                        self.debug_recorder.record(
+                            stage="speed_filter",
+                            event_type="failure",
+                            message="removed for excessive speed",
+                            step=image_id,
+                            trajectory_id=int(row['trajectory_id']),
+                            speed_m_per_day=float(speed_val) if speed_val is not None else None,
+                            max_valid_speed_m_per_day=self.max_valid_speed_m_per_day,
+                            observations=obs_counts.get(int(row['trajectory_id']), None) if 'obs_counts' in locals() else None,
+                        )
 
         # Convergence filtering
         if not points_matched.empty:
@@ -602,6 +721,17 @@ class ImageProcessor:
         available_traj_ids = self.templates.trajectory_ids
         has_template_mask = np.isin(all_traj_ids, available_traj_ids)
         if not np.all(has_template_mask):
+            if self.debug_recorder:
+                dropped_ids = all_traj_ids[~has_template_mask]
+                for tid in dropped_ids:
+                    self.debug_recorder.record(
+                        stage="template_filter",
+                        event_type="failure",
+                        message="missing template for trajectory",
+                        step=image_id,
+                        trajectory_id=int(tid),
+                        observations=obs_counts.get(int(tid), None) if 'obs_counts' in locals() else None,
+                    )
             points_matched = points_matched[has_template_mask]
             all_traj_ids = points_matched.trajectory_id.values
         if points_matched.empty:
@@ -630,10 +760,54 @@ class ImageProcessor:
 
         points_matched['corr'] = corr_values
         correlation_mask = corr_values >= self.min_correlation
+        # Current observation counts per trajectory
+        obs_counts = self.points['trajectory_id'].value_counts().to_dict() if len(self.points) > 0 else {}
         
         if not np.any(correlation_mask):
             logger.debug("No points passed correlation filter.")
+            if self.debug_recorder:
+                # Record failure for all trajectories that failed correlation
+                for idx, row in points_matched.iterrows():
+                    tid = row['trajectory_id']
+                    corr = float(row['corr'])
+                    self.debug_recorder.record(
+                        stage="pattern_match",
+                        event_type="failure",
+                        message="correlation below threshold",
+                        trajectory_id=tid,
+                        step=image_id,
+                        correlation=corr,
+                        min_correlation=self.min_correlation,
+                        observations=obs_counts.get(int(tid), None),
+                    )
             return Keypoints(), pd.DataFrame(columns=["trajectory_id", "geometry_pred"]) 
+
+        if self.debug_recorder:
+            for tid, corr in zip(points_matched.loc[correlation_mask, 'trajectory_id'], corr_values[correlation_mask]):
+                self.debug_recorder.record(
+                    stage="pattern_match",
+                    event_type="info",
+                    message="correlation passed",
+                    trajectory_id=tid,
+                    step=image_id,
+                    correlation=float(corr),
+                    min_correlation=self.min_correlation,
+                    observations=obs_counts.get(int(tid), None),
+                )
+
+        # Record dropped trajectories that failed correlation while allowing others to continue
+        if self.debug_recorder and (~correlation_mask).any():
+            for tid, corr in zip(points_matched.loc[~correlation_mask, 'trajectory_id'], corr_values[~correlation_mask]):
+                self.debug_recorder.record(
+                    stage="pattern_match",
+                    event_type="failure",
+                    message="correlation below threshold",
+                    trajectory_id=tid,
+                    step=image_id,
+                    correlation=float(corr),
+                    min_correlation=self.min_correlation,
+                    observations=obs_counts.get(int(tid), None),
+                )
 
         points_matched = points_matched[correlation_mask]
         keypoints_corrected_xy = keypoints_corrected_xy[correlation_mask]
@@ -687,6 +861,18 @@ class ImageProcessor:
             # collect failed (interpolated but did not pass recheck)
             if (~recheck_passed_mask).any():
                 failed_tids = points_to_recheck.loc[~recheck_passed_mask, 'trajectory_id'].values
+                if self.debug_recorder:
+                    for tid, corr in zip(failed_tids, corr_rechecked[~recheck_passed_mask]):
+                        self.debug_recorder.record(
+                            stage="pattern_match",
+                            event_type="failure",
+                            message="correlation below threshold (recheck)",
+                            trajectory_id=tid,
+                            step=image_id,
+                            correlation=float(corr),
+                            min_correlation=self.min_correlation,
+                            observations=obs_counts.get(int(tid), None),
+                        )
                 xs = x1_interp[was_interpolated_mask][~recheck_passed_mask]
                 ys = y1_interp[was_interpolated_mask][~recheck_passed_mask]
                 failed_geom = gpd.points_from_xy(xs, ys).tolist()
@@ -701,6 +887,18 @@ class ImageProcessor:
             # Combine survivors from both groups
             points_rechecked = points_to_recheck[recheck_passed_mask]
             points_rechecked['corr'] = corr_rechecked[recheck_passed_mask]
+            if self.debug_recorder and np.any(recheck_passed_mask):
+                for tid, corr in zip(points_rechecked['trajectory_id'], corr_rechecked[recheck_passed_mask]):
+                    self.debug_recorder.record(
+                        stage="pattern_match",
+                        event_type="info",
+                        message="correlation passed (recheck)",
+                        trajectory_id=tid,
+                        step=image_id,
+                        correlation=float(corr),
+                        min_correlation=self.min_correlation,
+                        observations=obs_counts.get(int(tid), None),
+                    )
 
             # Combine final results
             points_matched = pd.concat([points_good, points_rechecked], ignore_index=True)
@@ -787,3 +985,32 @@ class ImageProcessor:
                     )
                 else:
                     logger.error("Final persistence FAILED. _last_persisted_id not updated.")
+        
+        # Write debug feather file if debug recording is enabled
+        if self.debug_recorder and self.debug_recorder.enabled:
+            try:
+                # Get debug output path from config or use default
+                debug_config = self.config.get('debug', {}) if self.config and isinstance(self.config, dict) else {}
+                debug_path = debug_config.get('output_path', None)
+                if debug_path is None:
+                    debug_dir = "./data/debug"
+                    os.makedirs(debug_dir, exist_ok=True)
+                    run_identifier = self.run_name or self.debug_recorder.run_id
+                    debug_path = os.path.join(debug_dir, f"{run_identifier}_debug.feather")
+                else:
+                    # Support placeholders in path
+                    debug_path = debug_path.replace("{run_name}", self.run_name or "unknown")
+                    debug_path = debug_path.replace("{run_id}", self.debug_recorder.run_id)
+                    # Ensure directory exists
+                    debug_dir = os.path.dirname(debug_path)
+                    if debug_dir:
+                        os.makedirs(debug_dir, exist_ok=True)
+                
+                self.debug_recorder.to_feather(debug_path)
+                logger.info(f"Debug data written to: {debug_path}")
+                
+                # Log summary
+                summary = self.debug_recorder.get_summary()
+                logger.info(f"Debug summary: {summary['total_events']} events recorded for {summary['trajectories_tracked']} trajectories")
+            except Exception as e:
+                logger.error(f"Failed to write debug feather file: {e}", exc_info=True)
