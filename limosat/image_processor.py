@@ -43,6 +43,7 @@ class ImageProcessor:
                  insitu_points=None,
                  return_insitu_points_on_completion=False,
                  templates=None,
+                 grid_cache_dir=None,
                  **kwargs
                 ):
         self.points = points
@@ -105,7 +106,7 @@ class ImageProcessor:
         self._last_persisted_id = 0
         
         # Initialize the KeypointDetector
-        self.keypoint_detector = KeypointDetector(model=model)
+        self.keypoint_detector = KeypointDetector(model=model, cache_dir=grid_cache_dir)
 
         # Initialize trajectory_id column in insitu_points if in validation mode
         if self.insitu_points is not None:
