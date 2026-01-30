@@ -21,17 +21,15 @@ class KeypointDetector:
     including new keypoint detection and gridded detection.
     """
 
-    def __init__(self, model, debug_recorder=None, cache_dir=None):
+    def __init__(self, model, cache_dir=None):
         """
         Initialize the keypoint detector.
 
         Parameters:
             model: Feature detection model (e.g., SIFT, ORB)
-            debug_recorder: Optional debug recorder for trajectory analysis
             cache_dir: Optional directory to cache deterministic grid descriptors
         """
         self.model = model
-        self.debug_recorder = debug_recorder
         self.pc = ccrs.PlateCarree()
         central_longitude = -45
         true_scale_latitude = 70
