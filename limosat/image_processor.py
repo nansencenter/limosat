@@ -43,7 +43,11 @@ class ImageProcessor:
                  insitu_points=None,
                  return_insitu_points_on_completion=False,
                  templates=None,
+<<<<<<< HEAD
                  debug_recorder=None,
+=======
+                 grid_cache_dir=None,
+>>>>>>> 91628dc29eae9b8c2afe83e22e0f2d6671d8b4ec
                  **kwargs
                 ):
         self.points = points
@@ -107,12 +111,17 @@ class ImageProcessor:
         self.window_border = proc_params['window_border']  # 0 disables weighting
         self._last_persisted_id = 0
         
+<<<<<<< HEAD
         # Initialize the KeypointDetector with debug recorder
         self.keypoint_detector = KeypointDetector(model=model, debug_recorder=self.debug_recorder)
         
         # Pass debug recorder to matcher if it doesn't have one
         if hasattr(self.matcher, 'debug_recorder') and self.matcher.debug_recorder is None:
             self.matcher.debug_recorder = self.debug_recorder
+=======
+        # Initialize the KeypointDetector
+        self.keypoint_detector = KeypointDetector(model=model, cache_dir=grid_cache_dir)
+>>>>>>> 91628dc29eae9b8c2afe83e22e0f2d6671d8b4ec
 
         # Initialize trajectory_id column in insitu_points if in validation mode
         if self.insitu_points is not None:

@@ -9,7 +9,9 @@ import cv2
 import cartopy.crs as ccrs
 from skimage.util import view_as_windows
 from nansat import NSR
-from .utils import log_execution_time, logger
+import os
+from pathlib import Path
+from .utils import log_execution_time, logger, extract_date
 
 class KeypointDetector:
     """
@@ -38,6 +40,86 @@ class KeypointDetector:
         )
         # Cache for precomputed Gaussian masks: key = (window_size, gaussian_sigma_factor)
         self._gaussian_cache = {}
+        # Optional on-disk cache for gridded descriptors
+        if cache_dir is None:
+            cache_dir = os.environ.get("LIMOSAT_GRID_CACHE")
+        self.grid_cache_dir = cache_dir
+        if self.grid_cache_dir:
+            os.makedirs(self.grid_cache_dir, exist_ok=True)
+
+    def _model_cache_tag(self):
+        # Best-effort tag to avoid collisions across detector configs.
+        parts = [self.model.__class__.__name__]
+        for getter, label in (
+            ("getPatchSize", "ps"),
+            ("getNLevels", "nl"),
+            ("getMaxFeatures", "nf"),
+            ("getNFeatures", "nf"),
+            ("getScaleFactor", "sf"),
+            ("getEdgeThreshold", "et"),
+            ("getFirstLevel", "fl"),
+            ("getScoreType", "st"),
+        ):
+            if hasattr(self.model, getter):
+                try:
+                    parts.append(f"{label}{getattr(self.model, getter)()}")
+                except Exception:
+                    pass
+        return "-".join(parts)
+
+    def _cache_subdir(self, img, source_path):
+        date = getattr(img, "date", None)
+        if date is None:
+            date = extract_date(str(source_path))
+        if date is None:
+            return Path("unknown") / "unknown"
+        try:
+            return Path(f"{int(date.year):04d}") / f"{int(date.month):02d}"
+        except Exception:
+            return Path("unknown") / "unknown"
+
+    def _grid_cache_key(self, img, stride, border_size, octave):
+        if not self.grid_cache_dir:
+            return None
+        # Use basename and detector params; attempt to use image filename if available
+        source_path = (
+            getattr(img, "filename", None)
+            or getattr(img, "file_path", None)
+            or getattr(img, "filepath", None)
+            or getattr(img, "name", None)
+            or "unknown"
+        )
+        basename = Path(source_path).stem
+        subdir = self._cache_subdir(img, source_path)
+        model_tag = self._model_cache_tag()
+        return Path(self.grid_cache_dir) / subdir / f"{basename}_s{stride}_b{border_size}_o{octave}_{model_tag}.npz"
+
+    def _load_grid_cache(self, img, stride, border_size, octave):
+        cache_path = self._grid_cache_key(img, stride, border_size, octave)
+        if not cache_path or not cache_path.exists():
+            return None
+        try:
+            with np.load(cache_path, allow_pickle=False) as data:
+                coords = data['coords']
+                descriptors = data['descriptors']
+            tags = [None] * len(coords)
+            return coords, descriptors, tags
+        except Exception as e:
+            logger.warning(f"Failed to load grid cache {cache_path}: {e}")
+            return None
+
+    def _save_grid_cache(self, img, stride, border_size, octave, compute_result):
+        cache_path = self._grid_cache_key(img, stride, border_size, octave)
+        if not cache_path or compute_result is None:
+            return
+        coords, descriptors, tags = compute_result
+        if coords is None or descriptors is None:
+            return
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(cache_path, coords=coords, descriptors=descriptors)
+        except Exception as e:
+            logger.warning(f"Failed to save grid cache {cache_path}: {e}")
         
     @log_execution_time
     def compute_descriptors(self, keypoints_with_tags, img, polarisation='s0_HV', normalize=True):
@@ -326,44 +408,57 @@ class KeypointDetector:
         Returns:
             tuple: (keypoint_coords, descriptors, surviving_tags)
         """
+        # Attempt to load cached grid descriptors
+        cached = self._load_grid_cache(img, stride, border_size, octave)
+        if cached is not None:
+            return cached
+
         # Get image data and replace NaNs with zero
         img0 = img[1]
         img0[np.isnan(img0)] = 0
-        
-        # TODO: generalise preprocessing to create boolean landmask
+
+        # Optional land mask
         landmask = None
         if img.bands().get(2, {'name': 'none'}).get('name') == 'mask':
             landmask = img[2]
             img0[landmask == 2] = 0
 
-        # Generate grid keypoints
-        keypoints = []
-        for r in range(0, img0.shape[0], stride):
-            for c in range(0, img0.shape[1], stride):
-                if landmask is not None and landmask[r, c] == 2:
-                    continue  # skip land cells
+        # Vectorized grid generation to avoid Python double loop
+        h, w = img0.shape
+        rows, cols = np.mgrid[0:h:stride, 0:w:stride]
+        rows_flat = rows.ravel()
+        cols_flat = cols.ravel()
 
-                # The size parameter is required, but will be overwritten by the detector's patch size
-                kp = cv2.KeyPoint(c, r, size=31, octave=octave, angle=img.angle)
+        if landmask is not None:
+            landmask_bool = (landmask == 2)
+            valid_mask = ~landmask_bool[rows_flat, cols_flat]
+            rows_flat = rows_flat[valid_mask]
+            cols_flat = cols_flat[valid_mask]
 
-                keypoints.append((kp, None)) # Append tuple with None as tag
+        # Border filtering in one pass
+        border_mask = (
+            (cols_flat >= border_size)
+            & (cols_flat <= w - border_size)
+            & (rows_flat >= border_size)
+            & (rows_flat <= h - border_size)
+        )
+        rows_flat = rows_flat[border_mask]
+        cols_flat = cols_flat[border_mask]
 
-        # Filter keypoints within image borders
-        filtered_keypoints_with_tags = [
-            item
-            for item in keypoints
-            if (
-                border_size <= item[0].pt[0] <= img0.shape[1] - border_size
-                and border_size <= item[0].pt[1] <= img0.shape[0] - border_size
-            )
+        keypoints_with_tags = [
+            (cv2.KeyPoint(float(c), float(r), size=31, octave=octave, angle=img.angle), None)
+            for r, c in zip(rows_flat, cols_flat)
         ]
 
-        return self.compute_descriptors(
-            filtered_keypoints_with_tags,
+        result = self.compute_descriptors(
+            keypoints_with_tags,
             img,
             polarisation=1,
             normalize=False
         )
+
+        self._save_grid_cache(img, stride, border_size, octave, result)
+        return result
 
     def get_pixel_coords(self, nansat_obj, geom_x, geom_y):
         # helper function for keypoint_from_point
