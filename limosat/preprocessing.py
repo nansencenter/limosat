@@ -19,8 +19,7 @@ import numpy as np
 import cv2
 from nansat import Nansat
 from scipy import ndimage as ndi
-from concurrent.futures import ProcessPoolExecutor
-from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import traceback # Import traceback for detailed error printing
 import sys
 os.environ['MOD44WPATH'] = '/Data/sat/auxdata/mod44w/'
@@ -180,6 +179,13 @@ def _collect_inputs(idir, files_list=None, recursive=False, max_files=0):
         return valid
 
 
+def _print_progress(done, total, start_time):
+    elapsed = max(1e-9, time.time() - start_time)
+    pct = (done / total) * 100 if total else 100.0
+    rate = done / elapsed
+    print(f"[preprocessing] {done}/{total} ({pct:.1f}%) elapsed={elapsed:.1f}s rate={rate:.2f}/s", flush=True)
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description='Preprocess Sentinel-1 SAFE/ZIP to TIFF')
     parser.add_argument('--idir', default='/Data/sat/downloads/sentinel1/2015/', help='Input directory')
@@ -208,31 +214,33 @@ def main(argv=None):
     print(f"{len(input_files)} input files found")
     print(f"Starting processing with {workers} workers.")
 
+    total = len(input_files)
+    report_every = 1 if total <= 20 else 10
+    start_time = time.time()
+
     completed_count = 0
     error_count = 0
     if workers == 1:
-        for ifile in tqdm(input_files, total=len(input_files), desc="Processing inputs"):
+        for idx, ifile in enumerate(input_files, 1):
             try:
                 process_file(ifile, args.odir)
                 completed_count += 1
             except Exception:
                 error_count += 1
+            if idx % report_every == 0 or idx == total:
+                _print_progress(idx, total, start_time)
     else:
         with ProcessPoolExecutor(max_workers=workers) as executor:
-            futures = []
-            with tqdm(total=len(input_files), desc="Processing inputs") as pbar:
-                for ifile in input_files:
-                    future = executor.submit(process_file, ifile, args.odir)
-                    future.add_done_callback(lambda p: pbar.update())
-                    futures.append(future)
-
+            futures = [executor.submit(process_file, ifile, args.odir) for ifile in input_files]
             print("Waiting for all tasks to complete...")
-            for future in futures:
+            for idx, future in enumerate(as_completed(futures), 1):
                 try:
                     future.result()
                     completed_count += 1
                 except Exception:
                     error_count += 1
+                if idx % report_every == 0 or idx == total:
+                    _print_progress(idx, total, start_time)
 
     print(f"Processing complete. {completed_count} tasks finished successfully, {error_count} tasks failed.")
     return 0 if error_count == 0 else 1
