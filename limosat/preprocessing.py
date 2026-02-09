@@ -22,7 +22,9 @@ from scipy import ndimage as ndi
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import traceback # Import traceback for detailed error printing
 import sys
-os.environ['MOD44WPATH'] = '/Data/sat/auxdata/mod44w/'
+os.environ.setdefault('MOD44WPATH', '/Data/sat/auxdata/mod44w/')
+os.environ.setdefault('GDAL_VRT_RAWRASTERBAND_ALLOWED_SOURCE', 'ALL')
+os.environ.setdefault('VRT_ALLOW_MEM_DRIVER', 'YES')
 sys.path.insert(0, os.path.abspath('..'))
 
 def get_n(filename, pols=('HH', 'HV'), factor_hh=2, factor_hv=5):
@@ -128,7 +130,7 @@ def process_file(ifile, odir):
         # Use process ID to differentiate messages in parallel execution
         pid = os.getpid()
         print(f"{datetime.now()} - {pid} - Skipping {ifile}; {output_file} already exists.")
-        return  # Skip processing
+        return True  # Skip processing
 
     try:
         pid = os.getpid()
@@ -140,6 +142,7 @@ def process_file(ifile, odir):
         n.export(output_file, driver='GTiff', options=[])
         elapsed = time.time() - t0
         print(f"{datetime.now()} - {pid} - Finished processing {ifile} in {elapsed:.2f} seconds")
+        return True
     except Exception as e:
         # Print detailed error information including traceback
         pid = os.getpid()
@@ -148,6 +151,7 @@ def process_file(ifile, odir):
         print(f"Exception message: {e}")
         print("Traceback:")
         traceback.print_exc() # Prints the full traceback to standard error
+        return False
 
 
 def _is_supported_input(path):
@@ -186,6 +190,13 @@ def _print_progress(done, total, start_time):
     print(f"[preprocessing] {done}/{total} ({pct:.1f}%) elapsed={elapsed:.1f}s rate={rate:.2f}/s", flush=True)
 
 
+def _warmup_nansat(path):
+    try:
+        Nansat(path)
+    except Exception as e:
+        print(f"WARNING: Warmup failed for {path}: {e}")
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description='Preprocess Sentinel-1 SAFE/ZIP to TIFF')
     parser.add_argument('--idir', default='/Data/sat/downloads/sentinel1/2015/', help='Input directory')
@@ -218,13 +229,19 @@ def main(argv=None):
     report_every = 1 if total <= 20 else 10
     start_time = time.time()
 
+    if workers > 1 and total > 0:
+        _warmup_nansat(input_files[0])
+
     completed_count = 0
     error_count = 0
     if workers == 1:
         for idx, ifile in enumerate(input_files, 1):
             try:
-                process_file(ifile, args.odir)
-                completed_count += 1
+                ok = process_file(ifile, args.odir)
+                if ok:
+                    completed_count += 1
+                else:
+                    error_count += 1
             except Exception:
                 error_count += 1
             if idx % report_every == 0 or idx == total:
@@ -235,8 +252,11 @@ def main(argv=None):
             print("Waiting for all tasks to complete...")
             for idx, future in enumerate(as_completed(futures), 1):
                 try:
-                    future.result()
-                    completed_count += 1
+                    ok = future.result()
+                    if ok:
+                        completed_count += 1
+                    else:
+                        error_count += 1
                 except Exception:
                     error_count += 1
                 if idx % report_every == 0 or idx == total:
