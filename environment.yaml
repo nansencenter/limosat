@@ -30,5 +30,7 @@ dependencies:
   - geoalchemy2
   - zarr
   - pip:
+      - setuptools==70.3.0
+      - pythesint
       - nansat
       - pystac>=1.8.4
