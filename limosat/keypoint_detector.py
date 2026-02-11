@@ -21,13 +21,14 @@ class KeypointDetector:
     including new keypoint detection and gridded detection.
     """
 
-    def __init__(self, model, debug_recorder=None):
+    def __init__(self, model, debug_recorder=None, cache_dir=None):
         """
         Initialize the keypoint detector.
 
         Parameters:
             model: Feature detection model (e.g., SIFT, ORB)
             debug_recorder: Optional debug recorder for trajectory analysis
+            cache_dir: Optional on-disk cache directory for gridded descriptors
         """
         self.model = model
         self.debug_recorder = debug_recorder

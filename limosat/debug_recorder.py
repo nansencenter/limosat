@@ -91,6 +91,10 @@ class DebugRecorder:
         
         if self.enabled:
             logger.info(f"Debug recording enabled with run_id: {self.run_id}")
+
+    def __bool__(self) -> bool:
+        """Allow truthiness checks to follow enabled state."""
+        return bool(self.enabled)
     
     @staticmethod
     def _generate_run_id() -> str:
