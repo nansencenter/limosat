@@ -55,6 +55,41 @@ class DriftDatabase:
             'converged_to': Integer(),
         }
 
+    @staticmethod
+    def _chunked(values, chunk_size):
+        """Yield successive chunks from a list-like container."""
+        for i in range(0, len(values), chunk_size):
+            yield values[i:i + chunk_size]
+
+    @staticmethod
+    def _sqlite_max_variables(connection):
+        """
+        Return SQLite variable limit for bound parameters.
+        Falls back to 999 if the runtime limit cannot be determined.
+        """
+        default_limit = 999
+        try:
+            value = connection.execute(text("PRAGMA max_variable_number")).scalar()
+            if value is not None:
+                parsed = int(value)
+                if parsed > 0:
+                    return parsed
+        except Exception:
+            pass
+
+        try:
+            options = connection.execute(text("PRAGMA compile_options")).fetchall()
+            for row in options:
+                opt = row[0] if row else None
+                if isinstance(opt, str) and opt.startswith("MAX_VARIABLE_NUMBER="):
+                    parsed = int(opt.split("=", 1)[1])
+                    if parsed > 0:
+                        return parsed
+        except Exception:
+            pass
+
+        return default_limit
+
     def prepare_run_state(self, clear_existing_data=False, temporal_window_days=None):
         """
         Prepares the database and Zarr store for a run.
@@ -161,6 +196,9 @@ class DriftDatabase:
                     updated_traj_ids = [
                         int(tid) for tid in points_delta['trajectory_id'].dropna().unique().tolist()
                     ]
+                    sqlite_var_limit = None
+                    if not self.is_postgis:
+                        sqlite_var_limit = self._sqlite_max_variables(connection)
 
                     inspector = inspect(connection.engine)
                     table_exists = inspector.has_table(self.run_name)
@@ -171,8 +209,18 @@ class DriftDatabase:
                             SET is_last = 0
                             WHERE is_last = 1 AND trajectory_id IN :traj_ids
                         """).bindparams(bindparam("traj_ids", expanding=True))
-                        result = connection.execute(update_sql, {"traj_ids": updated_traj_ids})
-                        logger.debug(f"Updated is_last=0 for {result.rowcount} previous points in DB.")
+                        if self.is_postgis:
+                            result = connection.execute(update_sql, {"traj_ids": updated_traj_ids})
+                            logger.debug(f"Updated is_last=0 for {result.rowcount} previous points in DB.")
+                        else:
+                            # SQLite has a bound-variable limit; chunk large IN clauses.
+                            update_chunk_size = max(1, int(sqlite_var_limit * 0.9))
+                            rows_updated = 0
+                            for traj_chunk in self._chunked(updated_traj_ids, update_chunk_size):
+                                result = connection.execute(update_sql, {"traj_ids": traj_chunk})
+                                if result.rowcount and result.rowcount > 0:
+                                    rows_updated += result.rowcount
+                            logger.debug(f"Updated is_last=0 for {rows_updated} previous points in DB.")
                     elif updated_traj_ids:
                         logger.debug(f'Table "{self.run_name}" does not exist yet. It will be created.')
 
@@ -190,12 +238,15 @@ class DriftDatabase:
                             points_delta_sql['geometry'] = points_delta_sql['geometry'].apply(
                                 lambda geom: geom.wkt if geom is not None else None
                             )
+                        n_insert_cols = max(1, len(points_delta_sql.columns))
+                        sqlite_insert_chunk = max(1, int(sqlite_var_limit * 0.9) // n_insert_cols)
                         points_delta_sql.to_sql(
                             self.run_name,
                             connection,
                             if_exists='append',
                             index=False,
-                            method='multi'
+                            method='multi',
+                            chunksize=sqlite_insert_chunk
                         )
                     logger.debug(f"Appended {len(points_delta)} points to database.")
 
