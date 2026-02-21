@@ -150,6 +150,13 @@ class Matcher:
         Applies a Lowe's ratio-like test using k=4 neighbors to find additional matches.
         Relies on the subsequent self.filter call for descriptor and spatial distance filtering.
         """
+        if x1 is None or x1.shape[0] < self.knn_k:
+            n_train = 0 if x1 is None else int(x1.shape[0])
+            logger.debug(
+                f"Skipping Lowe's ratio test: train descriptors ({n_train}) < knn_k ({self.knn_k})."
+            )
+            return list(matches_bf_initial)
+
         index_params = dict(algorithm=6, table_number=12, key_size=20, multi_probe_level=2)
         search_params = {}
         knn_matcher = cv2.FlannBasedMatcher(index_params, search_params)
