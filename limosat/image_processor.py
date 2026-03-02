@@ -103,7 +103,7 @@ class ImageProcessor:
             self.max_speed_m_per_day = matcher_max_speed
         elif matcher_max_speed is not None and matcher_max_speed != self.max_speed_m_per_day:
             raise ValueError("max_speed_m_per_day must not be set to different values on ImageProcessor and Matcher.")
-        # Use one motion-control value for admission, matching, and final filtering.
+        # Use one motion-control value for candidate buffering, matching, and final filtering.
         self.candidate_search_max_daily_drift_m = (
             self.max_speed_m_per_day
             if self.max_speed_m_per_day is not None
@@ -180,7 +180,7 @@ class ImageProcessor:
         # Create Nansat Image object from file
         img = Image(filename)
         
-        # Compute buffer allowing drift INTO current frame
+        # Compute the candidate buffer for points that could drift into the current frame.
         buffer_distance = self._candidate_buffer_distance_m()
         buffered_image_poly = img.poly.buffer(buffer_distance)
         time_threshold = img.date - pd.Timedelta(days=self.temporal_window)
