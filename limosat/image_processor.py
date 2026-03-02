@@ -88,11 +88,22 @@ class ImageProcessor:
         self.persist_updates = proc_params['persist_updates']
         self.persist_interval = proc_params['persist_interval']
         self.pruning_interval = proc_params['pruning_interval']
+        # temporal_window is measured in days.
         self.temporal_window = proc_params['temporal_window']
         self.convergence_radius_pixels = proc_params['convergence_radius_pixels']
         self.max_speed_m_per_day = proc_params.get('max_speed_m_per_day')
         if self.max_speed_m_per_day is not None:
             self.max_speed_m_per_day = float(self.max_speed_m_per_day)
+        matcher_max_speed = None
+        if self.matcher is not None:
+            matcher_max_speed = getattr(self.matcher, 'max_speed_m_per_day', None)
+            if matcher_max_speed is not None:
+                matcher_max_speed = float(matcher_max_speed)
+        if self.max_speed_m_per_day is None:
+            self.max_speed_m_per_day = matcher_max_speed
+        elif matcher_max_speed is not None and matcher_max_speed != self.max_speed_m_per_day:
+            raise ValueError("max_speed_m_per_day must not be set to different values on ImageProcessor and Matcher.")
+        # Use one motion-control value for admission, matching, and final filtering.
         self.candidate_search_max_daily_drift_m = (
             self.max_speed_m_per_day
             if self.max_speed_m_per_day is not None
@@ -142,6 +153,7 @@ class ImageProcessor:
             logger.info("Validation mode enabled with in-situ points")
 
     def _candidate_buffer_distance_m(self):
+        # temporal_window is a day-based lookback, so this is meters/day * days.
         max_possible_drift = self.candidate_search_max_daily_drift_m * self.temporal_window
         if self.max_speed_m_per_day is not None or self.matcher is None:
             return max_possible_drift

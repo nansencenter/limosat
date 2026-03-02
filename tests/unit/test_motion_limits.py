@@ -156,6 +156,44 @@ def test_image_processor_max_speed_sets_all_motion_limits():
 
 
 @pytest.mark.unit
+def test_image_processor_reuses_matcher_max_speed_when_processor_value_is_unset():
+    ImageProcessor = load_real_module("limosat.image_processor").ImageProcessor
+
+    matcher = MatcherStub()
+    matcher.max_speed_m_per_day = 40000
+    proc = ImageProcessor(
+        points=make_points(),
+        model=None,
+        matcher=matcher,
+        persist_updates=False,
+        temporal_window=3,
+    )
+
+    assert proc.max_speed_m_per_day == pytest.approx(40000.0)
+    assert proc.candidate_search_max_daily_drift_m == pytest.approx(40000.0)
+    assert proc.max_valid_speed_m_per_day == pytest.approx(40000.0)
+    assert proc.matcher.max_speed_m_per_day == pytest.approx(40000.0)
+
+
+@pytest.mark.unit
+def test_image_processor_rejects_conflicting_max_speed_values():
+    ImageProcessor = load_real_module("limosat.image_processor").ImageProcessor
+
+    matcher = MatcherStub()
+    matcher.max_speed_m_per_day = 40000
+
+    with pytest.raises(ValueError, match="must not be set to different values"):
+        ImageProcessor(
+            points=make_points(),
+            model=None,
+            matcher=matcher,
+            persist_updates=False,
+            temporal_window=3,
+            max_speed_m_per_day=50000,
+        )
+
+
+@pytest.mark.unit
 def test_image_processor_buffer_uses_spatial_cap_without_max_speed():
     ImageProcessor = load_real_module("limosat.image_processor").ImageProcessor
 

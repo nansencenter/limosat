@@ -30,7 +30,7 @@ image_processor_params:
   persist_updates: true
   persist_interval: 100
   pruning_interval: 25
-  temporal_window: 4
+  temporal_window: 4  # days
   max_speed_m_per_day: null
   candidate_search_max_daily_drift_m: 10000
   window_size: 64
@@ -59,7 +59,6 @@ keypoint_detector:
 matcher_params:
   norm_type: "NORM_HAMMING2"
   descriptor_distance_max: 120
-  max_speed_m_per_day: null
   spatial_distance_max: 100000
   model_threshold: 10000
   plot_matches: false
