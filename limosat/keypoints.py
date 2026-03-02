@@ -13,6 +13,18 @@ from .utils import log_execution_time
 class Keypoints(gpd.GeoDataFrame):
     srs = NSR(3413)
 
+    @staticmethod
+    def _normalize_stopped(series):
+        """Normalize stopped flags to non-null bool values."""
+        return series.fillna(False).astype(bool)
+
+    @staticmethod
+    def _normalize_converged_to(series):
+        """Normalize converged_to to nullable integer trajectory ids."""
+        numeric = pd.to_numeric(series, errors='coerce')
+        numeric = numeric.mask(numeric == -1, pd.NA)
+        return numeric.astype('Int64')
+
     def __init__(self, *args, **kwargs):
         if not args and not kwargs:
             # Initialize with empty data if no arguments provided
@@ -40,13 +52,13 @@ class Keypoints(gpd.GeoDataFrame):
             if 'time' in self.columns:
                 self['time'] = pd.to_datetime(self['time'], errors='coerce')
             if 'stopped' in self.columns:
-                self['stopped'] = self['stopped'].astype(bool)
+                self['stopped'] = self._normalize_stopped(self['stopped'])
             if 'interpolated' in self.columns:
                 self['interpolated'] = self['interpolated'].astype('int32')
             if 'trajectory_id' in self.columns:
                 self['trajectory_id'] = self['trajectory_id'].astype('int64')
             if 'converged_to' in self.columns:
-                self['converged_to'] = self['converged_to'].astype('Int64')
+                self['converged_to'] = self._normalize_converged_to(self['converged_to'])
         else:
             # Initialize with provided data
             super().__init__(*args, **kwargs)
@@ -58,10 +70,9 @@ class Keypoints(gpd.GeoDataFrame):
             if 'trajectory_id' in self.columns:
                 self['trajectory_id'] = self['trajectory_id'].astype('int64', errors='ignore')
             if 'stopped' in self.columns:
-                self['stopped'] = self['stopped'].astype(bool)
+                self['stopped'] = self._normalize_stopped(self['stopped'])
             if 'converged_to' in self.columns:
-                self.loc[self['converged_to'] == -1, 'converged_to'] = pd.NA
-                self['converged_to'] = self['converged_to'].astype('Int64')
+                self['converged_to'] = self._normalize_converged_to(self['converged_to'])
             if 'interpolated' in self.columns:
                 self['interpolated'] = self['interpolated'].astype('int64', errors='ignore')
             if 'orbit_num' in self.columns:

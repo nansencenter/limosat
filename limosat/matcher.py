@@ -6,6 +6,7 @@
 
 import numpy as np
 import cv2
+import pandas as pd
 from skimage.transform import AffineTransform
 from matplotlib import pyplot as plt
 from collections import defaultdict
@@ -17,6 +18,7 @@ class Matcher:
                  norm=cv2.NORM_HAMMING2,
                  descriptor_distance_max=120,
                  spatial_distance_max=100000,
+                 max_speed_m_per_day=None,
 
                  # Homography estimation parameters
                  model=AffineTransform,
@@ -36,6 +38,7 @@ class Matcher:
         self.norm = norm
         self.descriptor_distance_max = descriptor_distance_max
         self.spatial_distance_max = spatial_distance_max
+        self.max_speed_m_per_day = max_speed_m_per_day
 
         # Homography estimation parameters
         self.model = model
@@ -65,6 +68,15 @@ class Matcher:
         qui = axs[1].quiver(pos0[:, 0], pos0[:, 1], pos1[:, 0] - pos0[:, 0], pos1[:, 1] - pos0[:, 1], dist, cmap='jet', clim=np.percentile(dist, [1, 99]), angles='xy', scale_units='xy', scale=1)
         plt.colorbar(qui, ax=axs[0], shrink=0.5)
         plt.show()
+
+    @staticmethod
+    def _single_time_value(times, context):
+        valid_times = pd.Series(times).dropna().unique()
+        if len(valid_times) == 0:
+            return None
+        if len(valid_times) != 1:
+            raise ValueError(f"{context} must contain exactly one timestamp.")
+        return pd.Timestamp(valid_times[0])
 
     @log_execution_time
     def match_with_grid(self, points_poly, points_grid):
@@ -103,8 +115,24 @@ class Matcher:
 
         # 4. Loop through each group and apply the 'filter' function
         all_inliers_idx0, all_inliers_idx1, all_residuals = [], [], []
+        current_time = None
+        if 'time' in points_grid.columns and len(points_grid) > 0:
+            current_time = self._single_time_value(points_grid['time'], "Current frame points")
         for image_id, group_matches in matches_by_group.items():
-            rc_idx0_group, rc_idx1_group, residuals_group = self.filter(group_matches, pos0, pos1)
+            previous_time = None
+            if current_time is not None and len(group_matches) > 0 and 'time' in points_poly.columns:
+                group_query_idx = [match.queryIdx for match in group_matches]
+                previous_time = self._single_time_value(
+                    points_poly.iloc[group_query_idx]['time'],
+                    f"Matches for previous image_id {image_id}",
+                )
+            max_distance_m = self.motion_distance_limit(previous_time, current_time)
+            rc_idx0_group, rc_idx1_group, residuals_group = self.filter(
+                group_matches,
+                pos0,
+                pos1,
+                max_distance_m=max_distance_m,
+            )
             
             if rc_idx0_group is not None and rc_idx0_group.size > 0:
                 all_inliers_idx0.append(rc_idx0_group)
@@ -189,8 +217,16 @@ class Matcher:
         
         return combined_matches
 
+    def motion_distance_limit(self, previous_time=None, current_time=None):
+        if self.max_speed_m_per_day is not None and previous_time is not None and current_time is not None:
+            delta_t_days = max((current_time - previous_time).total_seconds() / 86400.0, 0.0)
+            return float(self.max_speed_m_per_day) * delta_t_days
+        if self.spatial_distance_max is None:
+            return None
+        return float(self.spatial_distance_max)
+
     @log_execution_time
-    def filter(self, matches, pos0, pos1):
+    def filter(self, matches, pos0, pos1, max_distance_m=None):
         bf_idx0 = np.array([m.queryIdx for m in matches]) # Indices into pos0 for ALL 'matches'
         bf_idx1 = np.array([m.trainIdx for m in matches]) # Indices into pos1 for ALL 'matches'
 
@@ -204,13 +240,17 @@ class Matcher:
             if not self.use_model_estimation: return dd_idx0, dd_idx1, None
             return None, None, None
         
-        # Filter by spatial distance
-        # Calculate spatial distances ONLY for those that passed the descriptor distance filter
-        current_spatial_distances = np.hypot(pos1[dd_idx1, 0] - pos0[dd_idx0, 0], 
-                                            pos1[dd_idx1, 1] - pos0[dd_idx0, 1])
-        gpi1_spatial_filter_mask = current_spatial_distances < self.spatial_distance_max # Mask relative to dd_idx arrays
-        md_idx0 = dd_idx0[gpi1_spatial_filter_mask] # Indices of points passing spatial (and descriptor) filter
-        md_idx1 = dd_idx1[gpi1_spatial_filter_mask]
+        if max_distance_m is not None and np.isfinite(max_distance_m) and max_distance_m >= 0:
+            current_spatial_distances = np.hypot(
+                pos1[dd_idx1, 0] - pos0[dd_idx0, 0],
+                pos1[dd_idx1, 1] - pos0[dd_idx0, 1],
+            )
+            gpi1_spatial_filter_mask = current_spatial_distances <= max_distance_m
+            md_idx0 = dd_idx0[gpi1_spatial_filter_mask]
+            md_idx1 = dd_idx1[gpi1_spatial_filter_mask]
+        else:
+            md_idx0 = dd_idx0
+            md_idx1 = dd_idx1
 
         if not self.use_model_estimation:
             return md_idx0, md_idx1, None # md_idx0, md_idx1 are the final indices if no model estimation
