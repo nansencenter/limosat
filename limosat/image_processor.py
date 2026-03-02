@@ -61,6 +61,7 @@ class ImageProcessor:
             'pruning_interval': 10,
             'temporal_window': 3,
             'convergence_radius_pixels': 5,
+            'max_speed_m_per_day': None,
             'candidate_search_max_daily_drift_m': 10000,
             'window_size': 64,
             'border_size': 128,
@@ -89,7 +90,14 @@ class ImageProcessor:
         self.pruning_interval = proc_params['pruning_interval']
         self.temporal_window = proc_params['temporal_window']
         self.convergence_radius_pixels = proc_params['convergence_radius_pixels']
-        self.candidate_search_max_daily_drift_m = proc_params['candidate_search_max_daily_drift_m']
+        self.max_speed_m_per_day = proc_params.get('max_speed_m_per_day')
+        if self.max_speed_m_per_day is not None:
+            self.max_speed_m_per_day = float(self.max_speed_m_per_day)
+        self.candidate_search_max_daily_drift_m = (
+            self.max_speed_m_per_day
+            if self.max_speed_m_per_day is not None
+            else proc_params['candidate_search_max_daily_drift_m']
+        )
         self.window_size = proc_params['window_size']
         self.border_size = proc_params['border_size']
         self.border_matched = proc_params['border_matched']
@@ -101,9 +109,16 @@ class ImageProcessor:
         self.template_size = proc_params['template_size']
         self.use_interpolation = proc_params['use_interpolation']
         self.max_interpolation_time_gap_hours = proc_params['max_interpolation_time_gap_hours']
-        self.max_valid_speed_m_per_day = proc_params['max_valid_speed_m_per_day']
+        self.max_valid_speed_m_per_day = (
+            self.max_speed_m_per_day
+            if self.max_speed_m_per_day is not None
+            else proc_params['max_valid_speed_m_per_day']
+        )
         self.window_border = proc_params['window_border']  # 0 disables weighting
         self._last_persisted_id = 0
+
+        if self.matcher is not None and self.max_speed_m_per_day is not None:
+            self.matcher.max_speed_m_per_day = self.max_speed_m_per_day
         
         # Initialize the KeypointDetector
         self.keypoint_detector = KeypointDetector(model=model, cache_dir=grid_cache_dir)
@@ -126,6 +141,16 @@ class ImageProcessor:
         if self.insitu_points is not None:
             logger.info("Validation mode enabled with in-situ points")
 
+    def _candidate_buffer_distance_m(self):
+        max_possible_drift = self.candidate_search_max_daily_drift_m * self.temporal_window
+        if self.max_speed_m_per_day is not None or self.matcher is None:
+            return max_possible_drift
+
+        spatial_distance_max = getattr(self.matcher, 'spatial_distance_max', None)
+        if spatial_distance_max is None or not np.isfinite(spatial_distance_max) or spatial_distance_max <= 0:
+            return max_possible_drift
+        return min(max_possible_drift, spatial_distance_max)
+
     def process_image(self, image_id, filename):
         """Process a single image: match existing trajectories, seed new points, update templates, optionally persist.
 
@@ -144,15 +169,7 @@ class ImageProcessor:
         img = Image(filename)
         
         # Compute buffer allowing drift INTO current frame
-        max_possible_drift = self.candidate_search_max_daily_drift_m * self.temporal_window
-        buffer_distance = min(max_possible_drift, self.matcher.spatial_distance_max)
-        logger.debug(
-            "Using buffer distance: %.2f km (max theo %.1f km over %d days, match limit %.1f km)",
-            buffer_distance / 1000.0,
-            max_possible_drift / 1000.0,
-            self.temporal_window,
-            self.matcher.spatial_distance_max / 1000.0,
-        )
+        buffer_distance = self._candidate_buffer_distance_m()
         buffered_image_poly = img.poly.buffer(buffer_distance)
         time_threshold = img.date - pd.Timedelta(days=self.temporal_window)
         points_last = self.points.last()
