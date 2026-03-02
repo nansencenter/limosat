@@ -105,17 +105,12 @@ class Matcher:
 
         # 4. Loop through each group and apply the 'filter' function
         all_inliers_idx0, all_inliers_idx1, all_residuals = [], [], []
-        current_time = points_grid.iloc[0]["time"] if "time" in points_grid.columns and not points_grid.empty else None
+        current_time = points_grid.iloc[0]['time'] if 'time' in points_grid.columns and len(points_grid) > 0 else None
         for image_id, group_matches in matches_by_group.items():
-            max_distance_m = None
-            if self.max_speed_m_per_day is not None and current_time is not None:
-                query_idx = group_matches[0].queryIdx
-                previous_time = points_poly.iloc[query_idx]["time"]
-                delta_t_days = max((current_time - previous_time).total_seconds() / 86400.0, 0.0)
-                max_distance_m = float(self.max_speed_m_per_day) * delta_t_days
-            elif self.spatial_distance_max is not None:
-                max_distance_m = float(self.spatial_distance_max)
-
+            previous_time = None
+            if current_time is not None and len(group_matches) > 0:
+                previous_time = points_poly.iloc[group_matches[0].queryIdx]['time']
+            max_distance_m = self.motion_distance_limit(previous_time, current_time)
             rc_idx0_group, rc_idx1_group, residuals_group = self.filter(
                 group_matches,
                 pos0,
@@ -206,6 +201,14 @@ class Matcher:
         
         return combined_matches
 
+    def motion_distance_limit(self, previous_time=None, current_time=None):
+        if self.max_speed_m_per_day is not None and previous_time is not None and current_time is not None:
+            delta_t_days = max((current_time - previous_time).total_seconds() / 86400.0, 0.0)
+            return float(self.max_speed_m_per_day) * delta_t_days
+        if self.spatial_distance_max is None:
+            return None
+        return float(self.spatial_distance_max)
+
     @log_execution_time
     def filter(self, matches, pos0, pos1, max_distance_m=None):
         bf_idx0 = np.array([m.queryIdx for m in matches]) # Indices into pos0 for ALL 'matches'
@@ -221,8 +224,6 @@ class Matcher:
             if not self.use_model_estimation: return dd_idx0, dd_idx1, None
             return None, None, None
         
-        # Filter by motion distance. New configs use a speed-aware group limit,
-        # while legacy configs still fall back to the fixed spatial cap.
         if max_distance_m is not None and np.isfinite(max_distance_m) and max_distance_m > 0:
             current_spatial_distances = np.hypot(
                 pos1[dd_idx1, 0] - pos0[dd_idx0, 0],
