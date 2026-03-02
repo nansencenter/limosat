@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 from shapely.geometry import Point
 
-from tests.factories import MatcherStub
+from tests.factories import MatcherStub, make_keypoints
 
 
 def load_real_module(module_name):
@@ -95,6 +95,44 @@ def test_matcher_filter_zero_motion_limit_keeps_only_exact_matches():
 
     assert idx0.tolist() == [0]
     assert idx1.tolist() == [0]
+
+
+@pytest.mark.unit
+def test_matcher_rejects_mixed_previous_times_within_group():
+    Matcher = load_real_module("limosat.matcher").Matcher
+
+    matcher = Matcher(descriptor_distance_max=100, use_model_estimation=False, max_speed_m_per_day=50000)
+    points_poly = make_keypoints(2, image_id=1, t0="2020-03-01 00:00:00", step_s=3600)
+    points_grid = make_keypoints(2, image_id=2, t0="2020-03-02 00:00:00", step_s=0)
+    matches = [
+        cv2.DMatch(_queryIdx=0, _trainIdx=0, _distance=10),
+        cv2.DMatch(_queryIdx=1, _trainIdx=1, _distance=10),
+    ]
+
+    matcher.match_with_crosscheck = lambda x0, x1: matches
+    matcher.match_with_lowe_ratio = lambda matches_bf_initial, x0, x1, pos0, pos1: matches_bf_initial
+
+    with pytest.raises(ValueError, match="previous image_id 1"):
+        matcher.match_with_grid(points_poly, points_grid)
+
+
+@pytest.mark.unit
+def test_matcher_rejects_mixed_current_frame_times():
+    Matcher = load_real_module("limosat.matcher").Matcher
+
+    matcher = Matcher(descriptor_distance_max=100, use_model_estimation=False, max_speed_m_per_day=50000)
+    points_poly = make_keypoints(2, image_id=1, t0="2020-03-01 00:00:00", step_s=0)
+    points_grid = make_keypoints(2, image_id=2, t0="2020-03-02 00:00:00", step_s=3600)
+    matches = [
+        cv2.DMatch(_queryIdx=0, _trainIdx=0, _distance=10),
+        cv2.DMatch(_queryIdx=1, _trainIdx=1, _distance=10),
+    ]
+
+    matcher.match_with_crosscheck = lambda x0, x1: matches
+    matcher.match_with_lowe_ratio = lambda matches_bf_initial, x0, x1, pos0, pos1: matches_bf_initial
+
+    with pytest.raises(ValueError, match="Current frame points"):
+        matcher.match_with_grid(points_poly, points_grid)
 
 
 @pytest.mark.unit

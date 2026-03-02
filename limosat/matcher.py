@@ -6,6 +6,7 @@
 
 import numpy as np
 import cv2
+import pandas as pd
 from skimage.transform import AffineTransform
 from matplotlib import pyplot as plt
 from collections import defaultdict
@@ -68,6 +69,15 @@ class Matcher:
         plt.colorbar(qui, ax=axs[0], shrink=0.5)
         plt.show()
 
+    @staticmethod
+    def _single_time_value(times, context):
+        valid_times = pd.Series(times).dropna().unique()
+        if len(valid_times) == 0:
+            return None
+        if len(valid_times) != 1:
+            raise ValueError(f"{context} must contain exactly one timestamp.")
+        return pd.Timestamp(valid_times[0])
+
     @log_execution_time
     def match_with_grid(self, points_poly, points_grid):
         """
@@ -105,12 +115,17 @@ class Matcher:
 
         # 4. Loop through each group and apply the 'filter' function
         all_inliers_idx0, all_inliers_idx1, all_residuals = [], [], []
-        current_time = points_grid.iloc[0]['time'] if 'time' in points_grid.columns and len(points_grid) > 0 else None
+        current_time = None
+        if 'time' in points_grid.columns and len(points_grid) > 0:
+            current_time = self._single_time_value(points_grid['time'], "Current frame points")
         for image_id, group_matches in matches_by_group.items():
             previous_time = None
-            if current_time is not None and len(group_matches) > 0:
-                # Each group references one previous image, so the first match time represents the group.
-                previous_time = points_poly.iloc[group_matches[0].queryIdx]['time']
+            if current_time is not None and len(group_matches) > 0 and 'time' in points_poly.columns:
+                group_query_idx = [match.queryIdx for match in group_matches]
+                previous_time = self._single_time_value(
+                    points_poly.iloc[group_query_idx]['time'],
+                    f"Matches for previous image_id {image_id}",
+                )
             max_distance_m = self.motion_distance_limit(previous_time, current_time)
             rc_idx0_group, rc_idx1_group, residuals_group = self.filter(
                 group_matches,
