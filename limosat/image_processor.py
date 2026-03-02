@@ -61,6 +61,7 @@ class ImageProcessor:
             'pruning_interval': 10,
             'temporal_window': 3,
             'convergence_radius_pixels': 5,
+            'max_speed_m_per_day': None,
             'candidate_search_max_daily_drift_m': 10000,
             'window_size': 64,
             'border_size': 128,
@@ -89,7 +90,13 @@ class ImageProcessor:
         self.pruning_interval = proc_params['pruning_interval']
         self.temporal_window = proc_params['temporal_window']
         self.convergence_radius_pixels = proc_params['convergence_radius_pixels']
-        self.candidate_search_max_daily_drift_m = proc_params['candidate_search_max_daily_drift_m']
+        self.max_speed_m_per_day = proc_params.get('max_speed_m_per_day')
+        if self.max_speed_m_per_day is not None:
+            self.candidate_search_max_daily_drift_m = float(self.max_speed_m_per_day)
+            self.max_valid_speed_m_per_day = float(self.max_speed_m_per_day)
+        else:
+            self.candidate_search_max_daily_drift_m = proc_params['candidate_search_max_daily_drift_m']
+            self.max_valid_speed_m_per_day = proc_params['max_valid_speed_m_per_day']
         self.window_size = proc_params['window_size']
         self.border_size = proc_params['border_size']
         self.border_matched = proc_params['border_matched']
@@ -101,7 +108,6 @@ class ImageProcessor:
         self.template_size = proc_params['template_size']
         self.use_interpolation = proc_params['use_interpolation']
         self.max_interpolation_time_gap_hours = proc_params['max_interpolation_time_gap_hours']
-        self.max_valid_speed_m_per_day = proc_params['max_valid_speed_m_per_day']
         self.window_border = proc_params['window_border']  # 0 disables weighting
         self._last_persisted_id = 0
         
@@ -143,16 +149,30 @@ class ImageProcessor:
         # Create Nansat Image object from file
         img = Image(filename)
         
-        # Compute buffer allowing drift INTO current frame
+        # Unified configs use one speed prior for admission and matching. Legacy
+        # configs retain the old admission-vs-match split.
         max_possible_drift = self.candidate_search_max_daily_drift_m * self.temporal_window
-        buffer_distance = min(max_possible_drift, self.matcher.spatial_distance_max)
-        logger.debug(
-            "Using buffer distance: %.2f km (max theo %.1f km over %d days, match limit %.1f km)",
-            buffer_distance / 1000.0,
-            max_possible_drift / 1000.0,
-            self.temporal_window,
-            self.matcher.spatial_distance_max / 1000.0,
-        )
+        if self.max_speed_m_per_day is not None:
+            buffer_distance = max_possible_drift
+            logger.debug(
+                "Using speed-based buffer distance: %.2f km (%.1f km/day over %d days)",
+                buffer_distance / 1000.0,
+                self.max_speed_m_per_day / 1000.0,
+                self.temporal_window,
+            )
+        else:
+            spatial_limit = self.matcher.spatial_distance_max
+            if spatial_limit is not None and np.isfinite(spatial_limit) and spatial_limit > 0:
+                buffer_distance = min(max_possible_drift, spatial_limit)
+            else:
+                buffer_distance = max_possible_drift
+            logger.debug(
+                "Using buffer distance: %.2f km (max theo %.1f km over %d days, match limit %.1f km)",
+                buffer_distance / 1000.0,
+                max_possible_drift / 1000.0,
+                self.temporal_window,
+                0.0 if spatial_limit is None else spatial_limit / 1000.0,
+            )
         buffered_image_poly = img.poly.buffer(buffer_distance)
         time_threshold = img.date - pd.Timedelta(days=self.temporal_window)
         points_last = self.points.last()
