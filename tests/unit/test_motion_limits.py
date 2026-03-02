@@ -80,6 +80,24 @@ def test_matcher_filter_respects_motion_distance_limit():
 
 
 @pytest.mark.unit
+def test_matcher_filter_zero_motion_limit_keeps_only_exact_matches():
+    Matcher = load_real_module("limosat.matcher").Matcher
+
+    matcher = Matcher(descriptor_distance_max=100, use_model_estimation=False)
+    matches = [
+        cv2.DMatch(_queryIdx=0, _trainIdx=0, _distance=10),
+        cv2.DMatch(_queryIdx=1, _trainIdx=1, _distance=10),
+    ]
+    pos0 = np.array([[0.0, 0.0], [0.0, 0.0]], dtype=float)
+    pos1 = np.array([[0.0, 0.0], [0.1, 0.0]], dtype=float)
+
+    idx0, idx1, _ = matcher.filter(matches, pos0, pos1, max_distance_m=0.0)
+
+    assert idx0.tolist() == [0]
+    assert idx1.tolist() == [0]
+
+
+@pytest.mark.unit
 def test_image_processor_max_speed_sets_all_motion_limits():
     ImageProcessor = load_real_module("limosat.image_processor").ImageProcessor
 

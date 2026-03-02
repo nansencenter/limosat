@@ -109,6 +109,7 @@ class Matcher:
         for image_id, group_matches in matches_by_group.items():
             previous_time = None
             if current_time is not None and len(group_matches) > 0:
+                # Each group references one previous image, so the first match time represents the group.
                 previous_time = points_poly.iloc[group_matches[0].queryIdx]['time']
             max_distance_m = self.motion_distance_limit(previous_time, current_time)
             rc_idx0_group, rc_idx1_group, residuals_group = self.filter(
@@ -224,12 +225,12 @@ class Matcher:
             if not self.use_model_estimation: return dd_idx0, dd_idx1, None
             return None, None, None
         
-        if max_distance_m is not None and np.isfinite(max_distance_m) and max_distance_m > 0:
+        if max_distance_m is not None and np.isfinite(max_distance_m) and max_distance_m >= 0:
             current_spatial_distances = np.hypot(
                 pos1[dd_idx1, 0] - pos0[dd_idx0, 0],
                 pos1[dd_idx1, 1] - pos0[dd_idx0, 1],
             )
-            gpi1_spatial_filter_mask = current_spatial_distances < max_distance_m
+            gpi1_spatial_filter_mask = current_spatial_distances <= max_distance_m
             md_idx0 = dd_idx0[gpi1_spatial_filter_mask]
             md_idx1 = dd_idx1[gpi1_spatial_filter_mask]
         else:
