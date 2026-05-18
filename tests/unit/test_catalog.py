@@ -38,17 +38,19 @@ def test_build_stac_item_collection_writes_sorted_catalog(tmp_path):
     payload = json.loads(out_path.read_text())
     assert payload["type"] == "FeatureCollection"
     ids = [feature["id"] for feature in payload["features"]]
-    assert ids == ["AAA1", "BBB2"]
+    assert ids == [file_early.stem, file_late.stem]
 
     first_props = payload["features"][0]["properties"]
     assert first_props["image_id"] == 1
+    assert first_props["scene_id"] == file_early.stem
+    assert first_props["product_uid"] == "AAA1"
     assert first_props["filename"] == file_early.name
     assert first_props["filepath"] == str(file_early)
     assert payload["features"][0]["assets"]["image"]["href"] == str(file_early)
 
 
 @pytest.mark.unit
-def test_build_stac_item_collection_skips_duplicate_uid(tmp_path):
+def test_build_stac_item_collection_keeps_uid_collisions_with_different_scene_stems(tmp_path):
     from limosat.catalog import build_stac_item_collection
 
     file1 = tmp_path / "S1A_EW_GRDM_1SDH_20250101T000000_20250101T000030_012345_ABCDEF_DUP1.tiff"
@@ -60,8 +62,27 @@ def test_build_stac_item_collection_skips_duplicate_uid(tmp_path):
     coll = build_stac_item_collection([str(file1), str(file2)], out_path=str(out_path))
     features = coll.to_dict()["features"]
 
-    assert len(features) == 1
-    assert features[0]["id"] == "DUP1"
+    assert len(features) == 2
+    assert [feature["id"] for feature in features] == [file1.stem, file2.stem]
+    assert [feature["properties"]["product_uid"] for feature in features] == ["DUP1", "DUP1"]
+
+
+@pytest.mark.unit
+def test_build_stac_item_collection_rejects_duplicate_scene_stem(tmp_path):
+    from limosat.catalog import build_stac_item_collection
+
+    scene_name = "S1A_EW_GRDM_1SDH_20250101T000000_20250101T000030_012345_ABCDEF_DUP1.tiff"
+    dir1 = tmp_path / "a"
+    dir2 = tmp_path / "b"
+    dir1.mkdir()
+    dir2.mkdir()
+    file1 = dir1 / scene_name
+    file2 = dir2 / scene_name
+    file1.touch()
+    file2.touch()
+
+    with pytest.raises(ValueError, match="Duplicate Sentinel-1 scene id"):
+        build_stac_item_collection([str(file1), str(file2)])
 
 
 @pytest.mark.unit
@@ -85,7 +106,7 @@ def test_build_stac_item_collection_orders_by_datetime_then_name(tmp_path):
     ids = [feature["id"] for feature in payload["features"]]
     image_ids = [feature["properties"]["image_id"] for feature in payload["features"]]
 
-    assert ids == ["AAAA", "BBBB", "LATE"]
+    assert ids == [same_dt_a.stem, same_dt_b.stem, later.stem]
     assert image_ids == [1, 2, 3]
 
 

@@ -20,15 +20,16 @@ _S1_PATTERN = re.compile(
 )
 
 def _parse_s1_meta(path: str):
-    """Parse S1 filename to extract start datetime (UTC), product unique id, and orbit number."""
+    """Parse S1 filename to extract start datetime (UTC), scene id, product UID, and orbit number."""
     base = os.path.basename(path)
     m = _S1_PATTERN.match(base)
     if not m:
-        return None, None, None
+        return None, None, None, None
     dt = datetime.strptime(m.group("start"), "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
+    scene_id = os.path.splitext(base)[0]
     uid = m.group("uid")
     orbit = int(m.group("orbit"))
-    return dt, uid, orbit
+    return dt, scene_id, uid, orbit
 
 
 GeometryMode = Literal["none", "bbox"]
@@ -47,23 +48,30 @@ def build_stac_item_collection(
         raise ValueError("No files provided to build_stac_item_collection.")
 
     records: List[Dict[str, Any]] = []
-    seen_uids = set()
+    seen_scene_paths: Dict[str, str] = {}
 
     for p in files:
         if check_exists and not os.path.exists(p):
             raise FileNotFoundError(f"Missing file: {p}")
 
-        dt, uid, orbit = _parse_s1_meta(p)
-        if dt is None or uid is None or uid in seen_uids:
-            # Skip non-matching filenames or duplicates by unique id
+        dt, scene_id, uid, orbit = _parse_s1_meta(p)
+        if dt is None or scene_id is None:
+            # Skip non-matching filenames.
             continue
-        seen_uids.add(uid)
+        previous_path = seen_scene_paths.get(scene_id)
+        if previous_path is not None:
+            raise ValueError(
+                f"Duplicate Sentinel-1 scene id '{scene_id}' in catalog input: "
+                f"{previous_path} and {p}"
+            )
+        seen_scene_paths[scene_id] = p
 
         records.append(
             {
                 "path": p,
                 "basename": os.path.basename(p),
                 "dt": dt,
+                "scene_id": scene_id,
                 "uid": uid,
                 "orbit": orbit,
             }
@@ -75,13 +83,15 @@ def build_stac_item_collection(
     items: List[pystac.Item] = []
     for idx, rec in enumerate(records, start=1):
         it = pystac.Item(
-            id=str(rec["uid"]),
+            id=str(rec["scene_id"]),
             geometry=None,  # minimal: no geometry
             bbox=None,      # minimal: no bbox
             datetime=rec["dt"],
             properties={},
         )
         it.properties["image_id"] = int(idx)
+        it.properties["scene_id"] = rec["scene_id"]
+        it.properties["product_uid"] = rec["uid"]
         it.properties["filename"] = rec["basename"]
         it.properties["filepath"] = rec["path"]
         if rec.get("orbit") is not None:
