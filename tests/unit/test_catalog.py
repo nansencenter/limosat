@@ -50,6 +50,23 @@ def test_build_stac_item_collection_writes_sorted_catalog(tmp_path):
 
 
 @pytest.mark.unit
+def test_build_stac_item_collection_accepts_sentinel_1c_and_1d(tmp_path):
+    from limosat.catalog import build_stac_item_collection
+
+    file_c = tmp_path / "S1C_EW_GRDM_1SDH_20260625T121834_20260625T121934_008262_010561_6559.tiff"
+    file_d = tmp_path / "S1D_EW_GRDM_1SDH_20260624T172755_20260624T172855_003381_005F22_0755.tiff"
+    file_c.touch()
+    file_d.touch()
+
+    coll = build_stac_item_collection([str(file_c), str(file_d)])
+    features = coll.to_dict()["features"]
+
+    assert len(features) == 2
+    assert [feature["id"] for feature in features] == [file_d.stem, file_c.stem]
+    assert [feature["properties"]["product_uid"] for feature in features] == ["0755", "6559"]
+
+
+@pytest.mark.unit
 def test_build_stac_item_collection_keeps_uid_collisions_with_different_scene_stems(tmp_path):
     from limosat.catalog import build_stac_item_collection
 
