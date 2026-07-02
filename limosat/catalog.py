@@ -8,9 +8,9 @@ import pystac
 import shapely
 
 # Sentinel-1 filename pattern:
-# S1B_EW_GRDM_1SDH_20200101T015602_20200101T015706_019617_025132_32F2.tiff
+# S1C_EW_GRDM_1SDH_20200101T015602_20200101T015706_019617_025132_32F2.tiff
 _S1_PATTERN = re.compile(
-    r"^S1[AB]_EW_GRDM_1SDH_"
+    r"^S1[A-D]_EW_GRDM_1SDH_"
     r"(?P<start>\d{8}T\d{6})_"
     r"(?P<end>\d{8}T\d{6})_"
     r"(?P<orbit>\d{6})_"
