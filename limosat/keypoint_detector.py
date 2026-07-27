@@ -21,15 +21,17 @@ class KeypointDetector:
     including new keypoint detection and gridded detection.
     """
 
-    def __init__(self, model, cache_dir=None):
+    def __init__(self, model, cache_dir=None, debug_recorder=None):
         """
         Initialize the keypoint detector.
 
         Parameters:
             model: Feature detection model (e.g., SIFT, ORB)
             cache_dir: Optional directory to cache deterministic grid descriptors
+            debug_recorder: Optional debug recorder for structured event output
         """
         self.model = model
+        self.debug_recorder = debug_recorder
         self.pc = ccrs.PlateCarree()
         central_longitude = -45
         true_scale_latitude = 70
@@ -45,6 +47,19 @@ class KeypointDetector:
         self.grid_cache_dir = cache_dir
         if self.grid_cache_dir:
             os.makedirs(self.grid_cache_dir, exist_ok=True)
+
+    @staticmethod
+    def _read_band(img, band_id):
+        """Read a Nansat band, including integer bands that cannot hold NaN."""
+        try:
+            return img[band_id]
+        except ValueError as exc:
+            if "cannot convert float NaN to integer" not in str(exc):
+                raise
+            array = img.vrt.dataset.GetRasterBand(band_id).ReadAsArray()
+            if array is None:
+                raise RuntimeError(f"Could not read raster band {band_id}") from exc
+            return array
 
     def _model_cache_tag(self):
         # Best-effort tag to avoid collisions across detector configs.
@@ -183,7 +198,7 @@ class KeypointDetector:
             return rawkeypoints_coords, descriptors, surviving_tags
 
         else:
-            img_band = img[polarisation].copy()
+            img_band = self._read_band(img, polarisation).copy()
             img_band[np.isnan(img_band)] = 0
             keypoints_output, descriptors = self.model.compute(img_band, raw_cv2_kps)
             if descriptors is None or not keypoints_output:
@@ -231,12 +246,12 @@ class KeypointDetector:
         if not hasattr(self, "_cache"):
             self._cache = {}
 
-        img0 = img[1]
+        img0 = self._read_band(img, 1)
         img0[np.isnan(img0)] = 0
 
         # land mask
         if img.bands().get(2, {'name': 'none'}).get('name') == 'mask':
-            landmask = img[2]
+            landmask = self._read_band(img, 2)
             img0[landmask == 2] = 0
 
         if step is None:
@@ -328,9 +343,17 @@ class KeypointDetector:
                     composite_scores = responses * weights
                     best_idx = int(np.argmax(composite_scores))
                     best_kp_in_window = kps[best_idx]
+                    response_tag = {
+                        'response': float(best_kp_in_window.response),
+                        'composite_score': float(composite_scores[best_idx]),
+                    }
                 else:
                     # Raw response selection
                     best_kp_in_window = max(kps, key=lambda kp: kp.response)
+                    response_tag = {
+                        'response': float(best_kp_in_window.response),
+                        'composite_score': None,
+                    }
 
                 # Offset to image coords
                 best_kp_in_window.pt = (
@@ -340,7 +363,7 @@ class KeypointDetector:
                 if adjust_keypoint_angle:
                     best_kp_in_window.angle = img.angle
                 best_kp_in_window.octave = octave
-                keypoints.append((best_kp_in_window, None))
+                keypoints.append((best_kp_in_window, response_tag))
 
         # Enforce outer border exclusion
         filtered_keypoints_with_tags = [
@@ -351,6 +374,23 @@ class KeypointDetector:
                 and border_size <= item[0].pt[1] <= img0.shape[0] - border_size
             )
         ]
+
+        if getattr(self.debug_recorder, "enabled", False) and filtered_keypoints_with_tags:
+            responses = [
+                tag.get('response')
+                for _, tag in filtered_keypoints_with_tags
+                if isinstance(tag, dict) and tag.get('response') is not None
+            ]
+            if responses:
+                self.debug_recorder.record(
+                    stage="keypoint_detection",
+                    event_type="info",
+                    message="response summary",
+                    min_response=float(np.min(responses)),
+                    mean_response=float(np.mean(responses)),
+                    max_response=float(np.max(responses)),
+                    count=len(responses),
+                )
 
         if not compute_descriptors:
             return filtered_keypoints_with_tags
@@ -389,13 +429,13 @@ class KeypointDetector:
             return cached
 
         # Get image data and replace NaNs with zero
-        img0 = img[1]
+        img0 = self._read_band(img, 1)
         img0[np.isnan(img0)] = 0
 
         # Optional land mask
         landmask = None
         if img.bands().get(2, {'name': 'none'}).get('name') == 'mask':
-            landmask = img[2]
+            landmask = self._read_band(img, 2)
             img0[landmask == 2] = 0
 
         # Vectorized grid generation to avoid Python double loop
@@ -464,7 +504,7 @@ class KeypointDetector:
         window_size_for_detection = max(32, patch_size + 16)
 
         keypoints_with_indices = []
-        img_band_data = img[1]
+        img_band_data = self._read_band(img, 1)
         img_height, img_width = img_band_data.shape
 
         max_center_distance_m = 300.0
@@ -556,7 +596,14 @@ class KeypointDetector:
                         angle=float(img.angle),
                         response=float(best_kp_in_patch.response)
                     )
-                    keypoints_with_indices.append((final_kp_to_add, point_row.name))
+                    keypoints_with_indices.append((
+                        final_kp_to_add,
+                        {
+                            'original_index': point_row.name,
+                            'response': float(best_kp_in_patch.response),
+                            'composite_score': None,
+                        },
+                    ))
                 
             except Exception as e:
                 logger.info(f"Error processing point original_idx {original_idx} (input index {point_row.name}): {e}")

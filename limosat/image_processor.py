@@ -44,6 +44,7 @@ class ImageProcessor:
                  return_insitu_points_on_completion=False,
                  templates=None,
                  grid_cache_dir=None,
+                 debug_recorder=None,
                  **kwargs
                 ):
         self.points = points
@@ -53,6 +54,7 @@ class ImageProcessor:
         self.run_name = run_name
         self.insitu_points = insitu_points
         self.return_insitu_points_on_completion = return_insitu_points_on_completion
+        self.debug_recorder = debug_recorder
 
         # Define default parameters
         default_params = {
@@ -130,9 +132,15 @@ class ImageProcessor:
 
         if self.matcher is not None and self.max_speed_m_per_day is not None:
             self.matcher.max_speed_m_per_day = self.max_speed_m_per_day
+        if hasattr(self.matcher, "debug_recorder") and self.matcher.debug_recorder is None:
+            self.matcher.debug_recorder = self.debug_recorder
         
         # Initialize the KeypointDetector
-        self.keypoint_detector = KeypointDetector(model=model, cache_dir=grid_cache_dir)
+        self.keypoint_detector = KeypointDetector(
+            model=model,
+            cache_dir=grid_cache_dir,
+            debug_recorder=self.debug_recorder,
+        )
 
         # Initialize trajectory_id column in insitu_points if in validation mode
         if self.insitu_points is not None:
@@ -460,31 +468,71 @@ class ImageProcessor:
             self.points = self.points.append(points_new) # This assigns final trajectory_ids to the points_new portion
             
             appended_points_gdf = self.points.iloc[current_self_points_len:]
+            appended_points_gdf_reset = appended_points_gdf.reset_index(drop=True)
             logger.info(f"Added {len(appended_points_gdf)} new points (total: {len(self.points)})")
+
+            if getattr(self.debug_recorder, "enabled", False) and surviving_tags is not None:
+                for i, tag in enumerate(surviving_tags):
+                    if not isinstance(tag, dict) or tag.get('response') is None:
+                        continue
+                    if i >= len(appended_points_gdf_reset):
+                        break
+                    self.debug_recorder.record(
+                        stage="seed_response",
+                        event_type="info",
+                        message="seed response recorded",
+                        trajectory_id=int(appended_points_gdf_reset.iloc[i]['trajectory_id']),
+                        step=image_id,
+                        response=float(tag['response']),
+                        composite_score=(
+                            float(tag['composite_score'])
+                            if tag.get('composite_score') is not None
+                            else None
+                        ),
+                    )
 
             # Link insitu_points to final trajectory_ids using surviving_tags and store seed geometry metadata
             if self.insitu_points is not None and surviving_tags is not None and not appended_points_gdf.empty:
-                appended_points_gdf_reset = appended_points_gdf.reset_index(drop=True)
-
                 # Ensure columns exist (created lazily if missing)
                 for col in ['seed_kp_geometry', 'seed_image_id', 'seed_time']:
                     if col not in self.insitu_points.columns:
                         self.insitu_points[col] = pd.NA
 
                 if len(surviving_tags) == len(appended_points_gdf_reset):
-                    for i, original_df_idx_tag in enumerate(surviving_tags):
-                        if original_df_idx_tag is not None:  # tag is index in self.insitu_points
-                            final_tid = appended_points_gdf_reset.iloc[i]['trajectory_id']
-                            seed_geom = appended_points_gdf_reset.iloc[i]['geometry']
+                    for col in ['seed_kp_response', 'seed_kp_composite_score']:
+                        if col not in self.insitu_points.columns:
+                            self.insitu_points[col] = pd.NA
 
-                            self.insitu_points.loc[original_df_idx_tag, 'trajectory_id'] = final_tid
-                            self.insitu_points.loc[original_df_idx_tag, 'seed_kp_geometry'] = seed_geom
-                            self.insitu_points.loc[original_df_idx_tag, 'seed_image_id'] = image_id
-                            self.insitu_points.loc[original_df_idx_tag, 'seed_time'] = img.date
+                    for i, tag in enumerate(surviving_tags):
+                        if isinstance(tag, dict):
+                            original_df_idx_tag = tag.get('original_index')
+                            seed_response = tag.get('response')
+                            seed_composite_score = tag.get('composite_score')
+                        else:
+                            original_df_idx_tag = tag
+                            seed_response = None
+                            seed_composite_score = None
 
-                            logger.debug(
-                                f"Linked insitu_point (original index {original_df_idx_tag}) to trajectory_id {final_tid} and stored seed_kp_geometry"
-                            )
+                        if original_df_idx_tag is None:
+                            continue
+
+                        final_tid = appended_points_gdf_reset.iloc[i]['trajectory_id']
+                        seed_geom = appended_points_gdf_reset.iloc[i]['geometry']
+
+                        self.insitu_points.loc[original_df_idx_tag, 'trajectory_id'] = final_tid
+                        self.insitu_points.loc[original_df_idx_tag, 'seed_kp_geometry'] = seed_geom
+                        self.insitu_points.loc[original_df_idx_tag, 'seed_image_id'] = image_id
+                        self.insitu_points.loc[original_df_idx_tag, 'seed_time'] = img.date
+                        if seed_response is not None:
+                            self.insitu_points.loc[original_df_idx_tag, 'seed_kp_response'] = seed_response
+                        if seed_composite_score is not None:
+                            self.insitu_points.loc[original_df_idx_tag, 'seed_kp_composite_score'] = seed_composite_score
+
+                        logger.debug(
+                            "Linked insitu_point index %s to trajectory_id %s and stored seed metadata",
+                            original_df_idx_tag,
+                            final_tid,
+                        )
                 else:
                     logger.warning(
                         "Mismatch between surviving_tags (%d) and appended_points_gdf_reset (%d). Skipping linking.",
@@ -585,7 +633,8 @@ class ImageProcessor:
                 img=img,
                 max_interpolation_time_gap_hours=self.max_interpolation_time_gap_hours,
                 border_size=self.border_size,
-                model_type=AffineTransform
+                model_type=AffineTransform,
+                debug_recorder=self.debug_recorder,
             )
             if points_matched is None or points_matched.empty:
                 logger.warning("Interpolation resulted in no valid points. Proceeding with only matched points.")

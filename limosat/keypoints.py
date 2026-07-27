@@ -159,6 +159,10 @@ class Keypoints(gpd.GeoDataFrame):
     def create(cls, keypoints, descriptors, img, image_id, orbit_num):
         xy = img.transform_points(keypoints[:, 0], keypoints[:, 1], DstToSrc=0, dst_srs=cls.srs)
         N = len(xy[0])
+        # Some sensors do not expose an orbit number. Keep the integer schema
+        # and give each such image a distinct value so valid cross-image
+        # matching is not suppressed by the same-orbit filter.
+        orbit_value = int(orbit_num) if orbit_num is not None else -int(image_id)
         new_data = {
             'image_id': np.full(N, image_id, dtype=np.int32),
             'is_last': np.ones(N, dtype=np.int32),
@@ -169,7 +173,7 @@ class Keypoints(gpd.GeoDataFrame):
             'corr': np.zeros(N),
             'time': [img.date] * N,
             'interpolated': np.zeros(N, dtype=np.int32),
-            'orbit_num': np.full(N, orbit_num, dtype=np.int32),
+            'orbit_num': np.full(N, orbit_value, dtype=np.int32),
             'stopped': np.zeros(N, dtype=bool),
             'converged_to': [None] * N,
         }
