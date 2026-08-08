@@ -108,28 +108,16 @@ def log_execution_time(func):
     return wrapper   
 
 def extract_date(filename):
-    """
-    Extract the date from the filename, convert to pandas timestam
-    
-    Parameters:
-        filename (str): The filename to extract the date from.
-    
-    Returns:
-        datetime or None: The extracted date
-    """
+    """Extract an acquisition timestamp from a supported image filename."""
     base_filename = os.path.basename(filename)
-    pattern = r"(\d{8}T\d{6})"
-    match = re.search(pattern, base_filename)
-    if match:
-        date_str = match.group(1)
-        try:
-            date = datetime.strptime(date_str, "%Y%m%dT%H%M%S")
-            date = pd.Timestamp(date)
-            return date
-        except ValueError as ve:
-            logger.error(f"Error parsing date from filename '{filename}': {ve}")
-            return None
-    else:
+    match = re.search(r"(\d{8})[T_](\d{6})", base_filename)
+    if not match:
+        return None
+
+    try:
+        return pd.Timestamp(datetime.strptime("".join(match.groups()), "%Y%m%d%H%M%S"))
+    except ValueError as ve:
+        logger.error(f"Error parsing date from filename '{filename}': {ve}")
         return None
 
 

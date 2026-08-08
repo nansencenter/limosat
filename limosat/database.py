@@ -17,7 +17,8 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 import xarray as xr
-from sqlalchemy import text, Float, Text, DateTime, inspect, Integer
+from shapely import wkt as shapely_wkt
+from sqlalchemy import text, Float, Text, DateTime, inspect, Integer, bindparam
 from sqlalchemy import Boolean
 from .utils import logger, log_execution_time
 
@@ -35,13 +36,15 @@ class DriftDatabase:
         self.engine = engine
         self.zarr_path = zarr_path
         self.run_name = run_name
+        self.dialect_name = self.engine.dialect.name if self.engine is not None else None
+        self.is_postgis = self.dialect_name in {"postgresql", "postgres"}
 
         # Define database column types
         self.dtype = {
             'image_id': Integer(),
             'is_last': Integer(),
             'trajectory_id': Integer(), 
-            'geometry': 'geometry',
+            'geometry': 'geometry' if self.is_postgis else Text(),
             'descriptors': Text(),
             'angle': Float(),
             'corr': Float(),
@@ -51,6 +54,41 @@ class DriftDatabase:
             'stopped': Boolean(),
             'converged_to': Integer(),
         }
+
+    @staticmethod
+    def _chunked(values, chunk_size):
+        """Yield successive chunks from a list-like container."""
+        for i in range(0, len(values), chunk_size):
+            yield values[i:i + chunk_size]
+
+    @staticmethod
+    def _sqlite_max_variables(connection):
+        """
+        Return SQLite variable limit for bound parameters.
+        Falls back to 999 if the runtime limit cannot be determined.
+        """
+        default_limit = 999
+        try:
+            value = connection.execute(text("PRAGMA max_variable_number")).scalar()
+            if value is not None:
+                parsed = int(value)
+                if parsed > 0:
+                    return parsed
+        except Exception:
+            pass
+
+        try:
+            options = connection.execute(text("PRAGMA compile_options")).fetchall()
+            for row in options:
+                opt = row[0] if row else None
+                if isinstance(opt, str) and opt.startswith("MAX_VARIABLE_NUMBER="):
+                    parsed = int(opt.split("=", 1)[1])
+                    if parsed > 0:
+                        return parsed
+        except Exception:
+            pass
+
+        return default_limit
 
     def prepare_run_state(self, clear_existing_data=False, temporal_window_days=None):
         """
@@ -86,68 +124,130 @@ class DriftDatabase:
     @log_execution_time
     def save(self, points, templates, last_persisted_id, insitu_points=None):
         if points.empty:
-             logger.info("No points to save.")
-             if templates is not None and templates.trajectory_ids.size > 0 and self.zarr_path:
-                 try:
-                      logger.info("Saving empty points state, but saving templates...")
-                      templates.data.to_dataset(name="template_data").to_zarr(self.zarr_path, mode="w")
-                      logger.info(f"Successfully persisted {templates.trajectory_ids.size} templates (with 0 new points).")
-                      return True
-                 except Exception as e:
-                      logger.error(f"Failed to save templates even with no points: {e}", exc_info=True)
-                      return False
-             return True
+            logger.info("No points to save.")
+            if templates is not None and templates.trajectory_ids.size > 0 and self.zarr_path:
+                try:
+                    logger.info("Saving empty points state, but saving templates...")
+                    templates.data.to_dataset(name="template_data").to_zarr(self.zarr_path, mode="w")
+                    logger.info(f"Successfully persisted {templates.trajectory_ids.size} templates (with 0 new points).")
+                    return True
+                except Exception as e:
+                    logger.error(f"Failed to save templates even with no points: {e}", exc_info=True)
+                    return False
+            return True
 
         try:
-            # --- 1. Prepare Points Delta ---
-            points_image_id_series = points['image_id'].astype(int)
+            points = points.copy()
+            points = points.set_crs('EPSG:3413')
+
+            # Identify existing trajectories in DB
+            with self.engine.connect() as connection:
+                inspector = inspect(connection.engine)
+                table_exists = inspector.has_table(self.run_name)
+
+                if table_exists:
+                    try:
+                        existing_traj_ids_df = pd.read_sql(
+                            text(f'SELECT DISTINCT "trajectory_id" FROM "{self.run_name}"'),
+                            con=connection
+                        )
+                        existing_traj_ids = set(existing_traj_ids_df['trajectory_id'].dropna().astype(int).tolist())
+                    except Exception as e:
+                        logger.warning(f"Could not fetch existing trajectory ids: {e}. Assuming none.")
+                        existing_traj_ids = set()
+                else:
+                    existing_traj_ids = set()
+
+            points['trajectory_id'] = points['trajectory_id'].astype('Int64')
+
+            # New trajectories are those not present in DB yet
+            is_new_traj = ~points['trajectory_id'].isin(existing_traj_ids)
+            is_new_traj = is_new_traj.fillna(False)
+
+            # For existing trajectories, keep only rows newer than last_persisted_id
             last_persisted_id_int = int(last_persisted_id)
-            mask_series = points_image_id_series > last_persisted_id_int
-            points_delta = points.loc[mask_series].copy()
+            is_newer_than_last = points['image_id'].astype(int) > last_persisted_id_int
+
+            # Build delta:
+            #  - include ALL rows for brand new trajectories (so we include the seed row),
+            #  - include ONLY newer rows for already-known trajectories
+            points_delta = pd.concat([
+                points[is_new_traj],
+                points[~is_new_traj & is_newer_than_last]
+            ], ignore_index=True)
 
             if points_delta.empty:
                 logger.info("No new points detected since last save.")
                 if templates is not None and templates.trajectory_ids.size > 0 and self.zarr_path:
                     logger.info("Saving templates only (no new points).")
-                    templates.data.to_dataset(name="template_data").to_zarr(self.zarr_path, mode="w") 
+                    templates.data.to_dataset(name="template_data").to_zarr(self.zarr_path, mode="w")
                     return True
                 return True
 
-            logger.info(f"Processing {len(points_delta)} new/updated points for persistence.")
-            points_delta = points_delta.set_crs('EPSG:3413')
+            # Serialize descriptors only for is_last rows
             if 'descriptors' in points_delta.columns:
                 points_delta['descriptors'] = points_delta.apply(
-                    lambda row: self._serialize_descriptors(row['descriptors']) if row['is_last'] == 1 else None,
+                    lambda row: self._serialize_descriptors(row['descriptors']) if row.get('is_last', 0) == 1 else None,
                     axis=1
                 )
-
 
             with self.engine.connect() as connection:
                 with connection.begin():
                     updated_traj_ids = [
-                        int(tid) for tid in points_delta['trajectory_id'].unique().tolist()
-                        if pd.notna(tid)
+                        int(tid) for tid in points_delta['trajectory_id'].dropna().unique().tolist()
                     ]
+                    sqlite_var_limit = None
+                    if not self.is_postgis:
+                        sqlite_var_limit = self._sqlite_max_variables(connection)
+
                     inspector = inspect(connection.engine)
-                    table_exists = inspector.has_table(self.run_name, schema=connection.dialect.default_schema_name)
+                    table_exists = inspector.has_table(self.run_name)
+
                     if updated_traj_ids and table_exists:
                         update_sql = text(f"""
-                            UPDATE {self.run_name}
+                            UPDATE "{self.run_name}"
                             SET is_last = 0
-                            WHERE is_last = 1 AND trajectory_id = ANY(:traj_ids)
-                        """)
-                        result = connection.execute(update_sql, {"traj_ids": updated_traj_ids})
-                        logger.debug(f"Updated is_last=0 for {result.rowcount} previous points in DB.")
+                            WHERE is_last = 1 AND trajectory_id IN :traj_ids
+                        """).bindparams(bindparam("traj_ids", expanding=True))
+                        if self.is_postgis:
+                            result = connection.execute(update_sql, {"traj_ids": updated_traj_ids})
+                            logger.debug(f"Updated is_last=0 for {result.rowcount} previous points in DB.")
+                        else:
+                            # SQLite has a bound-variable limit; chunk large IN clauses.
+                            update_chunk_size = max(1, int(sqlite_var_limit * 0.9))
+                            rows_updated = 0
+                            for traj_chunk in self._chunked(updated_traj_ids, update_chunk_size):
+                                result = connection.execute(update_sql, {"traj_ids": traj_chunk})
+                                if result.rowcount and result.rowcount > 0:
+                                    rows_updated += result.rowcount
+                            logger.debug(f"Updated is_last=0 for {rows_updated} previous points in DB.")
                     elif updated_traj_ids:
-                        logger.debug(f"Table '{self.run_name}' does not exist yet. It will be created.")
+                        logger.debug(f'Table "{self.run_name}" does not exist yet. It will be created.')
 
-                    points_delta.to_postgis(
-                        self.run_name,
-                        connection,
-                        if_exists='append',
-                        index=False,
-                        dtype=self.dtype
-                    )
+                    if self.is_postgis:
+                        points_delta.to_postgis(
+                            self.run_name,
+                            connection,
+                            if_exists='append',
+                            index=False,
+                            dtype=self.dtype
+                        )
+                    else:
+                        points_delta_sql = pd.DataFrame(points_delta).copy()
+                        if 'geometry' in points_delta_sql.columns:
+                            points_delta_sql['geometry'] = points_delta_sql['geometry'].apply(
+                                lambda geom: geom.wkt if geom is not None else None
+                            )
+                        n_insert_cols = max(1, len(points_delta_sql.columns))
+                        sqlite_insert_chunk = max(1, int(sqlite_var_limit * 0.9) // n_insert_cols)
+                        points_delta_sql.to_sql(
+                            self.run_name,
+                            connection,
+                            if_exists='append',
+                            index=False,
+                            method='multi',
+                            chunksize=sqlite_insert_chunk
+                        )
                     logger.debug(f"Appended {len(points_delta)} points to database.")
 
             if templates is not None and templates.trajectory_ids.size > 0:
@@ -235,35 +335,64 @@ class DriftDatabase:
         try:
             with self.engine.connect() as connection:
                 with connection.begin():
-                    # Create table using an empty GeoDataFrame to define schema
-                    empty_gdf = gpd.GeoDataFrame({
-                        'image_id': pd.Series(dtype='int64'),
-                        'is_last': pd.Series(dtype='int64'),
-                        'trajectory_id': pd.Series(dtype='int64'),
-                        'geometry': gpd.GeoSeries(dtype='geometry'),
-                        'descriptors': pd.Series(dtype='object'),
-                        'angle': pd.Series(dtype='float64'),
-                        'corr': pd.Series(dtype='float64'),
-                        'time': pd.Series(dtype='datetime64[ns]'),
-                        'interpolated': pd.Series(dtype='int64'),
-                        'orbit_num': pd.Series(dtype='int64'),
-                        'stopped': pd.Series(dtype='bool'),
-                        'converged_to': pd.Series(dtype='Int64'),
-                    }, crs='EPSG:3413')
-                    
-                    empty_gdf.to_postgis(
-                        self.run_name,
-                        connection,
-                        if_exists='fail',
-                        index=False,
-                        dtype=self.dtype
-                    )
+                    if self.is_postgis:
+                        # Create table using an empty GeoDataFrame to define schema
+                        empty_gdf = gpd.GeoDataFrame({
+                            'image_id': pd.Series(dtype='int64'),
+                            'is_last': pd.Series(dtype='int64'),
+                            'trajectory_id': pd.Series(dtype='int64'),
+                            'geometry': gpd.GeoSeries(dtype='geometry'),
+                            'descriptors': pd.Series(dtype='object'),
+                            'angle': pd.Series(dtype='float64'),
+                            'corr': pd.Series(dtype='float64'),
+                            'time': pd.Series(dtype='datetime64[ns]'),
+                            'interpolated': pd.Series(dtype='int64'),
+                            'orbit_num': pd.Series(dtype='int64'),
+                            'stopped': pd.Series(dtype='bool'),
+                            'converged_to': pd.Series(dtype='Int64'),
+                        }, crs='EPSG:3413')
+
+                        empty_gdf.to_postgis(
+                            self.run_name,
+                            connection,
+                            if_exists='fail',
+                            index=False,
+                            dtype=self.dtype
+                        )
+                    else:
+                        empty_df = pd.DataFrame({
+                            'image_id': pd.Series(dtype='int64'),
+                            'is_last': pd.Series(dtype='int64'),
+                            'trajectory_id': pd.Series(dtype='int64'),
+                            'geometry': pd.Series(dtype='object'),
+                            'descriptors': pd.Series(dtype='object'),
+                            'angle': pd.Series(dtype='float64'),
+                            'corr': pd.Series(dtype='float64'),
+                            'time': pd.Series(dtype='datetime64[ns]'),
+                            'interpolated': pd.Series(dtype='int64'),
+                            'orbit_num': pd.Series(dtype='int64'),
+                            'stopped': pd.Series(dtype='bool'),
+                            'converged_to': pd.Series(dtype='Int64'),
+                        })
+                        empty_df.to_sql(
+                            self.run_name,
+                            connection,
+                            if_exists='fail',
+                            index=False
+                        )
                     logger.info(f"Table '{self.run_name}' created successfully.")
 
                     # Create performance index
-                    index_name = f"idx_{self.run_name}_traj_last"
-                    schema = connection.dialect.default_schema_name
-                    index_sql = text(f'CREATE INDEX IF NOT EXISTS {index_name} ON "{schema}"."{self.run_name}" (trajectory_id, is_last)')
+                    index_name = f"idx_{self.run_name}_traj_last".replace('-', '_')
+                    if self.is_postgis:
+                        schema = connection.dialect.default_schema_name
+                        index_sql = text(
+                            f'CREATE INDEX IF NOT EXISTS {index_name} ON "{schema}"."{self.run_name}" (trajectory_id, is_last)'
+                        )
+                    else:
+                        index_sql = text(
+                            f'CREATE INDEX IF NOT EXISTS {index_name} ON "{self.run_name}" (trajectory_id, is_last)'
+                        )
                     connection.execute(index_sql)
                     logger.info(f"Performance index '{index_name}' created.")
         except Exception as e:
@@ -281,8 +410,21 @@ class DriftDatabase:
         if not os.path.exists(self.zarr_path):
             raise FileNotFoundError(f"Cannot resume: Zarr path not found at '{self.zarr_path}'")
 
-        sql_query = f"SELECT * FROM {self.run_name} WHERE is_last = 1"
-        points_last_from_db = gpd.read_postgis(sql_query, self.engine, geom_col='geometry', coerce_float=False)
+        sql_query = text(f'SELECT * FROM "{self.run_name}" WHERE is_last = 1')
+        with self.engine.connect() as connection:
+            max_trajectory_id = connection.execute(
+                text(f'SELECT MAX(trajectory_id) FROM "{self.run_name}"')
+            ).scalar()
+        next_trajectory_id = 0 if max_trajectory_id is None else int(max_trajectory_id) + 1
+        if self.is_postgis:
+            points_last_from_db = gpd.read_postgis(sql_query, self.engine, geom_col='geometry', coerce_float=False)
+        else:
+            points_last_from_db = pd.read_sql(sql_query, self.engine)
+            if not points_last_from_db.empty:
+                points_last_from_db['geometry'] = points_last_from_db['geometry'].apply(
+                    lambda geom_wkt: shapely_wkt.loads(geom_wkt) if isinstance(geom_wkt, str) and geom_wkt else None
+                )
+                points_last_from_db = gpd.GeoDataFrame(points_last_from_db, geometry='geometry', crs='EPSG:3413')
         
         if points_last_from_db.empty:
             raise ValueError("Cannot resume: No points with is_last=1 found in database.")
@@ -299,7 +441,7 @@ class DriftDatabase:
             raise ValueError(f"Cannot resume: No 'is_last=1' points survived time filter (>= {time_threshold})")
 
         active_points_gdf['descriptors'] = active_points_gdf['descriptors'].apply(self.deserialize_descriptors)
-        points = Keypoints._from_gdf(active_points_gdf)
+        points = Keypoints._from_gdf(active_points_gdf, next_trajectory_id=next_trajectory_id)
 
         templates = Templates()
         with xr.open_zarr(self.zarr_path) as ds:

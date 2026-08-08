@@ -6,6 +6,7 @@
 
 import numpy as np
 import cv2
+import pandas as pd
 from skimage.transform import AffineTransform
 from matplotlib import pyplot as plt
 from collections import defaultdict
@@ -17,6 +18,7 @@ class Matcher:
                  norm=cv2.NORM_HAMMING2,
                  descriptor_distance_max=120,
                  spatial_distance_max=100000,
+                 max_speed_m_per_day=None,
 
                  # Homography estimation parameters
                  model=AffineTransform,
@@ -30,12 +32,16 @@ class Matcher:
                  knn_k=4,
 
                  # Visualization
-                 plot=False):
+                 plot=False,
+
+                 # Debug recording
+                 debug_recorder=None):
 
         # General matching parameters
         self.norm = norm
         self.descriptor_distance_max = descriptor_distance_max
         self.spatial_distance_max = spatial_distance_max
+        self.max_speed_m_per_day = max_speed_m_per_day
 
         # Homography estimation parameters
         self.model = model
@@ -55,6 +61,7 @@ class Matcher:
         self.lowe_ratio = lowe_ratio
         self.knn_k = knn_k
         self.plot = plot
+        self.debug_recorder = debug_recorder
 
     def plot_quiver(self, pos0, pos1, dist):
         u = pos1[:, 0] - pos0[:, 0]
@@ -65,6 +72,47 @@ class Matcher:
         qui = axs[1].quiver(pos0[:, 0], pos0[:, 1], pos1[:, 0] - pos0[:, 0], pos1[:, 1] - pos0[:, 1], dist, cmap='jet', clim=np.percentile(dist, [1, 99]), angles='xy', scale_units='xy', scale=1)
         plt.colorbar(qui, ax=axs[0], shrink=0.5)
         plt.show()
+
+    @staticmethod
+    def _single_time_value(times, context):
+        valid_times = pd.Series(times).dropna().unique()
+        if len(valid_times) == 0:
+            return None
+        if len(valid_times) != 1:
+            raise ValueError(f"{context} must contain exactly one timestamp.")
+        return pd.Timestamp(valid_times[0])
+
+    def _record_filter_event(
+        self,
+        *,
+        image_id,
+        event_type,
+        message,
+        num_initial_matches,
+        num_descriptor_passed,
+        num_spatial_passed,
+        num_homography_inliers,
+        spatial_distance_limit,
+    ):
+        if not getattr(self.debug_recorder, "enabled", False):
+            return
+
+        self.debug_recorder.record_matcher_filter(
+            stage="matcher_filter",
+            trajectory_id=None,
+            step=image_id,
+            event_type=event_type,
+            message=message,
+            num_initial_matches=num_initial_matches,
+            num_descriptor_passed=num_descriptor_passed,
+            num_spatial_passed=num_spatial_passed,
+            num_homography_inliers=num_homography_inliers,
+            descriptor_distance_max=self.descriptor_distance_max,
+            spatial_distance_max=spatial_distance_limit,
+            model_threshold=self.model_threshold,
+            min_homography_inliers=self.min_homography_inliers,
+            estimation_method=self.estimation_method_name,
+        )
 
     @log_execution_time
     def match_with_grid(self, points_poly, points_grid):
@@ -87,8 +135,20 @@ class Matcher:
         # 2. Generate an enhanced set of candidate matches
         # Start with the high-confidence cross-check matches...
         base_matches = self.match_with_crosscheck(x0, x1)
+        num_crosscheck_matches = len(base_matches)
         candidate_matches = self.match_with_lowe_ratio(base_matches, x0, x1, pos0, pos1)
         logger.info(f"Total candidate matches after cross-check and Lowe's ratio: {len(candidate_matches)}")
+        if getattr(self.debug_recorder, "enabled", False):
+            step = points_grid['image_id'].iloc[0] if 'image_id' in points_grid.columns and len(points_grid) > 0 else None
+            self.debug_recorder.record(
+                stage="bf_matcher",
+                event_type="info",
+                message="candidate matches generated",
+                step=step,
+                num_crosscheck_matches=num_crosscheck_matches,
+                num_lowe_additional=len(candidate_matches) - num_crosscheck_matches,
+                num_total_candidates=len(candidate_matches),
+            )
 
         # 3. Group all candidate matches by their source image_id
         matches_by_group = defaultdict(list)
@@ -103,8 +163,25 @@ class Matcher:
 
         # 4. Loop through each group and apply the 'filter' function
         all_inliers_idx0, all_inliers_idx1, all_residuals = [], [], []
+        current_time = None
+        if 'time' in points_grid.columns and len(points_grid) > 0:
+            current_time = self._single_time_value(points_grid['time'], "Current frame points")
         for image_id, group_matches in matches_by_group.items():
-            rc_idx0_group, rc_idx1_group, residuals_group = self.filter(group_matches, pos0, pos1)
+            previous_time = None
+            if current_time is not None and len(group_matches) > 0 and 'time' in points_poly.columns:
+                group_query_idx = [match.queryIdx for match in group_matches]
+                previous_time = self._single_time_value(
+                    points_poly.iloc[group_query_idx]['time'],
+                    f"Matches for previous image_id {image_id}",
+                )
+            max_distance_m = self.motion_distance_limit(previous_time, current_time)
+            rc_idx0_group, rc_idx1_group, residuals_group = self.filter(
+                group_matches,
+                pos0,
+                pos1,
+                max_distance_m=max_distance_m,
+                image_id=image_id,
+            )
             
             if rc_idx0_group is not None and rc_idx0_group.size > 0:
                 all_inliers_idx0.append(rc_idx0_group)
@@ -114,6 +191,15 @@ class Matcher:
         # 5. Check if any valid groups were found at all
         if not all_inliers_idx0:
             logger.warning("No valid inlier groups found after filtering.")
+            if getattr(self.debug_recorder, "enabled", False):
+                step = points_grid['image_id'].iloc[0] if 'image_id' in points_grid.columns and len(points_grid) > 0 else None
+                self.debug_recorder.record(
+                    stage="bf_matcher",
+                    event_type="failure",
+                    message="no valid inlier groups found after filtering",
+                    step=step,
+                    num_groups=len(matches_by_group),
+                )
             return None, None, None
 
         # 6. Aggregate results and return
@@ -150,6 +236,13 @@ class Matcher:
         Applies a Lowe's ratio-like test using k=4 neighbors to find additional matches.
         Relies on the subsequent self.filter call for descriptor and spatial distance filtering.
         """
+        if x1 is None or x1.shape[0] < self.knn_k:
+            n_train = 0 if x1 is None else int(x1.shape[0])
+            logger.debug(
+                f"Skipping Lowe's ratio test: train descriptors ({n_train}) < knn_k ({self.knn_k})."
+            )
+            return list(matches_bf_initial)
+
         index_params = dict(algorithm=6, table_number=12, key_size=20, multi_probe_level=2)
         search_params = {}
         knn_matcher = cv2.FlannBasedMatcher(index_params, search_params)
@@ -182,10 +275,24 @@ class Matcher:
         
         return combined_matches
 
+    def motion_distance_limit(self, previous_time=None, current_time=None):
+        if self.max_speed_m_per_day is not None and previous_time is not None and current_time is not None:
+            delta_t_days = max((current_time - previous_time).total_seconds() / 86400.0, 0.0)
+            return float(self.max_speed_m_per_day) * delta_t_days
+        if self.spatial_distance_max is None:
+            return None
+        return float(self.spatial_distance_max)
+
     @log_execution_time
-    def filter(self, matches, pos0, pos1):
+    def filter(self, matches, pos0, pos1, max_distance_m=None, image_id=None):
         bf_idx0 = np.array([m.queryIdx for m in matches]) # Indices into pos0 for ALL 'matches'
         bf_idx1 = np.array([m.trainIdx for m in matches]) # Indices into pos1 for ALL 'matches'
+        num_initial = len(matches)
+        spatial_distance_limit = (
+            float(max_distance_m)
+            if max_distance_m is not None and np.isfinite(max_distance_m)
+            else self.spatial_distance_max
+        )
 
         # Filter by descriptor distance
         # descriptor_distance is already calculated for ALL 'matches' (initial crosscheck)
@@ -193,23 +300,64 @@ class Matcher:
         gpi0_desc_filter_mask = descriptor_distance < self.descriptor_distance_max 
         dd_idx0 = bf_idx0[gpi0_desc_filter_mask] # Indices of points passing descriptor distance filter
         dd_idx1 = bf_idx1[gpi0_desc_filter_mask]
+        num_descriptor_passed = dd_idx0.size
         if dd_idx0.size == 0: # No points passed descriptor distance filter
+            self._record_filter_event(
+                image_id=image_id,
+                event_type="failure",
+                message="no matches passed descriptor distance filter",
+                num_initial_matches=num_initial,
+                num_descriptor_passed=0,
+                num_spatial_passed=0,
+                num_homography_inliers=0,
+                spatial_distance_limit=spatial_distance_limit,
+            )
             if not self.use_model_estimation: return dd_idx0, dd_idx1, None
             return None, None, None
         
-        # Filter by spatial distance
-        # Calculate spatial distances ONLY for those that passed the descriptor distance filter
-        current_spatial_distances = np.hypot(pos1[dd_idx1, 0] - pos0[dd_idx0, 0], 
-                                            pos1[dd_idx1, 1] - pos0[dd_idx0, 1])
-        gpi1_spatial_filter_mask = current_spatial_distances < self.spatial_distance_max # Mask relative to dd_idx arrays
-        md_idx0 = dd_idx0[gpi1_spatial_filter_mask] # Indices of points passing spatial (and descriptor) filter
-        md_idx1 = dd_idx1[gpi1_spatial_filter_mask]
+        if max_distance_m is not None and np.isfinite(max_distance_m) and max_distance_m >= 0:
+            current_spatial_distances = np.hypot(
+                pos1[dd_idx1, 0] - pos0[dd_idx0, 0],
+                pos1[dd_idx1, 1] - pos0[dd_idx0, 1],
+            )
+            gpi1_spatial_filter_mask = current_spatial_distances <= max_distance_m
+            md_idx0 = dd_idx0[gpi1_spatial_filter_mask]
+            md_idx1 = dd_idx1[gpi1_spatial_filter_mask]
+        else:
+            md_idx0 = dd_idx0
+            md_idx1 = dd_idx1
+        num_spatial_passed = md_idx0.size
+
+        if md_idx0.size == 0:
+            self._record_filter_event(
+                image_id=image_id,
+                event_type="failure",
+                message="no matches passed spatial distance filter",
+                num_initial_matches=num_initial,
+                num_descriptor_passed=num_descriptor_passed,
+                num_spatial_passed=0,
+                num_homography_inliers=0,
+                spatial_distance_limit=spatial_distance_limit,
+            )
+            if not self.use_model_estimation:
+                return md_idx0, md_idx1, None
+            return None, None, None
 
         if not self.use_model_estimation:
             return md_idx0, md_idx1, None # md_idx0, md_idx1 are the final indices if no model estimation
 
         if md_idx0.size < 4:
             logger.warning("Warning: Insufficient matches for model estimation (minimum 4 required)")
+            self._record_filter_event(
+                image_id=image_id,
+                event_type="failure",
+                message="insufficient matches for model estimation",
+                num_initial_matches=num_initial,
+                num_descriptor_passed=num_descriptor_passed,
+                num_spatial_passed=num_spatial_passed,
+                num_homography_inliers=0,
+                spatial_distance_limit=spatial_distance_limit,
+            )
             return None, None, None
 
         try:
@@ -231,6 +379,16 @@ class Matcher:
 
             if H is None:
                 logger.warning("Warning: Model estimation failed")
+                self._record_filter_event(
+                    image_id=image_id,
+                    event_type="failure",
+                    message="model estimation failed",
+                    num_initial_matches=num_initial,
+                    num_descriptor_passed=num_descriptor_passed,
+                    num_spatial_passed=num_spatial_passed,
+                    num_homography_inliers=0,
+                    spatial_distance_limit=spatial_distance_limit,
+                )
                 return None, None, None
             
             inliers_mask_homography_relative = inliers_mask_homography_relative.ravel().astype(bool)
@@ -242,6 +400,16 @@ class Matcher:
 
             if rc_idx0.size < self.min_homography_inliers:
                 logger.warning(f"Warning: Not enough inliers after homography estimation (minimum {self.min_homography_inliers} required)")
+                self._record_filter_event(
+                    image_id=image_id,
+                    event_type="failure",
+                    message="not enough homography inliers",
+                    num_initial_matches=num_initial,
+                    num_descriptor_passed=num_descriptor_passed,
+                    num_spatial_passed=num_spatial_passed,
+                    num_homography_inliers=int(rc_idx0.size),
+                    spatial_distance_limit=spatial_distance_limit,
+                )
                 return None, None, None
                 
             model = self.model(H) # Assuming self.model is AffineTransform class
@@ -252,12 +420,43 @@ class Matcher:
             
             if self.plot:
                 self.plot_quiver(pos0[rc_idx0], pos1[rc_idx1], residuals)
+
+            self._record_filter_event(
+                image_id=image_id,
+                event_type="info",
+                message="matcher filter succeeded",
+                num_initial_matches=num_initial,
+                num_descriptor_passed=num_descriptor_passed,
+                num_spatial_passed=num_spatial_passed,
+                num_homography_inliers=int(rc_idx0.size),
+                spatial_distance_limit=spatial_distance_limit,
+            )
                 
             return rc_idx0, rc_idx1, residuals
 
         except cv2.error as e:
             logger.error(f"Warning: OpenCV error during model estimation: {str(e)}")
+            self._record_filter_event(
+                image_id=image_id,
+                event_type="failure",
+                message="opencv error during model estimation",
+                num_initial_matches=num_initial,
+                num_descriptor_passed=num_descriptor_passed,
+                num_spatial_passed=num_spatial_passed,
+                num_homography_inliers=0,
+                spatial_distance_limit=spatial_distance_limit,
+            )
             return None, None, None
         except Exception as e:
             logger.error(f"Warning: Unexpected error during model estimation: {str(e)}")
+            self._record_filter_event(
+                image_id=image_id,
+                event_type="failure",
+                message="unexpected error during model estimation",
+                num_initial_matches=num_initial,
+                num_descriptor_passed=num_descriptor_passed,
+                num_spatial_passed=num_spatial_passed,
+                num_homography_inliers=0,
+                spatial_distance_limit=spatial_distance_limit,
+            )
             return None, None, None
