@@ -128,7 +128,7 @@ class ImageProcessor:
             else proc_params['max_valid_speed_m_per_day']
         )
         self.window_border = proc_params['window_border']  # 0 disables weighting
-        self._last_persisted_id = 0
+        self._last_persisted_id = self.points.last_image_id
 
         if self.matcher is not None and self.max_speed_m_per_day is not None:
             self.matcher.max_speed_m_per_day = self.max_speed_m_per_day
