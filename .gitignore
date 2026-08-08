@@ -28,3 +28,9 @@ htmlcov/
 build/
 dist/
 *.egg-info/
+
+# Runtime and validation output
+/logs/
+/examples/logs/
+/run.log
+/validation/limosat_debug_record_*.geojson
