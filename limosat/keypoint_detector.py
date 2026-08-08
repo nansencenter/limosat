@@ -250,6 +250,7 @@ class KeypointDetector:
         img0[np.isnan(img0)] = 0
 
         # land mask
+        landmask = None
         if img.bands().get(2, {'name': 'none'}).get('name') == 'mask':
             landmask = self._read_band(img, 2)
             img0[landmask == 2] = 0
@@ -307,6 +308,19 @@ class KeypointDetector:
                 kps = [kp for kp in kps if kp.response > response_threshold]
                 if not kps:
                     continue
+
+                # Filter before selecting a winner so land responses do not
+                # displace valid water candidates in the same window.
+                if landmask is not None:
+                    kps = [
+                        kp for kp in kps
+                        if landmask[
+                            y_start + int(round(kp.pt[1])),
+                            x_start + int(round(kp.pt[0])),
+                        ] != 2
+                    ]
+                    if not kps:
+                        continue
 
                 # Choose best keypoint
                 if window_border > 0:
