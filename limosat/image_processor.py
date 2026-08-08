@@ -708,7 +708,7 @@ class ImageProcessor:
         )
 
         points_matched['corr'] = corr_values
-        correlation_mask = corr_values >= self.min_correlation
+        correlation_mask = np.isfinite(corr_values) & (corr_values >= self.min_correlation)
         
         if not np.any(correlation_mask):
             logger.debug("No points passed correlation filter.")
@@ -761,7 +761,7 @@ class ImageProcessor:
                 band=1
             )
             
-            recheck_passed_mask = corr_rechecked >= self.min_correlation
+            recheck_passed_mask = np.isfinite(corr_rechecked) & (corr_rechecked >= self.min_correlation)
 
             # collect failed (interpolated but did not pass recheck)
             if (~recheck_passed_mask).any():
