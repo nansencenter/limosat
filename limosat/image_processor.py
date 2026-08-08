@@ -187,6 +187,8 @@ class ImageProcessor:
 
         # Create Nansat Image object from file
         img = Image(filename)
+        if pd.isna(img.date):
+            raise ValueError(f"Could not determine image acquisition time from filename: {basename}")
         
         # Compute the candidate buffer for points that could drift into the current frame.
         buffer_distance = self._candidate_buffer_distance_m()
