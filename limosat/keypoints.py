@@ -25,7 +25,7 @@ class Keypoints(gpd.GeoDataFrame):
         numeric = numeric.mask(numeric == -1, pd.NA)
         return numeric.astype('Int64')
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, next_trajectory_id=0, **kwargs):
         if not args and not kwargs:
             # Initialize with empty data if no arguments provided
             empty_data = {
@@ -79,6 +79,9 @@ class Keypoints(gpd.GeoDataFrame):
                 self['orbit_num'] = self['orbit_num'].astype('int64', errors='ignore')
 
         self.srs = kwargs.get('srs', self.srs)
+        max_id = self['trajectory_id'].max() if len(self) else None
+        observed_next_id = 0 if pd.isna(max_id) else int(max_id) + 1
+        self.attrs['_next_trajectory_id'] = max(observed_next_id, int(next_trajectory_id))
 
     @property
     def last_image_id(self):
@@ -86,9 +89,11 @@ class Keypoints(gpd.GeoDataFrame):
         return 0 if len(self) == 0 or 'image_id' not in self.columns else int(self['image_id'].max() or 0)
 
     @classmethod
-    def _from_gdf(cls, gdf):
+    def _from_gdf(cls, gdf, *, next_trajectory_id=None):
         """Convert a GeoDataFrame to Keypoints"""
-        return cls(gdf, crs=gdf.crs)
+        if next_trajectory_id is None:
+            next_trajectory_id = gdf.attrs.get('_next_trajectory_id', 0)
+        return cls(gdf, crs=gdf.crs, next_trajectory_id=next_trajectory_id)
 
     def in_poly(self, img):
         points_poly = self[self.within(img.poly)]
@@ -117,10 +122,7 @@ class Keypoints(gpd.GeoDataFrame):
         if 'trajectory_id' in self.columns:
             self['trajectory_id'] = self['trajectory_id'].astype('int64', errors='ignore')
 
-        existing_trajectory_ids = set(self['trajectory_id']) if len(self) > 0 else set()
-
-        # Assign new trajectory_ids starting from max existing + 1
-        next_trajectory_id = int(max(existing_trajectory_ids)) + 1 if existing_trajectory_ids else 0
+        next_trajectory_id = self.attrs['_next_trajectory_id']
         points['trajectory_id'] = list(range(next_trajectory_id, next_trajectory_id + len(points)))
 
         # Ensure columns match before concatenation
@@ -135,7 +137,10 @@ class Keypoints(gpd.GeoDataFrame):
         # Concatenate the new points
         result = pd.concat([self, points_to_concat], ignore_index=True)
 
-        return self._from_gdf(result)
+        return self._from_gdf(
+            result,
+            next_trajectory_id=next_trajectory_id + len(points),
+        )
 
     @log_execution_time
     def update(self, points):
@@ -153,7 +158,7 @@ class Keypoints(gpd.GeoDataFrame):
             result = pd.concat([self, points], ignore_index=True)
 
         # Return the updated Keypoints object
-        return self._from_gdf(result)
+        return self._from_gdf(result, next_trajectory_id=self.attrs['_next_trajectory_id'])
 
     @classmethod
     def create(cls, keypoints, descriptors, img, image_id, orbit_num):

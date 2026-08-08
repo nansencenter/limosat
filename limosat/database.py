@@ -411,6 +411,11 @@ class DriftDatabase:
             raise FileNotFoundError(f"Cannot resume: Zarr path not found at '{self.zarr_path}'")
 
         sql_query = text(f'SELECT * FROM "{self.run_name}" WHERE is_last = 1')
+        with self.engine.connect() as connection:
+            max_trajectory_id = connection.execute(
+                text(f'SELECT MAX(trajectory_id) FROM "{self.run_name}"')
+            ).scalar()
+        next_trajectory_id = 0 if max_trajectory_id is None else int(max_trajectory_id) + 1
         if self.is_postgis:
             points_last_from_db = gpd.read_postgis(sql_query, self.engine, geom_col='geometry', coerce_float=False)
         else:
@@ -436,7 +441,7 @@ class DriftDatabase:
             raise ValueError(f"Cannot resume: No 'is_last=1' points survived time filter (>= {time_threshold})")
 
         active_points_gdf['descriptors'] = active_points_gdf['descriptors'].apply(self.deserialize_descriptors)
-        points = Keypoints._from_gdf(active_points_gdf)
+        points = Keypoints._from_gdf(active_points_gdf, next_trajectory_id=next_trajectory_id)
 
         templates = Templates()
         with xr.open_zarr(self.zarr_path) as ds:
