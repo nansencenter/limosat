@@ -9,7 +9,9 @@ import cv2
 import cartopy.crs as ccrs
 from skimage.util import view_as_windows
 from nansat import NSR
-from .utils import log_execution_time, logger
+import os
+from pathlib import Path
+from .utils import log_execution_time, logger, extract_date
 
 class KeypointDetector:
     """
@@ -19,15 +21,17 @@ class KeypointDetector:
     including new keypoint detection and gridded detection.
     """
 
-    def __init__(self, model):
+    def __init__(self, model, cache_dir=None, debug_recorder=None):
         """
         Initialize the keypoint detector.
 
         Parameters:
             model: Feature detection model (e.g., SIFT, ORB)
-            octave (int): The octave value for keypoints
+            cache_dir: Optional directory to cache deterministic grid descriptors
+            debug_recorder: Optional debug recorder for structured event output
         """
         self.model = model
+        self.debug_recorder = debug_recorder
         self.pc = ccrs.PlateCarree()
         central_longitude = -45
         true_scale_latitude = 70
@@ -37,6 +41,99 @@ class KeypointDetector:
         )
         # Cache for precomputed Gaussian masks: key = (window_size, gaussian_sigma_factor)
         self._gaussian_cache = {}
+        # Optional on-disk cache for gridded descriptors
+        if cache_dir is None:
+            cache_dir = os.environ.get("LIMOSAT_GRID_CACHE")
+        self.grid_cache_dir = cache_dir
+        if self.grid_cache_dir:
+            os.makedirs(self.grid_cache_dir, exist_ok=True)
+
+    @staticmethod
+    def _read_band(img, band_id):
+        """Read a Nansat band, including integer bands that cannot hold NaN."""
+        try:
+            return img[band_id]
+        except ValueError as exc:
+            if "cannot convert float NaN to integer" not in str(exc):
+                raise
+            array = img.vrt.dataset.GetRasterBand(band_id).ReadAsArray()
+            if array is None:
+                raise RuntimeError(f"Could not read raster band {band_id}") from exc
+            return array
+
+    def _model_cache_tag(self):
+        # Best-effort tag to avoid collisions across detector configs.
+        parts = [self.model.__class__.__name__]
+        for getter, label in (
+            ("getPatchSize", "ps"),
+            ("getNLevels", "nl"),
+            ("getMaxFeatures", "nf"),
+            ("getNFeatures", "nf"),
+            ("getScaleFactor", "sf"),
+            ("getEdgeThreshold", "et"),
+            ("getFirstLevel", "fl"),
+            ("getScoreType", "st"),
+        ):
+            if hasattr(self.model, getter):
+                try:
+                    parts.append(f"{label}{getattr(self.model, getter)()}")
+                except Exception:
+                    pass
+        return "-".join(parts)
+
+    def _cache_subdir(self, img, source_path):
+        date = getattr(img, "date", None)
+        if date is None:
+            date = extract_date(str(source_path))
+        if date is None:
+            return Path("unknown") / "unknown"
+        try:
+            return Path(f"{int(date.year):04d}") / f"{int(date.month):02d}"
+        except Exception:
+            return Path("unknown") / "unknown"
+
+    def _grid_cache_key(self, img, stride, border_size, octave):
+        if not self.grid_cache_dir:
+            return None
+        # Use basename and detector params; attempt to use image filename if available
+        source_path = (
+            getattr(img, "filename", None)
+            or getattr(img, "file_path", None)
+            or getattr(img, "filepath", None)
+            or getattr(img, "name", None)
+            or "unknown"
+        )
+        basename = Path(source_path).stem
+        subdir = self._cache_subdir(img, source_path)
+        model_tag = self._model_cache_tag()
+        return Path(self.grid_cache_dir) / subdir / f"{basename}_s{stride}_b{border_size}_o{octave}_{model_tag}.npz"
+
+    def _load_grid_cache(self, img, stride, border_size, octave):
+        cache_path = self._grid_cache_key(img, stride, border_size, octave)
+        if not cache_path or not cache_path.exists():
+            return None
+        try:
+            with np.load(cache_path, allow_pickle=False) as data:
+                coords = data['coords']
+                descriptors = data['descriptors']
+            tags = [None] * len(coords)
+            return coords, descriptors, tags
+        except Exception as e:
+            logger.warning(f"Failed to load grid cache {cache_path}: {e}")
+            return None
+
+    def _save_grid_cache(self, img, stride, border_size, octave, compute_result):
+        cache_path = self._grid_cache_key(img, stride, border_size, octave)
+        if not cache_path or compute_result is None:
+            return
+        coords, descriptors, tags = compute_result
+        if coords is None or descriptors is None:
+            return
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(cache_path, coords=coords, descriptors=descriptors)
+        except Exception as e:
+            logger.warning(f"Failed to save grid cache {cache_path}: {e}")
         
     @log_execution_time
     def compute_descriptors(self, keypoints_with_tags, img, polarisation='s0_HV', normalize=True):
@@ -101,7 +198,7 @@ class KeypointDetector:
             return rawkeypoints_coords, descriptors, surviving_tags
 
         else:
-            img_band = img[polarisation].copy()
+            img_band = self._read_band(img, polarisation).copy()
             img_band[np.isnan(img_band)] = 0
             keypoints_output, descriptors = self.model.compute(img_band, raw_cv2_kps)
             if descriptors is None or not keypoints_output:
@@ -149,12 +246,13 @@ class KeypointDetector:
         if not hasattr(self, "_cache"):
             self._cache = {}
 
-        img0 = img[1]
+        img0 = self._read_band(img, 1)
         img0[np.isnan(img0)] = 0
 
         # land mask
+        landmask = None
         if img.bands().get(2, {'name': 'none'}).get('name') == 'mask':
-            landmask = img[2]
+            landmask = self._read_band(img, 2)
             img0[landmask == 2] = 0
 
         if step is None:
@@ -211,6 +309,19 @@ class KeypointDetector:
                 if not kps:
                     continue
 
+                # Filter before selecting a winner so land responses do not
+                # displace valid water candidates in the same window.
+                if landmask is not None:
+                    kps = [
+                        kp for kp in kps
+                        if landmask[
+                            y_start + int(round(kp.pt[1])),
+                            x_start + int(round(kp.pt[0])),
+                        ] != 2
+                    ]
+                    if not kps:
+                        continue
+
                 # Choose best keypoint
                 if window_border > 0:
                     cache_key = (window_size, int(window_border))
@@ -246,9 +357,17 @@ class KeypointDetector:
                     composite_scores = responses * weights
                     best_idx = int(np.argmax(composite_scores))
                     best_kp_in_window = kps[best_idx]
+                    response_tag = {
+                        'response': float(best_kp_in_window.response),
+                        'composite_score': float(composite_scores[best_idx]),
+                    }
                 else:
                     # Raw response selection
                     best_kp_in_window = max(kps, key=lambda kp: kp.response)
+                    response_tag = {
+                        'response': float(best_kp_in_window.response),
+                        'composite_score': None,
+                    }
 
                 # Offset to image coords
                 best_kp_in_window.pt = (
@@ -258,7 +377,7 @@ class KeypointDetector:
                 if adjust_keypoint_angle:
                     best_kp_in_window.angle = img.angle
                 best_kp_in_window.octave = octave
-                keypoints.append((best_kp_in_window, None))
+                keypoints.append((best_kp_in_window, response_tag))
 
         # Enforce outer border exclusion
         filtered_keypoints_with_tags = [
@@ -269,6 +388,23 @@ class KeypointDetector:
                 and border_size <= item[0].pt[1] <= img0.shape[0] - border_size
             )
         ]
+
+        if getattr(self.debug_recorder, "enabled", False) and filtered_keypoints_with_tags:
+            responses = [
+                tag.get('response')
+                for _, tag in filtered_keypoints_with_tags
+                if isinstance(tag, dict) and tag.get('response') is not None
+            ]
+            if responses:
+                self.debug_recorder.record(
+                    stage="keypoint_detection",
+                    event_type="info",
+                    message="response summary",
+                    min_response=float(np.min(responses)),
+                    mean_response=float(np.mean(responses)),
+                    max_response=float(np.max(responses)),
+                    count=len(responses),
+                )
 
         if not compute_descriptors:
             return filtered_keypoints_with_tags
@@ -301,44 +437,57 @@ class KeypointDetector:
         Returns:
             tuple: (keypoint_coords, descriptors, surviving_tags)
         """
+        # Attempt to load cached grid descriptors
+        cached = self._load_grid_cache(img, stride, border_size, octave)
+        if cached is not None:
+            return cached
+
         # Get image data and replace NaNs with zero
-        img0 = img[1]
+        img0 = self._read_band(img, 1)
         img0[np.isnan(img0)] = 0
-        
-        # TODO: generalise preprocessing to create boolean landmask
+
+        # Optional land mask
         landmask = None
         if img.bands().get(2, {'name': 'none'}).get('name') == 'mask':
-            landmask = img[2]
+            landmask = self._read_band(img, 2)
             img0[landmask == 2] = 0
 
-        # Generate grid keypoints
-        keypoints = []
-        for r in range(0, img0.shape[0], stride):
-            for c in range(0, img0.shape[1], stride):
-                if landmask is not None and landmask[r, c] == 2:
-                    continue  # skip land cells
+        # Vectorized grid generation to avoid Python double loop
+        h, w = img0.shape
+        rows, cols = np.mgrid[0:h:stride, 0:w:stride]
+        rows_flat = rows.ravel()
+        cols_flat = cols.ravel()
 
-                # The size parameter is required, but will be overwritten by the detector's patch size
-                kp = cv2.KeyPoint(c, r, size=31, octave=octave, angle=img.angle)
+        if landmask is not None:
+            landmask_bool = (landmask == 2)
+            valid_mask = ~landmask_bool[rows_flat, cols_flat]
+            rows_flat = rows_flat[valid_mask]
+            cols_flat = cols_flat[valid_mask]
 
-                keypoints.append((kp, None)) # Append tuple with None as tag
+        # Border filtering in one pass
+        border_mask = (
+            (cols_flat >= border_size)
+            & (cols_flat <= w - border_size)
+            & (rows_flat >= border_size)
+            & (rows_flat <= h - border_size)
+        )
+        rows_flat = rows_flat[border_mask]
+        cols_flat = cols_flat[border_mask]
 
-        # Filter keypoints within image borders
-        filtered_keypoints_with_tags = [
-            item
-            for item in keypoints
-            if (
-                border_size <= item[0].pt[0] <= img0.shape[1] - border_size
-                and border_size <= item[0].pt[1] <= img0.shape[0] - border_size
-            )
+        keypoints_with_tags = [
+            (cv2.KeyPoint(float(c), float(r), size=31, octave=octave, angle=img.angle), None)
+            for r, c in zip(rows_flat, cols_flat)
         ]
 
-        return self.compute_descriptors(
-            filtered_keypoints_with_tags,
+        result = self.compute_descriptors(
+            keypoints_with_tags,
             img,
             polarisation=1,
             normalize=False
         )
+
+        self._save_grid_cache(img, stride, border_size, octave, result)
+        return result
 
     def get_pixel_coords(self, nansat_obj, geom_x, geom_y):
         # helper function for keypoint_from_point
@@ -355,7 +504,7 @@ class KeypointDetector:
             points_gdf_for_current_image, # GDF of buoy points for *this* image
             octave,          # Passed by ImageProcessor, for cv2.KeyPoint.octave
             img,              # Nansat image object for the current image
-            response_threshold
+            response_threshold,
         ):
         """
         Dynamically finds the best ORB feature near each buoy point using a method similar to detect_new_keypoints
@@ -364,12 +513,15 @@ class KeypointDetector:
         # This method detects keypoints but does NOT compute their descriptors,
         # as it's part of a specific workflow in ImageProcessor where descriptors
         # are computed later in a batch.
-        # this is the window it searches
-        window_size_for_detection = 16
-        keypoints_with_indices = []
         orb_model = self.model
-        img_band_data = img[1]
+        patch_size = int(orb_model.getPatchSize())
+        window_size_for_detection = max(32, patch_size + 16)
+
+        keypoints_with_indices = []
+        img_band_data = self._read_band(img, 1)
         img_height, img_width = img_band_data.shape
+
+        max_center_distance_m = 300.0
 
         for original_idx, point_row in points_gdf_for_current_image.iterrows():
             buoy_geom = point_row.geometry
@@ -426,6 +578,30 @@ class KeypointDetector:
                             orb_desc_computation_half_patch <= kp_final_r < img_height - orb_desc_computation_half_patch):
                         continue
 
+                    center_c = c0 + patch_center_x
+                    center_r = r0 + patch_center_y
+                    try:
+                        cand_x, cand_y = img.transform_points(
+                            [kp_final_c],
+                            [kp_final_r],
+                            DstToSrc=0,
+                            dst_srs=img.srs,
+                        )
+                        center_x, center_y = img.transform_points(
+                            [center_c],
+                            [center_r],
+                            DstToSrc=0,
+                            dst_srs=img.srs,
+                        )
+                        dx = cand_x[0] - center_x[0]
+                        dy = cand_y[0] - center_y[0]
+                        center_distance = float(np.hypot(dx, dy))
+                    except Exception:
+                        center_distance = None
+
+                    if center_distance is not None and center_distance > max_center_distance_m:
+                        continue
+
                     final_kp_to_add = cv2.KeyPoint(
                         x=float(kp_final_c),
                         y=float(kp_final_r),
@@ -434,10 +610,17 @@ class KeypointDetector:
                         angle=float(img.angle),
                         response=float(best_kp_in_patch.response)
                     )
-                    keypoints_with_indices.append((final_kp_to_add, point_row.name))
+                    keypoints_with_indices.append((
+                        final_kp_to_add,
+                        {
+                            'original_index': point_row.name,
+                            'response': float(best_kp_in_patch.response),
+                            'composite_score': None,
+                        },
+                    ))
                 
             except Exception as e:
                 logger.info(f"Error processing point original_idx {original_idx} (input index {point_row.name}): {e}")
                 pass 
-                
+        
         return keypoints_with_indices

@@ -11,6 +11,8 @@ dependencies:
   - ca-certificates
   - certifi
   - openssl
+  - urllib3
+  - pillow
   - psycopg2
   - shapely
   - matplotlib=3.8.0
@@ -31,3 +33,5 @@ dependencies:
   - zarr
   - pip:
       - nansat
+      - pythesint
+      - pystac>=1.8.4
