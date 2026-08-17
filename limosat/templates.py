@@ -7,6 +7,7 @@
 import numpy as np
 import xarray as xr
 import cartopy.crs as ccrs
+import cv2
 from .utils import log_execution_time, logger
 
 class Templates:
@@ -33,7 +34,7 @@ class Templates:
 
     @staticmethod
     @log_execution_time
-    def _extract_from_img(points, img, hs, band=1):
+    def _extract_from_img(points, img, hs, band=1, sampling="integer"):
         """
         Extracts square templates from an image centered at specified keypoints.
         (Internal static method)
@@ -51,16 +52,26 @@ class Templates:
             lon, lat, _ = pc.transform_points(nps, x, y).T
             colsrows = np.array(img.transform_points(lon, lat, DstToSrc=1)).T
         
-        img_band = img[band]
-        colsrows = colsrows.astype(int)
+        if sampling not in {"integer", "bilinear"}:
+            raise ValueError("sampling must be 'integer' or 'bilinear'")
+        img_band = np.asarray(img[band])
+        if sampling == "integer":
+            colsrows = colsrows.astype(int)
         
         templates = []
         ids = []
 
         for i, (c0, r0) in enumerate(colsrows):
-            if r0-hs >= 0 and r0+hs+1 <= img_band.shape[0] and c0-hs >= 0 and c0+hs+1 <= img_band.shape[1]:
+            if r0-hs >= 0 and r0+hs <= img_band.shape[0]-1 and c0-hs >= 0 and c0+hs <= img_band.shape[1]-1:
                 ids.append(i)
-                template = img_band[r0-hs:r0+hs+1, c0-hs:c0+hs+1]
+                if sampling == "integer":
+                    template = img_band[r0-hs:r0+hs+1, c0-hs:c0+hs+1]
+                else:
+                    template = cv2.getRectSubPix(
+                        img_band,
+                        (2 * hs + 1, 2 * hs + 1),
+                        (float(c0), float(r0)),
+                    )
                 templates.append(template)
             else:
                 logger.warning(f"Keypoint at index {i} is out of image bounds for template extraction.")
@@ -75,11 +86,13 @@ class Templates:
         logger.info(f"Templates DataArray initialized with shape ({height}, {width}).")
 
     @log_execution_time
-    def add(self, points, img, template_size, band=1):
+    def add(self, points, img, template_size, band=1, sampling="integer"):
         """
         Extracts and adds new templates for points that are not yet tracked.
         """
-        templates_new, template_new_idx = self._extract_from_img(points, img, hs=template_size, band=band)
+        templates_new, template_new_idx = self._extract_from_img(
+            points, img, hs=template_size, band=band, sampling=sampling
+        )
         
         if templates_new.size == 0:
             return
@@ -112,14 +125,16 @@ class Templates:
             logger.debug(f"Added {len(new_trajectory_ids)} new templates.")
 
     @log_execution_time
-    def update(self, points, img, template_size, band=1):
+    def update(self, points, img, template_size, band=1, sampling="integer"):
         """
         Extracts and updates templates with a strict "all or nothing" policy.
 
         If a template cannot be extracted for every point, the entire update
         is skipped to ensure data consistency.
         """
-        templates_new, template_new_idx = self._extract_from_img(points, img, hs=template_size, band=band)
+        templates_new, template_new_idx = self._extract_from_img(
+            points, img, hs=template_size, band=band, sampling=sampling
+        )
 
         if len(template_new_idx) != len(points):
             logger.warning(

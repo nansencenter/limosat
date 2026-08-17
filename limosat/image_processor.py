@@ -69,6 +69,8 @@ class ImageProcessor:
             'border_size': 128,
             'border_matched': 16,
             'border_interpolated': 64,
+            'pattern_matching_subpixel_method': 'none',
+            'template_sampling': 'integer',
             'stride': 15,
             'octave': 8,
             'min_correlation': 0.4,
@@ -115,6 +117,16 @@ class ImageProcessor:
         self.border_size = proc_params['border_size']
         self.border_matched = proc_params['border_matched']
         self.border_interpolated = proc_params['border_interpolated']
+        self.pattern_matching_subpixel_method = proc_params[
+            'pattern_matching_subpixel_method'
+        ]
+        if self.pattern_matching_subpixel_method not in {'none', 'quadratic'}:
+            raise ValueError(
+                "pattern_matching_subpixel_method must be 'none' or 'quadratic'"
+            )
+        self.template_sampling = proc_params['template_sampling']
+        if self.template_sampling not in {'integer', 'bilinear'}:
+            raise ValueError("template_sampling must be 'integer' or 'bilinear'")
         self.stride = proc_params['stride']
         self.octave = proc_params['octave']
         self.min_correlation = proc_params['min_correlation']
@@ -564,11 +576,23 @@ class ImageProcessor:
 
             # Add templates only for surviving new points
             if len(appended_points_gdf) > 0:
-                self.templates.add(appended_points_gdf, img, self.template_size, band=1)
+                self.templates.add(
+                    appended_points_gdf,
+                    img,
+                    self.template_size,
+                    band=1,
+                    sampling=self.template_sampling,
+                )
         if len(points_final) > 0:
             self.points = self.points.update(points_final)
             # Update templates for the points that were successfully matched and updated
-            self.templates.update(points_final, img, self.template_size, band=1)
+            self.templates.update(
+                points_final,
+                img,
+                self.template_size,
+                band=1,
+                sampling=self.template_sampling,
+            )
             
     @log_execution_time
     def _match_existing_points(self, points_poly, img, image_id, current_orbit_num):
@@ -706,6 +730,7 @@ class ImageProcessor:
             hs=self.template_size,
             border_matched=self.border_matched,
             border_interpolated=self.border_interpolated,
+            subpixel_method=self.pattern_matching_subpixel_method,
             band=1
         )
 
@@ -760,6 +785,7 @@ class ImageProcessor:
                 hs=self.template_size,
                 border_matched=self.border_matched,
                 border_interpolated=self.border_interpolated,
+                subpixel_method=self.pattern_matching_subpixel_method,
                 band=1
             )
             
@@ -842,7 +868,13 @@ class ImageProcessor:
 
         # Update templates for surviving points
         if not points_matched.empty:
-            self.templates.update(points_matched, img, self.template_size, band=1)
+            self.templates.update(
+                points_matched,
+                img,
+                self.template_size,
+                band=1,
+                sampling=self.template_sampling,
+            )
 
         logger.debug(f"Returning {len(points_matched)} final points")
         return points_matched, failed_predictions
