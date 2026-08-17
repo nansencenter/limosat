@@ -26,6 +26,7 @@ class Matcher:
                  use_model_estimation=True,
                  estimation_method="USAC_MAGSAC",
                  min_homography_inliers=10,
+                 model_coordinate_scale_m=1.0,
 
                  # Lowe's ratio test parameter
                  lowe_ratio=0.9,
@@ -48,6 +49,12 @@ class Matcher:
         self.model_threshold = model_threshold
         self.use_model_estimation = use_model_estimation
         self.min_homography_inliers = min_homography_inliers
+        self.model_coordinate_scale_m = float(model_coordinate_scale_m)
+        if (
+            not np.isfinite(self.model_coordinate_scale_m)
+            or self.model_coordinate_scale_m <= 0
+        ):
+            raise ValueError("model_coordinate_scale_m must be finite and positive")
 
         # Store the method name and get its value
         if estimation_method.upper() == "DEGENSAC":
@@ -363,19 +370,48 @@ class Matcher:
         try:
             # H, inliers is your gpi2, applied to md_idx0/md_idx1
             # The `inliers` mask returned by findHomography is relative to the points fed into it (pos0[md_idx0], pos1[md_idx1])
+            if self.model_coordinate_scale_m == 1.0:
+                source_model = pos0[md_idx0]
+                target_model = pos1[md_idx1]
+                threshold_model = self.model_threshold
+            else:
+                source_model = pos0[md_idx0] / self.model_coordinate_scale_m
+                target_model = pos1[md_idx1] / self.model_coordinate_scale_m
+                threshold_model = self.model_threshold / self.model_coordinate_scale_m
+
             if self.estimation_method_name.upper() == "DEGENSAC":
                 try:
                     import pydegensac
-                    H, inliers_mask_homography_relative = pydegensac.findHomography(pos0[md_idx0], pos1[md_idx1], self.model_threshold)
+                    H, inliers_mask_homography_relative = pydegensac.findHomography(
+                        source_model, target_model, threshold_model
+                    )
                 except ImportError:
                     logger.warning("pydegensac not found, falling back to cv2.USAC_MAGSAC")
                     self.estimation_method_name = "USAC_MAGSAC"
                     self.estimation_method = cv2.USAC_MAGSAC
-                    H, inliers_mask_homography_relative = cv2.findHomography(pos0[md_idx0], pos1[md_idx1], 
-                                                                            self.estimation_method, self.model_threshold)
+                    H, inliers_mask_homography_relative = cv2.findHomography(
+                        source_model,
+                        target_model,
+                        self.estimation_method,
+                        threshold_model,
+                    )
             else:
-                H, inliers_mask_homography_relative = cv2.findHomography(pos0[md_idx0], pos1[md_idx1], 
-                                                                        self.estimation_method, self.model_threshold)
+                H, inliers_mask_homography_relative = cv2.findHomography(
+                    source_model,
+                    target_model,
+                    self.estimation_method,
+                    threshold_model,
+                )
+
+            if H is not None and self.model_coordinate_scale_m != 1.0:
+                input_to_model = np.diag(
+                    [
+                        1.0 / self.model_coordinate_scale_m,
+                        1.0 / self.model_coordinate_scale_m,
+                        1.0,
+                    ]
+                )
+                H = np.linalg.inv(input_to_model) @ H @ input_to_model
 
             if H is None:
                 logger.warning("Warning: Model estimation failed")
