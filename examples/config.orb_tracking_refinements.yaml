@@ -1,0 +1,74 @@
+# Path-neutral example of the selected production ORB refinements.
+# Replace the database and input paths before running.
+
+run_settings:
+  run_name: "limosat_orb_tracking_refinements"
+  clear_existing_data: false
+  max_cpu_cores: null
+
+database:
+  engine_url: "sqlite:///./data/limosat_orb_tracking_refinements.sqlite"
+  zarr_path_template: "./data/zarr_stores/{run_name}.zarr"
+
+paths:
+  image_catalog:
+    metadata_path: "./data/catalogs/image_catalog.geojson"
+    start_date_filter: null
+    end_date_filter: null
+  insitu_points:
+    use_insitu_seeding: false
+    geojson_path: "./data/insitu/buoy_data.geojson"
+    target_crs: "EPSG:3413"
+    seeding_selection:
+      max_attempts_per_buoy: 100
+      max_time_diff_minutes: 60
+      min_hours_between_seeds: 2
+      warmup_days: 0
+
+image_processor_params:
+  persist_updates: true
+  persist_interval: 50
+  pruning_interval: 25
+  temporal_window: 4
+  convergence_radius_pixels: 7
+  max_speed_m_per_day: 30000
+  candidate_search_max_daily_drift_m: 10000
+  window_size: 128
+  window_border: 6
+  border_size: 128
+  border_matched: 24
+  border_interpolated: 48
+  pattern_matching_subpixel_method: quadratic
+  template_sampling: bilinear
+  stride: 15
+  octave: 5
+  min_correlation: 0.30
+  response_threshold: 0.001
+  template_size: 16
+  use_interpolation: true
+  max_interpolation_time_gap_hours: 96
+
+keypoint_detector:
+  type: "ORB"
+  orb_params:
+    nfeatures: 200
+    scaleFactor: 1.20
+    nlevels: 5
+    edgeThreshold: 24
+    firstLevel: 0
+    patchSize: 88
+    scoreType: "HARRIS_SCORE"
+
+matcher_params:
+  norm_type: "NORM_HAMMING2"
+  descriptor_distance_max: 120
+  model_threshold: 15000
+  lowe_ratio: 0.80
+  knn_k: 8
+  plot_matches: false
+  geometric_model:
+    type: "AffineTransform"
+    use_model_estimation: true
+    estimation_method: "USAC_MAGSAC"
+    min_homography_inliers: 3
+    coordinate_scale_m: 1000.0
