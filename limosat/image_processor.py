@@ -887,8 +887,11 @@ class ImageProcessor:
                 logger.info(
                     f"Performing final persistence for remaining {images_since_persist} images"
                 )
+                traj_id_counts = self.points['trajectory_id'].value_counts()
+                matched_traj_ids = traj_id_counts[traj_id_counts > 1].index
+                points_to_persist = self.points[self.points['trajectory_id'].isin(matched_traj_ids)]
                 save_successful = self.db.save(
-                    points=self.points,
+                    points=points_to_persist,
                     templates=self.templates,
                     last_persisted_id=self._last_persisted_id,
                     insitu_points=self.insitu_points
