@@ -42,7 +42,7 @@ LiMOSAT expects the tracking image in band 1 and optionally a land mask named
 Use `build_stac_item_collection` to build a catalog of imagery metadata.
 3.	Set-up database(optional):
 Enable persistence by providing a SQL engine and Zarr storage path to store both the drift keypoints and pattern matching templates. limosat can also be run without persistence.
-4.	Run `examples/limosat_drift.ipynb`
+4.	Follow the current library example in `examples/README.md`.
 5. Visualise results
 
 ## License
