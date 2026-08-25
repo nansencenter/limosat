@@ -13,7 +13,7 @@ from collections import defaultdict
 from .utils import log_execution_time, logger
 
 # Keep physical inputs in metres, but condition model fitting in kilometres.
-_METRES_PER_MODEL_UNIT = 1000.0
+_METRES_PER_KILOMETRE = 1000.0
 
 
 class Matcher:
@@ -367,9 +367,9 @@ class Matcher:
         try:
             # H, inliers is your gpi2, applied to md_idx0/md_idx1
             # The `inliers` mask returned by findHomography is relative to the points fed into it (pos0[md_idx0], pos1[md_idx1])
-            source_model = pos0[md_idx0] / _METRES_PER_MODEL_UNIT
-            target_model = pos1[md_idx1] / _METRES_PER_MODEL_UNIT
-            threshold_model = self.model_threshold / _METRES_PER_MODEL_UNIT
+            source_model = pos0[md_idx0] / _METRES_PER_KILOMETRE
+            target_model = pos1[md_idx1] / _METRES_PER_KILOMETRE
+            threshold_model = self.model_threshold / _METRES_PER_KILOMETRE
 
             if self.estimation_method_name.upper() == "DEGENSAC":
                 try:
@@ -398,13 +398,13 @@ class Matcher:
             if H is not None:
                 input_to_model = np.diag(
                     [
-                        1.0 / _METRES_PER_MODEL_UNIT,
-                        1.0 / _METRES_PER_MODEL_UNIT,
+                        1.0 / _METRES_PER_KILOMETRE,
+                        1.0 / _METRES_PER_KILOMETRE,
                         1.0,
                     ]
                 )
                 model_to_input = np.diag(
-                    [_METRES_PER_MODEL_UNIT, _METRES_PER_MODEL_UNIT, 1.0]
+                    [_METRES_PER_KILOMETRE, _METRES_PER_KILOMETRE, 1.0]
                 )
                 H = model_to_input @ H @ input_to_model
 
