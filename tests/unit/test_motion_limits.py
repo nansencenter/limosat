@@ -28,7 +28,7 @@ def make_points():
 
 @pytest.mark.unit
 def test_matcher_motion_distance_limit_scales_with_time_gap():
-    matcher = Matcher(max_speed_m_per_day=50000, use_model_estimation=False)
+    matcher = Matcher(max_speed_m_per_day=50000)
     previous_time = pd.Timestamp("2020-03-01 00:00:00")
 
     assert matcher.motion_distance_limit(previous_time, previous_time + pd.Timedelta(hours=12)) == pytest.approx(25000.0)
@@ -37,7 +37,7 @@ def test_matcher_motion_distance_limit_scales_with_time_gap():
 
 @pytest.mark.unit
 def test_matcher_motion_distance_limit_clamps_backward_time_gap():
-    matcher = Matcher(max_speed_m_per_day=50000, spatial_distance_max=100000, use_model_estimation=False)
+    matcher = Matcher(max_speed_m_per_day=50000, spatial_distance_max=100000)
 
     assert matcher.motion_distance_limit(
         pd.Timestamp("2020-03-13 00:00:00"),
@@ -47,18 +47,23 @@ def test_matcher_motion_distance_limit_clamps_backward_time_gap():
 
 @pytest.mark.unit
 def test_matcher_filter_respects_motion_distance_limit():
-    matcher = Matcher(descriptor_distance_max=100, use_model_estimation=False)
+    matcher = Matcher(descriptor_distance_max=100, min_homography_inliers=4)
     matches = [
-        cv2.DMatch(_queryIdx=0, _trainIdx=0, _distance=10),
-        cv2.DMatch(_queryIdx=1, _trainIdx=1, _distance=10),
+        cv2.DMatch(_queryIdx=i, _trainIdx=i, _distance=10)
+        for i in range(5)
     ]
-    pos0 = np.array([[0.0, 0.0], [0.0, 0.0]], dtype=float)
-    pos1 = np.array([[30.0, 0.0], [60.0, 0.0]], dtype=float)
+    pos0 = np.array(
+        [[0.0, 0.0], [100.0, 0.0], [0.0, 100.0], [100.0, 100.0], [200.0, 200.0]],
+        dtype=float,
+    )
+    pos1 = pos0 + np.array(
+        [[30.0, 0.0], [30.0, 0.0], [30.0, 0.0], [30.0, 0.0], [60.0, 0.0]]
+    )
 
     idx0, idx1, _ = matcher.filter(matches, pos0, pos1, max_distance_m=50.0)
 
-    assert idx0.tolist() == [0]
-    assert idx1.tolist() == [0]
+    assert idx0.tolist() == [0, 1, 2, 3]
+    assert idx1.tolist() == [0, 1, 2, 3]
 
 
 @pytest.mark.unit
@@ -75,6 +80,7 @@ def test_homography_fit_uses_kilometres_and_returns_metre_residuals(
     def fake_find_homography(source_scaled, target_scaled, method, threshold):
         captured["source"] = source_scaled
         captured["target"] = target_scaled
+        captured["method"] = method
         captured["threshold"] = threshold
         return (
             np.array([[1.0, 0.0, 0.003], [0.0, 1.0, -0.002], [0.0, 0.0, 1.0]]),
@@ -92,6 +98,7 @@ def test_homography_fit_uses_kilometres_and_returns_metre_residuals(
 
     np.testing.assert_allclose(captured["source"], source / 1_000.0)
     np.testing.assert_allclose(captured["target"], target / 1_000.0)
+    assert captured["method"] == cv2.USAC_MAGSAC
     assert captured["threshold"] == 15.0
     assert idx0.tolist() == [0, 1, 2, 3]
     assert idx1.tolist() == [0, 1, 2, 3]
@@ -100,23 +107,27 @@ def test_homography_fit_uses_kilometres_and_returns_metre_residuals(
 
 @pytest.mark.unit
 def test_matcher_filter_zero_motion_limit_keeps_only_exact_matches():
-    matcher = Matcher(descriptor_distance_max=100, use_model_estimation=False)
+    matcher = Matcher(descriptor_distance_max=100, min_homography_inliers=4)
     matches = [
-        cv2.DMatch(_queryIdx=0, _trainIdx=0, _distance=10),
-        cv2.DMatch(_queryIdx=1, _trainIdx=1, _distance=10),
+        cv2.DMatch(_queryIdx=i, _trainIdx=i, _distance=10)
+        for i in range(5)
     ]
-    pos0 = np.array([[0.0, 0.0], [0.0, 0.0]], dtype=float)
-    pos1 = np.array([[0.0, 0.0], [0.1, 0.0]], dtype=float)
+    pos0 = np.array(
+        [[0.0, 0.0], [100.0, 0.0], [0.0, 100.0], [100.0, 100.0], [200.0, 200.0]],
+        dtype=float,
+    )
+    pos1 = pos0.copy()
+    pos1[-1, 0] += 0.1
 
     idx0, idx1, _ = matcher.filter(matches, pos0, pos1, max_distance_m=0.0)
 
-    assert idx0.tolist() == [0]
-    assert idx1.tolist() == [0]
+    assert idx0.tolist() == [0, 1, 2, 3]
+    assert idx1.tolist() == [0, 1, 2, 3]
 
 
 @pytest.mark.unit
 def test_matcher_rejects_mixed_previous_times_within_group():
-    matcher = Matcher(descriptor_distance_max=100, use_model_estimation=False, max_speed_m_per_day=50000)
+    matcher = Matcher(descriptor_distance_max=100, max_speed_m_per_day=50000)
     points_poly = make_keypoints(2, image_id=1, t0="2020-03-01 00:00:00", step_s=3600)
     points_grid = make_keypoints(2, image_id=2, t0="2020-03-02 00:00:00", step_s=0)
     matches = [
@@ -133,7 +144,7 @@ def test_matcher_rejects_mixed_previous_times_within_group():
 
 @pytest.mark.unit
 def test_matcher_rejects_mixed_current_frame_times():
-    matcher = Matcher(descriptor_distance_max=100, use_model_estimation=False, max_speed_m_per_day=50000)
+    matcher = Matcher(descriptor_distance_max=100, max_speed_m_per_day=50000)
     points_poly = make_keypoints(2, image_id=1, t0="2020-03-01 00:00:00", step_s=0)
     points_grid = make_keypoints(2, image_id=2, t0="2020-03-02 00:00:00", step_s=3600)
     matches = [
