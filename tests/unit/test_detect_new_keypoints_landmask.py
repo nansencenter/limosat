@@ -2,27 +2,9 @@
 
 import cv2
 import geopandas as gpd
-import importlib.util
-import logging
 import numpy as np
-from pathlib import Path
-import sys
-import types
 
-
-if "limosat.utils" not in sys.modules:
-    utils = types.ModuleType("limosat.utils")
-    utils.log_execution_time = lambda func: func
-    utils.logger = logging.getLogger(__name__)
-    utils.extract_date = lambda _value: None
-    sys.modules["limosat.utils"] = utils
-
-MODULE_PATH = Path(__file__).parents[2] / "limosat" / "keypoint_detector.py"
-SPEC = importlib.util.spec_from_file_location("limosat.keypoint_detector", MODULE_PATH)
-MODULE = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = MODULE
-SPEC.loader.exec_module(MODULE)
-KeypointDetector = MODULE.KeypointDetector
+from limosat.keypoint_detector import KeypointDetector
 
 
 class _Image:

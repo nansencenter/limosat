@@ -1,21 +1,9 @@
-import importlib
-import sys
-from pathlib import Path
-
 import geopandas as gpd
 import numpy as np
 import pytest
 from shapely.geometry import Point
 
-
-def load_real_templates():
-    repo_root = Path(__file__).resolve().parents[2]
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
-    for name in list(sys.modules):
-        if name == "limosat" or name.startswith("limosat."):
-            del sys.modules[name]
-    return importlib.import_module("limosat.templates").Templates
+from limosat.templates import Templates
 
 
 def fixture():
@@ -45,7 +33,6 @@ def fixture():
 
 @pytest.mark.unit
 def test_integer_template_sampling_preserves_legacy_slice():
-    Templates = load_real_templates()
     points, image, image_data = fixture()
 
     patches, indices = Templates._extract_from_img(
@@ -58,7 +45,6 @@ def test_integer_template_sampling_preserves_legacy_slice():
 
 @pytest.mark.unit
 def test_bilinear_template_sampling_uses_fractional_centre():
-    Templates = load_real_templates()
     points, image, _ = fixture()
 
     patches, indices = Templates._extract_from_img(
@@ -71,7 +57,6 @@ def test_bilinear_template_sampling_uses_fractional_centre():
 
 @pytest.mark.unit
 def test_template_sampling_rejects_unknown_method():
-    Templates = load_real_templates()
     points, image, _ = fixture()
 
     with pytest.raises(ValueError, match="sampling"):

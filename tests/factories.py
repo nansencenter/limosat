@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 import xarray as xr
-from shapely.geometry import Point, box
+from shapely.geometry import box
 
 
 class ImageStub:
@@ -55,15 +55,6 @@ class MatcherStub:
     def match_with_lowe_ratio(self, *args, **kwargs):
         # Passthrough
         return []
-
-
-class DatabaseStub:
-    def __init__(self):
-        self.calls = 0
-
-    def save(self, points, templates, last_persisted_id, insitu_points=None):
-        self.calls += 1
-        return True
 
 
 def make_templates(tids, hs):

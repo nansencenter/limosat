@@ -1,23 +1,14 @@
-import importlib
-import sys
-from pathlib import Path
 from unittest.mock import Mock
 
 import geopandas as gpd
 import pandas as pd
 from shapely.geometry import Point
 
+from limosat.image_processor import ImageProcessor
+from limosat.keypoints import Keypoints
+
 
 def test_final_persistence_excludes_singleton_trajectories():
-    repo_root = Path(__file__).resolve().parents[2]
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
-    for name in list(sys.modules):
-        if name == "limosat" or name.startswith("limosat."):
-            del sys.modules[name]
-    ImageProcessor = importlib.import_module("limosat.image_processor").ImageProcessor
-    Keypoints = importlib.import_module("limosat.keypoints").Keypoints
-
     points = Keypoints._from_gdf(
         gpd.GeoDataFrame(
             {
