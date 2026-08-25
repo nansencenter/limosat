@@ -80,7 +80,7 @@ def test_matcher_filter_respects_motion_distance_limit():
 
 
 @pytest.mark.unit
-def test_default_homography_scale_preserves_physical_threshold_and_residuals(
+def test_homography_fit_uses_kilometres_and_returns_metre_residuals(
     monkeypatch,
 ):
     matcher_module = load_real_module("limosat.matcher")
@@ -88,7 +88,7 @@ def test_default_homography_scale_preserves_physical_threshold_and_residuals(
 
     source = np.array(
         [[0.0, 0.0], [10.0, 0.0], [0.0, 10.0], [10.0, 10.0]]
-    )
+    ) + np.array([3_000_000.0, -1_000_000.0])
     target = source + np.array([3.0, -2.0])
     matches = [cv2.DMatch(i, i, 0, 10.0) for i in range(len(source))]
     captured = {}
@@ -117,24 +117,6 @@ def test_default_homography_scale_preserves_physical_threshold_and_residuals(
     assert idx0.tolist() == [0, 1, 2, 3]
     assert idx1.tolist() == [0, 1, 2, 3]
     assert np.max(residuals) < 1e-9
-
-
-@pytest.mark.unit
-def test_matcher_allows_explicit_legacy_metre_coordinate_mode():
-    Matcher = load_real_module("limosat.matcher").Matcher
-
-    matcher = Matcher(model_coordinate_scale_m=1.0)
-
-    assert matcher.model_coordinate_scale_m == 1.0
-
-
-@pytest.mark.unit
-@pytest.mark.parametrize("scale", [0, -1, np.inf, np.nan])
-def test_matcher_rejects_invalid_model_coordinate_scale(scale):
-    Matcher = load_real_module("limosat.matcher").Matcher
-
-    with pytest.raises(ValueError, match="model_coordinate_scale_m"):
-        Matcher(model_coordinate_scale_m=scale)
 
 
 @pytest.mark.unit

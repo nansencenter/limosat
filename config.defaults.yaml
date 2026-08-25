@@ -68,4 +68,3 @@ matcher_params:
     type: "AffineTransform"
     use_model_estimation: true
     estimation_method: "USAC_MAGSAC"
-    coordinate_scale_m: 1000.0  # Metres per estimator unit; 1.0 reproduces the legacy fit

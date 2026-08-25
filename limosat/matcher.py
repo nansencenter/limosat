@@ -12,6 +12,10 @@ from matplotlib import pyplot as plt
 from collections import defaultdict
 from .utils import log_execution_time, logger
 
+# Keep physical inputs in metres, but condition model fitting in kilometres.
+_METRES_PER_MODEL_UNIT = 1000.0
+
+
 class Matcher:
     def __init__(self,
                  # General matching parameters
@@ -26,7 +30,6 @@ class Matcher:
                  use_model_estimation=True,
                  estimation_method="USAC_MAGSAC",
                  min_homography_inliers=10,
-                 model_coordinate_scale_m=1000.0,
 
                  # Lowe's ratio test parameter
                  lowe_ratio=0.9,
@@ -49,12 +52,6 @@ class Matcher:
         self.model_threshold = model_threshold
         self.use_model_estimation = use_model_estimation
         self.min_homography_inliers = min_homography_inliers
-        self.model_coordinate_scale_m = float(model_coordinate_scale_m)
-        if (
-            not np.isfinite(self.model_coordinate_scale_m)
-            or self.model_coordinate_scale_m <= 0
-        ):
-            raise ValueError("model_coordinate_scale_m must be finite and positive")
 
         # Store the method name and get its value
         if estimation_method.upper() == "DEGENSAC":
@@ -370,14 +367,9 @@ class Matcher:
         try:
             # H, inliers is your gpi2, applied to md_idx0/md_idx1
             # The `inliers` mask returned by findHomography is relative to the points fed into it (pos0[md_idx0], pos1[md_idx1])
-            if self.model_coordinate_scale_m == 1.0:
-                source_model = pos0[md_idx0]
-                target_model = pos1[md_idx1]
-                threshold_model = self.model_threshold
-            else:
-                source_model = pos0[md_idx0] / self.model_coordinate_scale_m
-                target_model = pos1[md_idx1] / self.model_coordinate_scale_m
-                threshold_model = self.model_threshold / self.model_coordinate_scale_m
+            source_model = pos0[md_idx0] / _METRES_PER_MODEL_UNIT
+            target_model = pos1[md_idx1] / _METRES_PER_MODEL_UNIT
+            threshold_model = self.model_threshold / _METRES_PER_MODEL_UNIT
 
             if self.estimation_method_name.upper() == "DEGENSAC":
                 try:
@@ -403,15 +395,18 @@ class Matcher:
                     threshold_model,
                 )
 
-            if H is not None and self.model_coordinate_scale_m != 1.0:
+            if H is not None:
                 input_to_model = np.diag(
                     [
-                        1.0 / self.model_coordinate_scale_m,
-                        1.0 / self.model_coordinate_scale_m,
+                        1.0 / _METRES_PER_MODEL_UNIT,
+                        1.0 / _METRES_PER_MODEL_UNIT,
                         1.0,
                     ]
                 )
-                H = np.linalg.inv(input_to_model) @ H @ input_to_model
+                model_to_input = np.diag(
+                    [_METRES_PER_MODEL_UNIT, _METRES_PER_MODEL_UNIT, 1.0]
+                )
+                H = model_to_input @ H @ input_to_model
 
             if H is None:
                 logger.warning("Warning: Model estimation failed")
