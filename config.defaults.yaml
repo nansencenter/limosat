@@ -66,5 +66,3 @@ matcher_params:
   plot_matches: false
   geometric_model:
     type: "AffineTransform"
-    use_model_estimation: true
-    estimation_method: "USAC_MAGSAC"

@@ -39,8 +39,6 @@ class KeypointDetector:
             central_longitude=central_longitude,
             true_scale_latitude=true_scale_latitude
         )
-        # Cache for precomputed Gaussian masks: key = (window_size, gaussian_sigma_factor)
-        self._gaussian_cache = {}
         # Optional on-disk cache for gridded descriptors
         if cache_dir is None:
             cache_dir = os.environ.get("LIMOSAT_GRID_CACHE")

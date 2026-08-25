@@ -32,14 +32,17 @@ conda env create -f environment.yaml && conda activate limosat
 ## Run limosat
 
 1.	Prepare Your Data:
-Organize your satellite imagery into a folder and run `preprocessing.py`.
+Provide georeferenced, analysis-ready satellite imagery. Level-1 preprocessing is
+outside LiMOSAT; current deployments prepare imagery with `arktalas_vae`.
+LiMOSAT expects the SAR image data in band 1 and optionally a land mask named
+`mask` in band 2, where a value of 2 denotes land.
    If you use the gridded descriptor cache, note that changing stride or descriptor
    parameters (ORB settings, border size, octave) requires regenerating the cache.
 2. Build catalog:
-Use create_image_gdf to build a catalog of imagery metadata.
+Use `build_stac_item_collection` to build a catalog of imagery metadata.
 3.	Set-up database(optional):
 Enable persistence by providing a SQL engine and Zarr storage path to store both the drift keypoints and pattern matching templates. limosat can also be run without persistence.
-4.	Run `examples/limosat_drift.ipynb`
+4.	Follow the current library example in `examples/README.md`.
 5. Visualise results
 
 ## License

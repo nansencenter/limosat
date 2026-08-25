@@ -1,7 +1,3 @@
-import importlib
-import sys
-from pathlib import Path
-
 import numpy as np
 import cv2
 import pandas as pd
@@ -9,22 +5,12 @@ import geopandas as gpd
 import pytest
 from shapely.geometry import Point
 
+from limosat.processing import pattern_matching, refine_correlation_peak_quadratic
 from tests.factories import ImageStub, make_templates
-
-
-def load_real_processing():
-    repo_root = Path(__file__).resolve().parents[2]
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
-    for name in list(sys.modules):
-        if name == "limosat" or name.startswith("limosat."):
-            del sys.modules[name]
-    return importlib.import_module("limosat.processing")
 
 
 @pytest.mark.unit
 def test_quadratic_peak_refinement_recovers_analytic_maximum():
-    refine = load_real_processing().refine_correlation_peak_quadratic
     cols, rows = np.meshgrid(np.arange(7), np.arange(7))
     expected = np.array([3.35, 2.60])
     response = -(
@@ -34,7 +20,7 @@ def test_quadratic_peak_refinement_recovers_analytic_maximum():
     )
     peak = cv2.minMaxLoc(response.astype(np.float32))[3]
 
-    dc, dr, status = refine(response, peak)
+    dc, dr, status = refine_correlation_peak_quadratic(response, peak)
 
     assert status == "quadratic"
     np.testing.assert_allclose(np.array(peak) + [dc, dr], expected, atol=1e-12)
@@ -42,9 +28,7 @@ def test_quadratic_peak_refinement_recovers_analytic_maximum():
 
 @pytest.mark.unit
 def test_quadratic_peak_refinement_falls_back_at_boundary():
-    refine = load_real_processing().refine_correlation_peak_quadratic
-
-    dc, dr, status = refine(np.ones((5, 5)), (0, 2))
+    dc, dr, status = refine_correlation_peak_quadratic(np.ones((5, 5)), (0, 2))
 
     assert (dc, dr, status) == (0.0, 0.0, "response_boundary")
 
@@ -57,7 +41,6 @@ def test_quadratic_peak_refinement_falls_back_at_boundary():
 def test_quadratic_peak_refinement_recovers_fractional_image_translation(
     translation,
 ):
-    refine = load_real_processing().refine_correlation_peak_quadratic
     rng = np.random.default_rng(20260817)
     texture = rng.normal(size=(129, 129)).astype(np.float32)
     texture = cv2.GaussianBlur(texture, (0, 0), 1.2)
@@ -90,7 +73,7 @@ def test_quadratic_peak_refinement_recovers_fractional_image_translation(
     response = cv2.matchTemplate(search, template, cv2.TM_CCOEFF_NORMED)
     peak = cv2.minMaxLoc(response)[3]
 
-    dc, dr, status = refine(response, peak)
+    dc, dr, status = refine_correlation_peak_quadratic(response, peak)
     estimated = np.array(peak, dtype=float) + [dc, dr] - border
 
     assert status == "quadratic"
@@ -99,11 +82,10 @@ def test_quadratic_peak_refinement_recovers_fractional_image_translation(
 
 @pytest.mark.unit
 def test_quadratic_peak_refinement_rejects_non_concave_neighbourhood():
-    refine = load_real_processing().refine_correlation_peak_quadratic
     cols, rows = np.meshgrid(np.arange(5), np.arange(5))
     response = (cols - 2.0) ** 2 + (rows - 2.0) ** 2
 
-    dc, dr, status = refine(response, (2, 2))
+    dc, dr, status = refine_correlation_peak_quadratic(response, (2, 2))
 
     assert (dc, dr, status) == (0.0, 0.0, "non_concave")
 
@@ -111,8 +93,6 @@ def test_quadratic_peak_refinement_rejects_non_concave_neighbourhood():
 @pytest.mark.unit
 def test_pattern_matching_shapes(monkeypatch):
     # monkeypatch cartopy transforms to pass-through handled by conftest
-    pattern_matching = load_real_processing().pattern_matching
-
     img = ImageStub()
     n = 5
     points = gpd.GeoDataFrame(
