@@ -35,8 +35,10 @@ image_processor_params:
   candidate_search_max_daily_drift_m: 10000
   window_size: 64
   border_size: 128
-  border_matched: 16
-  border_interpolated: 32
+  border_matched: 24
+  border_interpolated: 48
+  pattern_matching_subpixel_method: quadratic  # Set to "none" only for legacy reproduction
+  template_sampling: bilinear                  # Set to "integer" only for legacy reproduction
   stride: 10
   octave: 8
   min_correlation: 0.35
@@ -60,7 +62,7 @@ matcher_params:
   norm_type: "NORM_HAMMING2"
   descriptor_distance_max: 120
   spatial_distance_max: 100000
-  model_threshold: 10000
+  model_threshold: 15000  # Metres; converted to kilometres only for model fitting
   plot_matches: false
   geometric_model:
     type: "AffineTransform"

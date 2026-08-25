@@ -80,6 +80,46 @@ def test_matcher_filter_respects_motion_distance_limit():
 
 
 @pytest.mark.unit
+def test_homography_fit_uses_kilometres_and_returns_metre_residuals(
+    monkeypatch,
+):
+    matcher_module = load_real_module("limosat.matcher")
+    Matcher = matcher_module.Matcher
+
+    source = np.array(
+        [[0.0, 0.0], [10.0, 0.0], [0.0, 10.0], [10.0, 10.0]]
+    ) + np.array([3_000_000.0, -1_000_000.0])
+    target = source + np.array([3.0, -2.0])
+    matches = [cv2.DMatch(i, i, 0, 10.0) for i in range(len(source))]
+    captured = {}
+
+    def fake_find_homography(source_scaled, target_scaled, method, threshold):
+        captured["source"] = source_scaled
+        captured["target"] = target_scaled
+        captured["threshold"] = threshold
+        return (
+            np.array([[1.0, 0.0, 0.003], [0.0, 1.0, -0.002], [0.0, 0.0, 1.0]]),
+            np.ones((len(source_scaled), 1), dtype=np.uint8),
+        )
+
+    monkeypatch.setattr(matcher_module.cv2, "findHomography", fake_find_homography)
+    matcher = Matcher(
+        descriptor_distance_max=100,
+        model_threshold=15_000.0,
+        min_homography_inliers=3,
+    )
+
+    idx0, idx1, residuals = matcher.filter(matches, source, target)
+
+    np.testing.assert_allclose(captured["source"], source / 1_000.0)
+    np.testing.assert_allclose(captured["target"], target / 1_000.0)
+    assert captured["threshold"] == 15.0
+    assert idx0.tolist() == [0, 1, 2, 3]
+    assert idx1.tolist() == [0, 1, 2, 3]
+    assert np.max(residuals) < 1e-9
+
+
+@pytest.mark.unit
 def test_matcher_filter_zero_motion_limit_keeps_only_exact_matches():
     Matcher = load_real_module("limosat.matcher").Matcher
 

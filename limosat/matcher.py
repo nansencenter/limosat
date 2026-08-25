@@ -12,6 +12,10 @@ from matplotlib import pyplot as plt
 from collections import defaultdict
 from .utils import log_execution_time, logger
 
+# Keep physical inputs in metres, but condition model fitting in kilometres.
+_METRES_PER_KILOMETRE = 1000.0
+
+
 class Matcher:
     def __init__(self,
                  # General matching parameters
@@ -363,19 +367,46 @@ class Matcher:
         try:
             # H, inliers is your gpi2, applied to md_idx0/md_idx1
             # The `inliers` mask returned by findHomography is relative to the points fed into it (pos0[md_idx0], pos1[md_idx1])
+            source_model = pos0[md_idx0] / _METRES_PER_KILOMETRE
+            target_model = pos1[md_idx1] / _METRES_PER_KILOMETRE
+            threshold_model = self.model_threshold / _METRES_PER_KILOMETRE
+
             if self.estimation_method_name.upper() == "DEGENSAC":
                 try:
                     import pydegensac
-                    H, inliers_mask_homography_relative = pydegensac.findHomography(pos0[md_idx0], pos1[md_idx1], self.model_threshold)
+                    H, inliers_mask_homography_relative = pydegensac.findHomography(
+                        source_model, target_model, threshold_model
+                    )
                 except ImportError:
                     logger.warning("pydegensac not found, falling back to cv2.USAC_MAGSAC")
                     self.estimation_method_name = "USAC_MAGSAC"
                     self.estimation_method = cv2.USAC_MAGSAC
-                    H, inliers_mask_homography_relative = cv2.findHomography(pos0[md_idx0], pos1[md_idx1], 
-                                                                            self.estimation_method, self.model_threshold)
+                    H, inliers_mask_homography_relative = cv2.findHomography(
+                        source_model,
+                        target_model,
+                        self.estimation_method,
+                        threshold_model,
+                    )
             else:
-                H, inliers_mask_homography_relative = cv2.findHomography(pos0[md_idx0], pos1[md_idx1], 
-                                                                        self.estimation_method, self.model_threshold)
+                H, inliers_mask_homography_relative = cv2.findHomography(
+                    source_model,
+                    target_model,
+                    self.estimation_method,
+                    threshold_model,
+                )
+
+            if H is not None:
+                input_to_model = np.diag(
+                    [
+                        1.0 / _METRES_PER_KILOMETRE,
+                        1.0 / _METRES_PER_KILOMETRE,
+                        1.0,
+                    ]
+                )
+                model_to_input = np.diag(
+                    [_METRES_PER_KILOMETRE, _METRES_PER_KILOMETRE, 1.0]
+                )
+                H = model_to_input @ H @ input_to_model
 
             if H is None:
                 logger.warning("Warning: Model estimation failed")

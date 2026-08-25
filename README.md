@@ -30,6 +30,7 @@ conda env create -f environment.yaml && conda activate limosat
 ```
 
 ## Run limosat
+
 1.	Prepare Your Data:
 Organize your satellite imagery into a folder and run `preprocessing.py`.
    If you use the gridded descriptor cache, note that changing stride or descriptor
