@@ -1,8 +1,6 @@
 # Minimal LiMOSAT run
 
-The previous notebook duplicated deployment setup, used outdated catalog and
-template APIs, and enabled persistence without configuring storage. This example
-shows the current library-level workflow without persistence.
+This example shows the library-level workflow without persistence.
 
 ```python
 from pathlib import Path

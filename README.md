@@ -34,7 +34,7 @@ conda env create -f environment.yaml && conda activate limosat
 1.	Prepare Your Data:
 Provide georeferenced, analysis-ready satellite imagery. Level-1 preprocessing is
 outside LiMOSAT; current deployments prepare imagery with `arktalas_vae`.
-LiMOSAT expects the tracking image in band 1 and optionally a land mask named
+LiMOSAT expects the SAR image data in band 1 and optionally a land mask named
 `mask` in band 2, where a value of 2 denotes land.
    If you use the gridded descriptor cache, note that changing stride or descriptor
    parameters (ORB settings, border size, octave) requires regenerating the cache.
