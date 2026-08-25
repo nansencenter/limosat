@@ -10,6 +10,10 @@ import geopandas as gpd
 from nansat import NSR
 from .utils import log_execution_time
 
+
+EXPECTED_CRS = "EPSG:3413"
+
+
 class Keypoints(gpd.GeoDataFrame):
     srs = NSR(3413)
 
@@ -42,7 +46,7 @@ class Keypoints(gpd.GeoDataFrame):
                 'stopped': [],
                 'converged_to': [],
             }
-            super().__init__(empty_data)
+            super().__init__(empty_data, geometry='geometry', crs=EXPECTED_CRS)
             if 'image_id' in self.columns:
                 self['image_id'] = self['image_id'].astype('int32')
             if 'is_last' in self.columns:
@@ -77,6 +81,12 @@ class Keypoints(gpd.GeoDataFrame):
                 self['interpolated'] = self['interpolated'].astype('int64', errors='ignore')
             if 'orbit_num' in self.columns:
                 self['orbit_num'] = self['orbit_num'].astype('int64', errors='ignore')
+
+        if 'geometry' in self.columns:
+            if self.crs is None:
+                self.set_crs(EXPECTED_CRS, inplace=True)
+            elif self.crs != EXPECTED_CRS:
+                raise ValueError(f"Keypoints must use {EXPECTED_CRS}, got {self.crs}.")
 
         self.srs = kwargs.get('srs', self.srs)
         max_id = self['trajectory_id'].max() if len(self) else None
@@ -172,7 +182,7 @@ class Keypoints(gpd.GeoDataFrame):
             'image_id': np.full(N, image_id, dtype=np.int32),
             'is_last': np.ones(N, dtype=np.int32),
             'trajectory_id': range(N),
-            'geometry': gpd.points_from_xy(xy[0], xy[1]),
+            'geometry': gpd.points_from_xy(xy[0], xy[1], crs=EXPECTED_CRS),
             'descriptors': list(descriptors),
             'angle': [img.angle] * N,
             'corr': np.zeros(N),

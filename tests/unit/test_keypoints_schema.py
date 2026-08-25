@@ -16,7 +16,20 @@ def test_keypoints_empty_schema():
         'angle', 'corr', 'time', 'interpolated', 'orbit_num', 'stopped', 'converged_to'
     }
     assert required.issubset(set(kp.columns))
+    assert kp.crs == 'EPSG:3413'
     assert_flags_valid(kp)
+
+
+@pytest.mark.unit
+def test_keypoints_rejects_other_coordinate_systems():
+    from limosat.keypoints import Keypoints
+
+    with pytest.raises(ValueError, match="must use EPSG:3413"):
+        Keypoints(
+            {'trajectory_id': [0]},
+            geometry=[Point(0, 0)],
+            crs='EPSG:4326',
+        )
 
 
 @pytest.mark.unit
