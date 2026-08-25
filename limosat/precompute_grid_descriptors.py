@@ -199,7 +199,7 @@ def main():
 
     try:
         from tqdm import tqdm
-        progress = tqdm(total=len(tasks), unit="img")
+        progress = tqdm(total=len(paths), unit="img")
     except Exception:
         progress = None
 
