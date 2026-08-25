@@ -26,7 +26,7 @@ class Matcher:
                  use_model_estimation=True,
                  estimation_method="USAC_MAGSAC",
                  min_homography_inliers=10,
-                 model_coordinate_scale_m=1.0,
+                 model_coordinate_scale_m=1000.0,
 
                  # Lowe's ratio test parameter
                  lowe_ratio=0.9,

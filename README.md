@@ -31,10 +31,6 @@ conda env create -f environment.yaml && conda activate limosat
 
 ## Run limosat
 
-The selected ORB tracking refinements are recorded in
-`examples/config.orb_tracking_refinements.yaml`. The example keeps paths local
-and explicit; replace them before running on Olivia.
-
 1.	Prepare Your Data:
 Organize your satellite imagery into a folder and run `preprocessing.py`.
    If you use the gridded descriptor cache, note that changing stride or descriptor

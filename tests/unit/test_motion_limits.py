@@ -80,7 +80,7 @@ def test_matcher_filter_respects_motion_distance_limit():
 
 
 @pytest.mark.unit
-def test_configured_homography_scale_preserves_physical_threshold_and_residuals(
+def test_default_homography_scale_preserves_physical_threshold_and_residuals(
     monkeypatch,
 ):
     matcher_module = load_real_module("limosat.matcher")
@@ -107,7 +107,6 @@ def test_configured_homography_scale_preserves_physical_threshold_and_residuals(
         descriptor_distance_max=100,
         model_threshold=15_000.0,
         min_homography_inliers=3,
-        model_coordinate_scale_m=1_000.0,
     )
 
     idx0, idx1, residuals = matcher.filter(matches, source, target)
@@ -118,6 +117,15 @@ def test_configured_homography_scale_preserves_physical_threshold_and_residuals(
     assert idx0.tolist() == [0, 1, 2, 3]
     assert idx1.tolist() == [0, 1, 2, 3]
     assert np.max(residuals) < 1e-9
+
+
+@pytest.mark.unit
+def test_matcher_allows_explicit_legacy_metre_coordinate_mode():
+    Matcher = load_real_module("limosat.matcher").Matcher
+
+    matcher = Matcher(model_coordinate_scale_m=1.0)
+
+    assert matcher.model_coordinate_scale_m == 1.0
 
 
 @pytest.mark.unit

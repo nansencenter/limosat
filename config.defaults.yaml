@@ -35,10 +35,10 @@ image_processor_params:
   candidate_search_max_daily_drift_m: 10000
   window_size: 64
   border_size: 128
-  border_matched: 16
-  border_interpolated: 32
-  pattern_matching_subpixel_method: none  # "quadratic" enables guarded subpixel refinement
-  template_sampling: integer              # "bilinear" preserves fractional template centres
+  border_matched: 24
+  border_interpolated: 48
+  pattern_matching_subpixel_method: quadratic  # Set to "none" only for legacy reproduction
+  template_sampling: bilinear                  # Set to "integer" only for legacy reproduction
   stride: 10
   octave: 8
   min_correlation: 0.35
@@ -68,4 +68,4 @@ matcher_params:
     type: "AffineTransform"
     use_model_estimation: true
     estimation_method: "USAC_MAGSAC"
-    coordinate_scale_m: 1.0  # Set to 1000.0 to fit homographies in kilometre coordinates
+    coordinate_scale_m: 1000.0  # Metres per estimator unit; 1.0 reproduces the legacy fit
