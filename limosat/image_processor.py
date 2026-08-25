@@ -866,16 +866,6 @@ class ImageProcessor:
             logger.warning("Descriptor computation failed; removing all remaining points.")
             points_matched = points_matched.iloc[0:0]  # Empty DataFrame
 
-        # Update templates for surviving points
-        if not points_matched.empty:
-            self.templates.update(
-                points_matched,
-                img,
-                self.template_size,
-                band=1,
-                sampling=self.template_sampling,
-            )
-
         logger.debug(f"Returning {len(points_matched)} final points")
         return points_matched, failed_predictions
 
