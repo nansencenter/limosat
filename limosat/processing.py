@@ -194,7 +194,8 @@ def pattern_matching(
     hs: int,
     band: str = 's0_HV',
     border_matched: int = 16,
-    border_interpolated: int = 32
+    border_interpolated: int = 32,
+    min_valid_fraction: float = 0.0,
 ):
     """
     Perform pattern matching on a single image band with template rotation search.
@@ -216,6 +217,26 @@ def pattern_matching(
     """
     mtype = cv2.TM_CCOEFF_NORMED
     image_band_data = img[band]
+    image_valid_data = None
+    if min_valid_fraction > 0.0:
+        try:
+            image_mask_data = img[2]
+            image_valid_data = (
+                (image_mask_data != 2)
+                & np.isfinite(image_band_data)
+                & (image_band_data > 0)
+            )
+        except Exception as exc:
+            logger.error(
+                "Pattern Matching: valid-data filtering requested but mask band "
+                f"could not be read: {exc}"
+            )
+            n_pts = len(points)
+            return (
+                np.full((n_pts, 2), np.nan),
+                np.full((n_pts, 2), np.nan),
+                np.full(n_pts, -1.0),
+            )
 
     pc_crs_pm = ccrs.PlateCarree()
     nps_crs_pm = ccrs.NorthPolarStereo(central_longitude=-45, true_scale_latitude=70)
@@ -287,6 +308,18 @@ def pattern_matching(
             logger.warning(f"Pattern Matching: Template for TID {current_tid} has zero variance. Skipping.")
             results_list.append((([0, 0], -1.0, 0.0)))
             continue
+
+        template_valid_fraction = float(np.mean(template_np > 0))
+        if template_valid_fraction < min_valid_fraction:
+            logger.debug(
+                "Pattern Matching: Template for TID %s has valid fraction %.3f "
+                "below minimum %.3f. Skipping.",
+                current_tid,
+                template_valid_fraction,
+                min_valid_fraction,
+            )
+            results_list.append((([0, 0], -1.0, 0.0)))
+            continue
         
         if template_np.shape != (hs * 2 + 1, hs * 2 + 1):
             logger.warning(f"Pattern Matching: Template for TID {current_tid} has unexpected shape {template_np.shape}. Expected ({hs*2+1}, {hs*2+1}). Skipping.")
@@ -307,6 +340,20 @@ def pattern_matching(
             continue
 
         sub_img = image_band_data[r_start_search:r_end_search, c_start_search:c_end_search]
+        valid_candidate_mask = None
+        if image_valid_data is not None:
+            sub_valid = image_valid_data[
+                r_start_search:r_end_search,
+                c_start_search:c_end_search,
+            ].astype(np.float32)
+            valid_counts = cv2.matchTemplate(
+                sub_valid,
+                np.ones((hs * 2 + 1, hs * 2 + 1), dtype=np.float32),
+                cv2.TM_CCORR,
+            )
+            valid_candidate_mask = (
+                valid_counts / float((hs * 2 + 1) ** 2)
+            ) >= min_valid_fraction
 
         # Expected shape of sub_img uses current_border
         expected_sub_img_shape = (hs * 2 + 1 + current_border * 2, hs * 2 + 1 + current_border * 2)
@@ -339,6 +386,12 @@ def pattern_matching(
                 if np.sum(mask) < (0.5 * h_t * w_t): # If less than 50% of template is valid after rotation
                     continue # Skip this rotation if too much of template is lost
                 result_match = cv2.matchTemplate(sub_img, rotated_template, mtype, mask=mask)
+
+            if valid_candidate_mask is not None:
+                result_match = np.asarray(result_match).copy()
+                result_match[~valid_candidate_mask] = -1.0
+                if not np.any(valid_candidate_mask):
+                    continue
 
             _, current_max_corr, _, max_loc_in_result = cv2.minMaxLoc(result_match)
 

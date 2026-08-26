@@ -23,6 +23,31 @@ from .keypoint_detector import KeypointDetector
 from .templates import Templates
 from .processing import interpolate_drift, pattern_matching
 
+
+def _post_pm_speed_mask(
+    source_xy,
+    source_times,
+    corrected_xy,
+    current_time,
+    max_speed_m_per_day,
+):
+    """Return the physical-validity mask for final PM-corrected vectors."""
+    source_times = pd.to_datetime(source_times)
+    time_diff_days = (
+        pd.Timestamp(current_time) - source_times
+    ).dt.total_seconds().to_numpy() / 86400.0
+    distance_m = np.linalg.norm(np.asarray(corrected_xy) - np.asarray(source_xy), axis=1)
+    final_speed_m_per_day = np.divide(
+        distance_m,
+        time_diff_days,
+        out=np.full(len(source_xy), np.inf, dtype=float),
+        where=time_diff_days > 1e-9,
+    )
+    return (
+        np.isfinite(final_speed_m_per_day)
+        & (final_speed_m_per_day <= float(max_speed_m_per_day))
+    ), final_speed_m_per_day
+
 class ImageProcessor:
     """Core pipeline for sequential ice drift tracking.
 
@@ -72,6 +97,8 @@ class ImageProcessor:
             'stride': 15,
             'octave': 8,
             'min_correlation': 0.4,
+            'min_pm_valid_fraction': 0.0,
+            'post_pm_max_speed_m_per_day': None,
             'response_threshold': 0.0001,
             'template_size': 16,
             'use_interpolation': True,
@@ -118,6 +145,14 @@ class ImageProcessor:
         self.stride = proc_params['stride']
         self.octave = proc_params['octave']
         self.min_correlation = proc_params['min_correlation']
+        self.min_pm_valid_fraction = float(proc_params['min_pm_valid_fraction'])
+        if not 0.0 <= self.min_pm_valid_fraction <= 1.0:
+            raise ValueError("min_pm_valid_fraction must be between 0 and 1.")
+        self.post_pm_max_speed_m_per_day = proc_params['post_pm_max_speed_m_per_day']
+        if self.post_pm_max_speed_m_per_day is not None:
+            self.post_pm_max_speed_m_per_day = float(self.post_pm_max_speed_m_per_day)
+            if self.post_pm_max_speed_m_per_day <= 0:
+                raise ValueError("post_pm_max_speed_m_per_day must be positive.")
         self.response_threshold = proc_params['response_threshold']
         self.template_size = proc_params['template_size']
         self.use_interpolation = proc_params['use_interpolation']
@@ -706,7 +741,8 @@ class ImageProcessor:
             hs=self.template_size,
             border_matched=self.border_matched,
             border_interpolated=self.border_interpolated,
-            band=1
+            band=1,
+            min_valid_fraction=self.min_pm_valid_fraction,
         )
 
         points_matched['corr'] = corr_values
@@ -722,7 +758,9 @@ class ImageProcessor:
         # Preserve original geometry for vector validation
         points_matched = pd.merge(
             points_matched,
-            points_orig[['trajectory_id', 'geometry']].rename(columns={'geometry': 'geometry_orig'}),
+            points_orig[['trajectory_id', 'geometry', 'time']].rename(
+                columns={'geometry': 'geometry_orig', 'time': 'time_orig'}
+            ),
             on='trajectory_id', how='left'
         )
         
@@ -760,7 +798,8 @@ class ImageProcessor:
                 hs=self.template_size,
                 border_matched=self.border_matched,
                 border_interpolated=self.border_interpolated,
-                band=1
+                band=1,
+                min_valid_fraction=self.min_pm_valid_fraction,
             )
             
             recheck_passed_mask = np.isfinite(corr_rechecked) & (corr_rechecked >= self.min_correlation)
@@ -798,8 +837,36 @@ class ImageProcessor:
             logger.debug("No points survived filtering.")
             return Keypoints(), failed_predictions
                         
+        # Reapply the physical velocity limit to the final PM-corrected vectors.
+        if self.post_pm_max_speed_m_per_day is not None:
+            source_xy = np.column_stack((
+                points_matched.geometry_orig.x.to_numpy(),
+                points_matched.geometry_orig.y.to_numpy(),
+            ))
+            post_pm_speed_mask, final_speed_m_per_day = _post_pm_speed_mask(
+                source_xy,
+                points_matched['time_orig'],
+                corrected_xy,
+                img.date,
+                self.post_pm_max_speed_m_per_day,
+            )
+            removed_count = int(np.sum(~post_pm_speed_mask))
+            if removed_count:
+                logger.info(
+                    "Post-PM velocity filter: Removed %d outlier points exceeding %.0f m/day.",
+                    removed_count,
+                    self.post_pm_max_speed_m_per_day,
+                )
+            points_matched = points_matched.loc[post_pm_speed_mask].copy()
+            corrected_xy = corrected_xy[post_pm_speed_mask]
+            corrected_rc = corrected_rc[post_pm_speed_mask]
+
+        if points_matched.empty:
+            logger.debug("No points survived final post-PM filtering.")
+            return Keypoints(), failed_predictions
+
         # Update geometry with corrected positions
-        points_matched = points_matched.drop(columns=['geometry_orig'])
+        points_matched = points_matched.drop(columns=['geometry_orig', 'time_orig'])
         points_matched['geometry'] = gpd.points_from_xy(corrected_xy[:, 0], corrected_xy[:, 1])
         
         logger.info(

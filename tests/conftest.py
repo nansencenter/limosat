@@ -195,7 +195,7 @@ def _inject_limosat_stubs():
     # processing stub
     if 'limosat.processing' not in sys.modules:
         pm = types.ModuleType('limosat.processing')
-        def pattern_matching(points, img, templates, points_fg1, hs, band='s0_HV', border_matched=16, border_interpolated=32):
+        def pattern_matching(points, img, templates, points_fg1, hs, band='s0_HV', border_matched=16, border_interpolated=32, min_valid_fraction=0.0):
             n = len(points)
             if n == 0:
                 return np.empty((0, 2)), np.empty((0, 2)), np.empty((0,))

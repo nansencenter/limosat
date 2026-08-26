@@ -210,3 +210,26 @@ def test_image_processor_buffer_uses_spatial_cap_without_max_speed():
     )
 
     assert proc._candidate_buffer_distance_m() == pytest.approx(15000.0)
+
+
+@pytest.mark.unit
+def test_post_pm_speed_mask_uses_corrected_positions():
+    image_processor = load_real_module("limosat.image_processor")
+
+    source_xy = np.array([[0.0, 0.0], [0.0, 0.0]])
+    corrected_xy = np.array([[34000.0, 0.0], [36000.0, 0.0]])
+    source_times = pd.Series([
+        pd.Timestamp("2020-03-01 00:00:00"),
+        pd.Timestamp("2020-03-01 00:00:00"),
+    ])
+
+    mask, speeds = image_processor._post_pm_speed_mask(
+        source_xy,
+        source_times,
+        corrected_xy,
+        pd.Timestamp("2020-03-02 00:00:00"),
+        35000.0,
+    )
+
+    assert speeds.tolist() == pytest.approx([34000.0, 36000.0])
+    assert mask.tolist() == [True, False]
