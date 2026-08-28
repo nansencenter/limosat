@@ -1,0 +1,18 @@
+{
+  "experiment": "efficientloftr_march_leave_one_out",
+  "analysis_crs": "EPSG:3413",
+  "displacement_units": "metres",
+  "baseline_image_ids": [10107, 10217, 10229, 10245, 10341, 10352],
+  "sequences": [
+    {
+      "name": "remove_10217",
+      "image_ids": [10107, 10229, 10245, 10341, 10352],
+      "purpose": "Replace the first 21.41 h and 1.64 h edges with one 23.04 h edge, then measure downstream routing sensitivity."
+    },
+    {
+      "name": "remove_10245",
+      "image_ids": [10107, 10217, 10229, 10341, 10352],
+      "purpose": "Replace an interior 1.64 h and 19.77 h pair with one 21.41 h edge, then measure the following 3.27 h edge."
+    }
+  ]
+}

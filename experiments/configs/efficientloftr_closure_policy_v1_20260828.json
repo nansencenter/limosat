@@ -1,0 +1,27 @@
+{
+  "policy_name": "shortest_primary_closure_fused_v1",
+  "truth_status_at_freeze": "buoy metrics sealed",
+  "analysis_crs": "EPSG:3413",
+  "coordinate_units": "metres",
+  "primary_candidate": "fewest skipped images, then most selected matches",
+  "closure_agreement_m": 1000.0,
+  "uncertainty_floor_m": 80.0,
+  "maximum_triangle_edge_m": 6400.0,
+  "fusion_weight": "selected_matches / max(maximum_residual_m, uncertainty_floor_m)^2",
+  "conflict_action": "retain the alternative in the candidate ledger but do not fuse it into the primary endpoint",
+  "parameter_basis": {
+    "closure_agreement_m": "existing EfficientLoFTR local consensus distance",
+    "uncertainty_floor_m": "one analysis pixel",
+    "maximum_triangle_edge_m": "existing fold-free trajectory interpolation limit"
+  },
+  "sealed_nice_evidence": {
+    "multiple_candidate_rows": 2378,
+    "fused_rows": 2351,
+    "conflict_rows": 27,
+    "primary_to_fused_median_m": 28.888944519924465,
+    "primary_to_fused_p90_m": 138.04457608096473,
+    "final_shortest_trajectories": 1581,
+    "final_fused_trajectories": 1582,
+    "final_total_deformation_spearman": 0.9291905555259893
+  }
+}
