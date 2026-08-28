@@ -12,9 +12,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sys
 import time
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -55,7 +57,18 @@ from limosat.learned_drift.trajectory_graph import (
     FieldEdge,
     advect_trajectory_graph,
 )
+from limosat.learned_drift.tile_gates import (
+    OpenWaterEvidence,
+    SicField,
+    SicFileIndex,
+    load_sic_field,
+    tile_open_water_evidence,
+    valid_tile_overlap_gate,
+)
 from limosat.learned_drift.types import DriftField, MotionMatches
+
+
+SENTINEL1_TIME_RE = re.compile(r"_(\d{8}T\d{6})_")
 
 
 @dataclass(frozen=True)
@@ -92,7 +105,51 @@ def parse_args() -> argparse.Namespace:
         default=30.0,
         help="Radial physics gate; test 30, 40, and 50 before changing the default.",
     )
+    parser.add_argument(
+        "--sic-root",
+        type=Path,
+        help="Optional OSI SAF OSI-401-d root for conservative open-water skipping.",
+    )
+    parser.add_argument("--sic-open-water-threshold-percent", type=float, default=15.0)
+    parser.add_argument("--sic-max-age-days", type=int, default=1)
+    parser.add_argument("--sic-samples-per-axis", type=int, default=5)
     return parser.parse_args()
+
+
+def acquisition_time_from_path(path: str) -> datetime | None:
+    """Return the first Sentinel-1 acquisition time encoded in a filename."""
+    match = SENTINEL1_TIME_RE.search(Path(path).name)
+    return datetime.strptime(match.group(1), "%Y%m%dT%H%M%S") if match else None
+
+
+def open_water_gate_policy(
+    threshold_percent: float, samples_per_axis: int
+) -> dict:
+    """Return the shared scientific policy recorded at every output level."""
+    if not 0 <= threshold_percent <= 100:
+        raise ValueError("SIC open-water threshold must be in [0, 100]")
+    if samples_per_axis < 2:
+        raise ValueError("at least two SIC samples per axis are required")
+    return {
+        "variable_policy": "prefer_ice_conc_unfiltered",
+        "threshold_percent": threshold_percent,
+        "samples_per_axis": samples_per_axis,
+        "policy": "skip only when all samples on both dates are below threshold",
+        "missing_sic_policy": "keep_tile",
+    }
+
+
+def sic_evidence_metrics(
+    prefix: str, evidence: OpenWaterEvidence | None
+) -> dict[str, int | float | None]:
+    return {
+        f"{prefix}_sic_valid_samples": (
+            None if evidence is None else evidence.valid_samples
+        ),
+        f"{prefix}_sic_max_percent": (
+            None if evidence is None else evidence.maximum_sic_percent
+        ),
+    }
 
 
 def load_specs(args: argparse.Namespace) -> list[PairSpec]:
@@ -219,6 +276,10 @@ def pair_identity(
     previous_elapsed_days: float | None,
     source_selection_xy_m: np.ndarray | None = None,
     source_selection_buffer_m: float | None = None,
+    source_sic_path: Path | None = None,
+    target_sic_path: Path | None = None,
+    sic_open_water_threshold_percent: float = 15.0,
+    sic_samples_per_axis: int = 5,
 ) -> str:
     identity = {
         "source_image_id": spec.source_image_id,
@@ -234,6 +295,17 @@ def pair_identity(
         "initial_displacement_m": initial_displacement_m,
         "previous_field_sha256": field_sha256(previous_field),
         "previous_elapsed_days": previous_elapsed_days,
+        "pre_match_tile_gates": {
+            "valid_overlap": "endpoint_support_bounds_v1",
+            "open_water": {
+                **open_water_gate_policy(
+                    sic_open_water_threshold_percent, sic_samples_per_axis
+                ),
+                "enabled": source_sic_path is not None and target_sic_path is not None,
+                "source_sic_path": None if source_sic_path is None else str(source_sic_path),
+                "target_sic_path": None if target_sic_path is None else str(target_sic_path),
+            },
+        },
     }
     if source_selection_xy_m is not None:
         identity["source_selection_sha256"] = array_sha256(source_selection_xy_m)
@@ -338,6 +410,10 @@ def track_pair(
     output_dir: Path,
     source_selection_xy_m: np.ndarray | None = None,
     source_selection_buffer_m: float | None = None,
+    source_sic: SicField | None = None,
+    target_sic: SicField | None = None,
+    sic_open_water_threshold_percent: float = 15.0,
+    sic_samples_per_axis: int = 5,
 ) -> tuple[DriftField, dict]:
     pair_started = time.perf_counter()
     source_domain, target_domain = pair_domains(spec, config)
@@ -401,7 +477,75 @@ def track_pair(
         target_support = valid_support(
             target_valid, config.endpoint_support_radius_px
         )
+        source_core_support = source_support.copy()
+        margin = config.tile_margin_px
+        source_core_support[:margin] = False
+        source_core_support[config.tile_size_px - margin :] = False
+        source_core_support[:, :margin] = False
+        source_core_support[:, config.tile_size_px - margin :] = False
+
+        validity_gate = valid_tile_overlap_gate(
+            source_core_support,
+            target_support,
+            region.center_xy_m,
+            target_center,
+            config.pixel_size_m,
+            config.maximum_displacement_m(spec.elapsed_hours),
+        )
+        source_open_water = None
+        target_open_water = None
+        skip_reason = validity_gate.reason
+        if not validity_gate.skip and source_sic is not None and target_sic is not None:
+            source_open_water = tile_open_water_evidence(
+                source_sic,
+                region.center_xy_m,
+                config.tile_core_size_m,
+                config.analysis_epsg,
+                sic_open_water_threshold_percent,
+                sic_samples_per_axis,
+            )
+            target_open_water = tile_open_water_evidence(
+                target_sic,
+                target_center,
+                config.tile_size_px * config.pixel_size_m,
+                config.analysis_epsg,
+                sic_open_water_threshold_percent,
+                sic_samples_per_axis,
+            )
+            if source_open_water.confidently_open and target_open_water.confidently_open:
+                skip_reason = "open_water_both_dates"
         sampling_seconds += time.perf_counter() - started
+
+        tile_metric = {
+            "tile_id": region.tile_id,
+            "row": region.row,
+            "column": region.column,
+            "source_center_x_m": region.center_xy_m[0],
+            "source_center_y_m": region.center_xy_m[1],
+            "target_center_x_m": target_center[0],
+            "target_center_y_m": target_center[1],
+            "routing_dx_m": shift_m[0],
+            "routing_dy_m": shift_m[1],
+            "routing_source": routing_source,
+            "skip_reason": skip_reason,
+            "source_support_pixels": validity_gate.source_support_pixels,
+            "target_support_pixels": validity_gate.target_support_pixels,
+            "minimum_support_bounds_distance_m": (
+                validity_gate.minimum_bounds_distance_m
+            ),
+            **sic_evidence_metrics("source", source_open_water),
+            **sic_evidence_metrics("target", target_open_water),
+        }
+        if skip_reason is not None:
+            tile_metrics.append(
+                {
+                    **tile_metric,
+                    "raw_matches": 0,
+                    "physics_valid_matches": 0,
+                    "matching_seconds": 0.0,
+                }
+            )
+            continue
 
         inputs = matcher_inputs(source_patch, target_patch, device)
         started = time.perf_counter()
@@ -442,16 +586,7 @@ def track_pair(
         tile_rows.append(np.full(int(accepted.sum()), region.tile_id, dtype=np.int32))
         tile_metrics.append(
             {
-                "tile_id": region.tile_id,
-                "row": region.row,
-                "column": region.column,
-                "source_center_x_m": region.center_xy_m[0],
-                "source_center_y_m": region.center_xy_m[1],
-                "target_center_x_m": target_center[0],
-                "target_center_y_m": target_center[1],
-                "routing_dx_m": shift_m[0],
-                "routing_dy_m": shift_m[1],
-                "routing_source": routing_source,
+                **tile_metric,
                 "raw_matches": int(len(scores)),
                 "physics_valid_matches": int(accepted.sum()),
                 "matching_seconds": tile_matching_seconds,
@@ -543,6 +678,13 @@ def track_pair(
     if buoy is not None:
         buoy.to_csv(output_dir / "buoy_results.csv", index=False)
     pd.DataFrame(tile_metrics).to_csv(output_dir / "tiles.csv", index=False)
+    skip_counts = (
+        pd.Series(
+            [item["skip_reason"] for item in tile_metrics if item["skip_reason"]]
+        )
+        .value_counts()
+        .to_dict()
+    )
 
     summary = {
         "status": "complete",
@@ -561,6 +703,23 @@ def track_pair(
             ),
         },
         "source_tiles": len(tile_metrics),
+        "matched_source_tiles": len(tile_metrics) - sum(skip_counts.values()),
+        "skipped_source_tiles": sum(skip_counts.values()),
+        "tile_skip_counts": skip_counts,
+        "open_water_gate": {
+            **open_water_gate_policy(
+                sic_open_water_threshold_percent, sic_samples_per_axis
+            ),
+            "enabled": source_sic is not None and target_sic is not None,
+            "source_sic_path": (
+                None if source_sic is None else str(source_sic.source_path)
+            ),
+            "target_sic_path": (
+                None if target_sic is None else str(target_sic.source_path)
+            ),
+            "source_variable": None if source_sic is None else source_sic.variable,
+            "target_variable": None if target_sic is None else target_sic.variable,
+        },
         "full_source_tiles": len(all_regions),
         "targeted_recovery": (
             {
@@ -857,6 +1016,12 @@ def save_trajectory_products(
 def main() -> int:
     args = parse_args()
     specs = load_specs(args)
+    open_water_policy = open_water_gate_policy(
+        args.sic_open_water_threshold_percent, args.sic_samples_per_axis
+    )
+    if args.sic_max_age_days < 0:
+        raise ValueError("maximum SIC age cannot be negative")
+    sic_index = SicFileIndex(args.sic_root) if args.sic_root is not None else None
     config = EfficientLoFTRConfig(
         maximum_speed_m_per_day=args.maximum_speed_km_per_day * 1_000.0
     )
@@ -896,6 +1061,22 @@ def main() -> int:
     fields = []
     resumed_pairs = 0
     for pair_index, spec in enumerate(specs):
+        source_sic_path = (
+            None
+            if sic_index is None
+            else sic_index.resolve(
+                acquisition_time_from_path(spec.source_path),
+                args.sic_max_age_days,
+            )
+        )
+        target_sic_path = (
+            None
+            if sic_index is None
+            else sic_index.resolve(
+                acquisition_time_from_path(spec.target_path),
+                args.sic_max_age_days,
+            )
+        )
         initial_displacement_m = (
             initial_translation.displacement_m
             if pair_index == 0 and initial_translation is not None
@@ -911,6 +1092,12 @@ def main() -> int:
             checkpoint_sha256,
             previous_field,
             previous_elapsed_days,
+            source_sic_path=source_sic_path,
+            target_sic_path=target_sic_path,
+            sic_open_water_threshold_percent=(
+                args.sic_open_water_threshold_percent
+            ),
+            sic_samples_per_axis=args.sic_samples_per_axis,
         )
         completed = load_completed_pair(pair_dir, identity)
         if completed is not None:
@@ -936,6 +1123,16 @@ def main() -> int:
                 initial_displacement_m,
                 identity,
                 pair_dir,
+                source_sic=(
+                    None if source_sic_path is None else load_sic_field(source_sic_path)
+                ),
+                target_sic=(
+                    None if target_sic_path is None else load_sic_field(target_sic_path)
+                ),
+                sic_open_water_threshold_percent=(
+                    args.sic_open_water_threshold_percent
+                ),
+                sic_samples_per_axis=args.sic_samples_per_axis,
             )
         previous_elapsed_days = spec.elapsed_hours / 24.0
         pair_summaries.append(summary)
@@ -1014,6 +1211,16 @@ def main() -> int:
             "maximum_triangle_edge_m": config.maximum_triangle_edge_m,
             "new_point_exclusion_radius_m": config.new_point_exclusion_radius_m,
             "confidence_threshold": None,
+        },
+        "pre_match_tile_gates": {
+            "valid_overlap": "endpoint_support_bounds_v1",
+            "open_water": {
+                **open_water_policy,
+                "enabled": sic_index is not None,
+                "sic_root": None if args.sic_root is None else str(args.sic_root),
+                "product": "EUMETSAT OSI SAF OSI-401-d",
+                "max_age_days": args.sic_max_age_days,
+            },
         },
         "pairs_summary": pair_summaries,
         "trajectories": trajectory_summary,
