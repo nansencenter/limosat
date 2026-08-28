@@ -1,0 +1,21 @@
+{
+  "policy_name": "dormant_trajectory_targeted_recovery_v1",
+  "truth_status_at_freeze": "N-ICE used for design; March buoy results sealed",
+  "selection_basis": "positions active at the non-consecutive pair source and inactive at its target in the adjacent-only trajectory graph",
+  "selection_buffer_m": 6400.0,
+  "selection_buffer_basis": "existing maximum fold-free trajectory interpolation distance",
+  "gate": {
+    "trajectory_gain_recovery_fraction_min": 0.9,
+    "matcher_call_reduction_fraction_min": 0.5,
+    "buoy_availability_loss_max": 0,
+    "buoy_correct_within_2km_loss_max": 0,
+    "buoy_median_error_increase_m_max": 1.0,
+    "buoy_p90_error_increase_m_max": 1.0,
+    "flipped_triangles_max": 0,
+    "trajectory_position_median_difference_m_max": 80.0,
+    "trajectory_position_p90_difference_m_max": 250.0,
+    "trajectory_total_deformation_spearman_min": 0.8
+  },
+  "comparison_policy": "routing-matched full-source matching versus targeted matching, both replayed with the shortest-observation primary trajectory policy",
+  "deformation_gate_scope": "the resulting cumulative trajectory graph; sparse non-consecutive recovery fields remain a diagnostic because they are not emitted as deformation products"
+}
