@@ -1,31 +1,28 @@
-"""North-up sampling of the standard LiMOSAT VAE imagery."""
+"""North-up sampling of the standard LiMOSAT VAE imagery with Rasterio."""
 
 from __future__ import annotations
 
+import atexit
 import math
+from dataclasses import dataclass
 from functools import lru_cache
 
 import cv2
 import numpy as np
-import shapely
-from nansat import NSR
-from osgeo import gdal
+import rasterio
+from rasterio.transform import AffineTransformer, GCPTransformer
 from pyproj import Transformer
+from shapely.geometry import Polygon
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import transform
-
-from limosat.image import Image
-
-gdal.UseExceptions()
 
 
 @lru_cache(maxsize=4)
 def read_scene(path: str) -> tuple[np.ndarray, np.ndarray | None]:
     """Read one VAE image and its optional invalid-pixel mask."""
-    dataset = gdal.Open(path)
-    if dataset is None:
-        raise FileNotFoundError(path)
-    image = np.asarray(dataset.GetRasterBand(1).ReadAsArray())
+    with rasterio.open(path) as dataset:
+        image = dataset.read(1)
+        mask = dataset.read(2).astype(np.uint8) if dataset.count >= 2 else None
     if image.dtype != np.uint8:
         finite = np.isfinite(image)
         if not finite.any():
@@ -35,26 +32,107 @@ def read_scene(path: str) -> tuple[np.ndarray, np.ndarray | None]:
         image = np.clip((image - low) * 255.0 / scale, 0, 255).astype(np.uint8)
     else:
         image = image.copy()
-    mask = (
-        np.asarray(dataset.GetRasterBand(2).ReadAsArray(), dtype=np.uint8)
-        if dataset.RasterCount >= 2
-        else None
-    )
     if mask is not None:
         image[mask >= 2] = 0
     return image, mask
 
 
+@dataclass
+class _SceneTransform:
+    width: int
+    height: int
+    transformer: AffineTransformer | GCPTransformer
+    analysis_to_native: Transformer
+    native_to_lonlat: Transformer
+
+    def analysis_to_pixels(
+        self, x_m: np.ndarray, y_m: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        native_x, native_y = self.analysis_to_native.transform(x_m, y_m)
+        rows, columns = self.transformer.rowcol(
+            native_x, native_y, op=lambda value: value
+        )
+        return (
+            np.asarray(columns, dtype=np.float64),
+            np.asarray(rows, dtype=np.float64),
+        )
+
+    def pixels_to_lonlat(
+        self, columns: np.ndarray, rows: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        native_x, native_y = self.transformer.xy(rows, columns, offset="ul")
+        longitude, latitude = self.native_to_lonlat.transform(native_x, native_y)
+        return (
+            np.asarray(longitude, dtype=np.float64),
+            np.asarray(latitude, dtype=np.float64),
+        )
+
+
 @lru_cache(maxsize=4)
-def image_object(path: str, analysis_epsg: int) -> Image:
-    return Image(path, srs=NSR(analysis_epsg))
+def image_object(path: str, analysis_epsg: int) -> _SceneTransform:
+    """Return the cached native/pixel transform for one scene.
+
+    The standard VAE GeoTIFFs use ground-control points rather than a single
+    affine geotransform. GDAL's thin-plate-spline transformer is selected for
+    those files, matching the previous Nansat sampling path.
+    """
+    with rasterio.open(path) as dataset:
+        gcps, gcp_crs = dataset.gcps
+        if gcps:
+            if gcp_crs is None:
+                raise ValueError(f"ground-control points have no CRS: {path}")
+            native_crs = gcp_crs
+            pixel_transformer = GCPTransformer(gcps, tps=True)
+        else:
+            if dataset.crs is None:
+                raise ValueError(
+                    f"image has neither ground-control points nor a CRS: {path}"
+                )
+            native_crs = dataset.crs
+            pixel_transformer = AffineTransformer(dataset.transform)
+        return _SceneTransform(
+            width=dataset.width,
+            height=dataset.height,
+            transformer=pixel_transformer,
+            analysis_to_native=Transformer.from_crs(
+                analysis_epsg, native_crs, always_xy=True
+            ),
+            native_to_lonlat=Transformer.from_crs(
+                native_crs, 4326, always_xy=True
+            ),
+        )
+
+
+atexit.register(image_object.cache_clear)
+
+
+def _border_pixels(size: int, points: int = 10) -> list[int]:
+    step = max(1, int(size / points))
+    return list(range(0, size, step))[:points] + [size]
 
 
 def projected_footprint(path: str, analysis_epsg: int) -> BaseGeometry:
     """Return the image footprint in the metre-based analysis CRS."""
-    geometry = shapely.from_geojson(
-        image_object(path, analysis_epsg).get_border_geojson()
+    scene = image_object(path, analysis_epsg)
+    x_vector = _border_pixels(scene.width)
+    y_vector = _border_pixels(scene.height)
+    columns = np.asarray(
+        x_vector
+        + [scene.width] * len(y_vector)
+        + x_vector[::-1]
+        + [0] * len(y_vector),
+        dtype=np.float64,
     )
+    rows = np.asarray(
+        [0] * len(x_vector)
+        + y_vector
+        + [scene.height] * len(x_vector)
+        + y_vector[::-1],
+        dtype=np.float64,
+    )
+    longitude, latitude = scene.pixels_to_lonlat(columns, rows)
+    # Preserve Nansat get_border()'s established four-decimal-degree footprint.
+    geometry = Polygon(np.column_stack((longitude.round(4), latitude.round(4))))
     projector = Transformer.from_crs(
         4326, analysis_epsg, always_xy=True
     ).transform
@@ -94,11 +172,8 @@ def north_up_patch(
     )
     projected_x, projected_y_offset = np.meshgrid(center_xy_m[0] + offsets, offsets)
     projected_y = center_xy_m[1] - projected_y_offset
-    columns, rows = image_object(path, analysis_epsg).transform_points(
-        projected_x.ravel(),
-        projected_y.ravel(),
-        DstToSrc=1,
-        dst_srs=NSR(analysis_epsg),
+    columns, rows = image_object(path, analysis_epsg).analysis_to_pixels(
+        projected_x.ravel(), projected_y.ravel()
     )
     coarse_x = np.asarray(columns, dtype=np.float32).reshape(
         coarse_pixels, coarse_pixels

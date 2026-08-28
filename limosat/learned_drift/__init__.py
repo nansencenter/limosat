@@ -1,21 +1,40 @@
 """Learned-matcher sea-ice drift components."""
 
-from .config import ALIKEDConfig, EfficientLoFTRConfig
-from .efficientloftr import (
-    source_core_mask,
-    speed_limit_mask,
-    valid_endpoints,
-    valid_support,
-)
-from .features import extract_image_features, restrict_features, tile_layout
-from .field import estimate_field, reject_folds, regular_grid, topology_summary
-from .matching import DirectALIKEDLightGlue, match_features
-from .pipeline import ALIKEDDrift
-from .routing import CoarseTranslation, coarse_phase_translation, preceding_field_shifts
-from .store import ImagePair, LearnedDriftStore
-from .trajectory import FieldSamples, advect_trajectories, sample_field
-from .trajectory_graph import FieldEdge, advect_trajectory_graph
-from .types import DriftField, FeatureTile, ImageFeatures, MotionMatches, PairResult
+from importlib import import_module
+
+_PUBLIC_MODULES = {
+    "ALIKEDConfig": ".config",
+    "EfficientLoFTRConfig": ".config",
+    "source_core_mask": ".efficientloftr",
+    "speed_limit_mask": ".efficientloftr",
+    "valid_endpoints": ".efficientloftr",
+    "valid_support": ".efficientloftr",
+    "extract_image_features": ".features",
+    "restrict_features": ".features",
+    "tile_layout": ".features",
+    "estimate_field": ".field",
+    "reject_folds": ".field",
+    "regular_grid": ".field",
+    "topology_summary": ".field",
+    "DirectALIKEDLightGlue": ".matching",
+    "match_features": ".matching",
+    "ALIKEDDrift": ".pipeline",
+    "CoarseTranslation": ".routing",
+    "coarse_phase_translation": ".routing",
+    "preceding_field_shifts": ".routing",
+    "ImagePair": ".store",
+    "LearnedDriftStore": ".store",
+    "FieldSamples": ".trajectory",
+    "advect_trajectories": ".trajectory",
+    "sample_field": ".trajectory",
+    "FieldEdge": ".trajectory_graph",
+    "advect_trajectory_graph": ".trajectory_graph",
+    "DriftField": ".types",
+    "FeatureTile": ".types",
+    "ImageFeatures": ".types",
+    "MotionMatches": ".types",
+    "PairResult": ".types",
+}
 
 __all__ = [
     "ALIKEDConfig",
@@ -50,3 +69,13 @@ __all__ = [
     "valid_endpoints",
     "valid_support",
 ]
+
+
+def __getattr__(name: str):
+    """Keep matcher-specific dependencies out of unrelated learned imports."""
+    module_name = _PUBLIC_MODULES.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(module_name, __name__), name)
+    globals()[name] = value
+    return value
