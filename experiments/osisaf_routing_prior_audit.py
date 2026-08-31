@@ -771,12 +771,18 @@ def write_report(
     paired_duration = paired_summary(samples, ["duration_band"])
     paired_agreement = paired_summary(samples, ["phase_osi455_agreement"])
     paired_sic = paired_summary(samples, ["sic_stratum"])
+    paired_split = paired_summary(samples, ["experiment_split"])
+    paired_provenance = paired_summary(samples, ["osi455_provenance"])
     pairs = pair_summary(samples)
     overall.to_csv(output_dir / "method_summary_overall.csv", index=False)
     by_duration.to_csv(output_dir / "method_summary_by_duration.csv", index=False)
     paired_duration.to_csv(output_dir / "paired_summary_by_duration.csv", index=False)
     paired_agreement.to_csv(output_dir / "paired_summary_by_agreement.csv", index=False)
     paired_sic.to_csv(output_dir / "paired_summary_by_sic.csv", index=False)
+    paired_split.to_csv(output_dir / "paired_summary_by_split.csv", index=False)
+    paired_provenance.to_csv(
+        output_dir / "paired_summary_by_provenance.csv", index=False
+    )
     pairs.to_csv(output_dir / "pair_summary.csv", index=False)
     long_pairs = pairs.loc[pairs["elapsed_hours"] >= 30].sort_values("elapsed_hours")
     report = "\n".join(
@@ -785,6 +791,9 @@ def write_report(
             "",
             "OSI-455 and phase correlation are evaluated only as target-window priors; "
             "the buoy truth is not used to form either prior.",
+            "",
+            "Dataset DOI: https://doi.org/10.15770/EUM_SAF_OSI_0012. "
+            "Files were retrieved from the configured academic THREDDS mirror and hashed.",
             "",
             f"- Pair cases: {len(cases)}",
             f"- Buoy-pair samples: {len(samples)}",
@@ -811,6 +820,14 @@ def write_report(
             "## Paired phase versus OSI-455 by sea-ice stratum",
             "",
             markdown_table(paired_sic),
+            "",
+            "## Paired phase versus OSI-455 by frozen experiment split",
+            "",
+            markdown_table(paired_split),
+            "",
+            "## Paired phase versus OSI-455 by OSI provenance",
+            "",
+            markdown_table(paired_provenance),
             "",
             "## Cases at least 30 hours",
             "",

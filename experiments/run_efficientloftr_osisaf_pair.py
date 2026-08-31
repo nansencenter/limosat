@@ -51,6 +51,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pair-dir", type=Path, required=True)
     parser.add_argument("--cohort", required=True)
     parser.add_argument("--role", required=True)
+    parser.add_argument(
+        "--cluster",
+        help="Independent sequence/component label for grouped analysis.",
+    )
     parser.add_argument("--baseline-summary", type=Path)
     parser.add_argument("--efficientloftr-repo", type=Path, default=DEFAULT_REPO)
     parser.add_argument(
@@ -239,6 +243,7 @@ def main() -> int:
     manifest = {
         "status": "complete",
         "role": args.role,
+        "cluster": args.cluster,
         "case_id": case.case_id,
         "source_image_id": case.source_image_id,
         "target_image_id": case.target_image_id,

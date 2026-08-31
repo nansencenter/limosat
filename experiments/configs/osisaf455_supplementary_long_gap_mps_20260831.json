@@ -1,0 +1,36 @@
+{
+  "cases": [
+    {
+      "cohort": "full70_2020",
+      "cluster": "jan16_20",
+      "role": "supplementary_long_gap_edge",
+      "pair_dir": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/learned_feature_pilots/efficientloftr_full70_components_phase_local_mps_v1_20260824/reference_pairs/pair_1793_2039",
+      "baseline_summary": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/learned_feature_pilots/efficientloftr_full70_components_phase_local_mps_v1_20260824/sequence_03_jan16_20/pair_1793_2039/summary.json"
+    },
+    {
+      "cohort": "full70_2020",
+      "cluster": "mar21_26",
+      "role": "supplementary_long_gap_edge",
+      "pair_dir": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/learned_feature_pilots/efficientloftr_full70_components_phase_local_mps_v1_20260824/reference_pairs/pair_9535_9872"
+    },
+    {
+      "cohort": "nice_adjacent",
+      "cluster": "nice_apr27_may02",
+      "role": "supplementary_long_gap_edge",
+      "pair_dir": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2015/learned_feature_pilots/efficientloftr_sequence_6775_6801_6901_6998_phase_local_mps_v1_20260823/pair_6801_6901"
+    },
+    {
+      "cohort": "nice_adjacent",
+      "cluster": "nice_apr27_may02",
+      "role": "supplementary_long_gap_edge",
+      "pair_dir": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2015/learned_feature_pilots/efficientloftr_sequence_6775_6801_6901_6998_phase_local_mps_v1_20260823/pair_6901_6998"
+    },
+    {
+      "cohort": "nice_simulated_gap",
+      "cluster": "nice_apr27_may02",
+      "role": "supplementary_long_gap_edge",
+      "pair_dir": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2015/learned_feature_pilots/efficientloftr_skip_pair_6775_6901_phase_mps_v1_20260823/pair_6775_6901",
+      "baseline_summary": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2015/learned_feature_pilots/efficientloftr_skip_pair_6775_6901_phase_mps_v1_20260823/pair_6775_6901/summary.json"
+    }
+  ]
+}
