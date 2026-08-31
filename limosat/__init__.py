@@ -10,12 +10,17 @@ from .config import (
     load_config,
 )
 from .models import DisplacementField, FieldEdge, MotionMatches, PairResult
+from .deformation import DeformationCell, deformation_from_field
+from .efficientloftr import EfficientLoFTR
+from .pairs import PairProcessor
 from .trajectory import TrajectoryPoint, build_trajectories
 from .run import LiMOSATRun
 from .store import RunStore
 
 __all__ = [
     "DisplacementField",
+    "DeformationCell",
+    "EfficientLoFTR",
     "FieldConfig",
     "FieldEdge",
     "ImageCatalogue",
@@ -25,12 +30,14 @@ __all__ = [
     "LiMOSATRun",
     "MotionMatches",
     "PairResult",
+    "PairProcessor",
     "RoutingConfig",
     "RunConfig",
     "RunStore",
     "TrajectoryConfig",
     "TrajectoryPoint",
     "build_trajectories",
+    "deformation_from_field",
     "load_catalogue",
     "load_config",
 ]

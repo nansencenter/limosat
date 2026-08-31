@@ -1,68 +1,38 @@
-# LiMOSAT Default Configuration File (config.defaults.yaml)
-# Users should copy this to 'config.yaml' and modify it for their specific run.
+run_id: limosat-efficientloftr-run
+catalogue: ./catalogue.csv
+database: ./outputs/limosat.sqlite
+output_directory: ./outputs
+analysis_epsg: 3413
 
-run_settings:
-  run_name: "limosat_default_run" # Unique name for the run, used for DB and Zarr store
-  clear_existing_data: false      # If true, drops DB table for 'run_name' and clears Zarr store.
-  max_cpu_cores: null             # Integer: Max number of CPU cores to use. null or omit to disable.
+matcher:
+  repository: /path/to/EfficientLoFTR
+  checkpoint: /path/to/eloftr_outdoor.ckpt
+  model_name: efficientloftr-official-opt
+  device: cuda
+  pixel_size_m: 80.0
+  tile_size_px: 512
+  tile_margin_px: 32
+  endpoint_support_radius_px: 16
+  transform_grid_spacing_px: 32
+  tile_grid_origin_m: 0.0
+  maximum_speed_m_per_day: 30000.0
 
-database:
-  engine_url: "postgresql://user:password@localhost:5432/arktalas"
-  zarr_path_template: "./data/zarr_stores/{run_name}.zarr"
+field:
+  grid_spacing_m: 4000.0
+  neighbour_count: 12
+  minimum_agreeing_matches: 8
+  maximum_neighbour_distance_m: 6000.0
+  agreement_distance_m: 1000.0
+  maximum_triangle_edge_m: 6400.0
 
-paths:
-  image_catalog:
-    metadata_path: "./data/catalogs/image_catalog.geojson" # Path to pre-existing image catalog GeoJSON
-    start_date_filter: null # Optional: "YYYY-MM-DD HH:MM:SS"
-    end_date_filter: null   # Optional: "YYYY-MM-DD HH:MM:SS"
+routing:
+  mode: sequential_local
+  initial: phase_correlation
+  residual_edge_recovery: true
+  targeted_recovery: true
+  maximum_skip_images: 1
+  targeted_selection_buffer_m: 6400.0
 
-  insitu_points: # Optional: for seeding initial points
-    use_insitu_seeding: false
-    geojson_path: "./data/insitu/buoy_data.geojson" # GeoJSON with in-situ data
-    target_crs: "EPSG:3413" # Target Coordinate Reference System
-    seeding_selection:
-      max_attempts_per_buoy: 100
-      max_time_diff_minutes: 60
-      min_hours_between_seeds: 2
-      warmup_days: 0
-
-image_processor_params:
-  persist_updates: true
-  persist_interval: 100
-  pruning_interval: 25
-  temporal_window: 4  # days
-  max_speed_m_per_day: null
-  candidate_search_max_daily_drift_m: 10000
-  window_size: 64
-  border_size: 128
-  border_matched: 16
-  border_interpolated: 32
-  stride: 10
-  octave: 8
-  min_correlation: 0.35
-  response_threshold: 0
-  template_size: 16
-  use_interpolation: true
-  max_interpolation_time_gap_hours: 24
-
-keypoint_detector:
-  type: "ORB"
-  orb_params:
-    nfeatures: 500
-    scaleFactor: 1.2
-    nlevels: 8
-    edgeThreshold: 31
-    firstLevel: 0
-    patchSize: 31
-    scoreType: "HARRIS_SCORE"
-
-matcher_params:
-  norm_type: "NORM_HAMMING2"
-  descriptor_distance_max: 120
-  spatial_distance_max: 100000
-  model_threshold: 10000
-  plot_matches: false
-  geometric_model:
-    type: "AffineTransform"
-    use_model_estimation: true
-    estimation_method: "USAC_MAGSAC"
+trajectories:
+  add_as_coverage_enters: true
+  new_point_exclusion_radius_m: 2000.0

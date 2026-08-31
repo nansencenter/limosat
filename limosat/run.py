@@ -73,40 +73,54 @@ class LiMOSATRun:
                     self.config.trajectories,
                 )
                 if self.config.routing.targeted_recovery:
-                    for target_index in range(2, len(images)):
-                        source_index = target_index - 2
-                        positions = targeted_recovery_positions(
-                            trajectories,
-                            images[source_index].image_id,
-                            images[target_index].image_id,
+                    adjacent_pairs = self.catalogue.adjacent_pairs(component_id)
+                    for skipped_images in range(
+                        1, self.config.routing.maximum_skip_images + 1
+                    ):
+                        for target_index in range(skipped_images + 1, len(images)):
+                            source_index = target_index - skipped_images - 1
+                            positions = targeted_recovery_positions(
+                                trajectories,
+                                images[source_index].image_id,
+                                images[target_index].image_id,
+                            )
+                            if not len(positions):
+                                continue
+                            pair = ImagePair(
+                                images[source_index], images[target_index]
+                            )
+                            prior = (
+                                adjacent_fields[source_index - 1]
+                                if source_index
+                                else None
+                            )
+                            prior_elapsed = (
+                                adjacent_pairs[source_index - 1].elapsed_seconds
+                                if source_index
+                                else None
+                            )
+                            field, resumed = self._obtain_pair(
+                                pair,
+                                component_id,
+                                "recovery",
+                                True,
+                                prior,
+                                prior_elapsed,
+                                positions,
+                            )
+                            resumed_pairs += int(resumed)
+                            computed_pairs += int(not resumed)
+                            edges.append(
+                                FieldEdge(
+                                    field, skipped_images=skipped_images
+                                )
+                            )
+                        trajectories = build_trajectories(
+                            edges,
+                            images,
+                            self.config.field,
+                            self.config.trajectories,
                         )
-                        if not len(positions):
-                            continue
-                        pair = ImagePair(images[source_index], images[target_index])
-                        prior = adjacent_fields[source_index - 1] if source_index else None
-                        prior_elapsed = (
-                            self.catalogue.adjacent_pairs(component_id)[source_index - 1].elapsed_seconds
-                            if source_index
-                            else None
-                        )
-                        field, resumed = self._obtain_pair(
-                            pair,
-                            component_id,
-                            "recovery",
-                            True,
-                            prior,
-                            prior_elapsed,
-                            positions,
-                        )
-                        resumed_pairs += int(resumed)
-                        computed_pairs += int(not resumed)
-                        edges.append(FieldEdge(field, skipped_images=1))
-                    trajectories = build_trajectories(
-                        edges,
-                        images,
-                        self.config.field,
-                        self.config.trajectories,
-                    )
                 self.store.replace_trajectories(component_id, trajectories)
                 for field in adjacent_fields:
                     self.store.replace_deformation(

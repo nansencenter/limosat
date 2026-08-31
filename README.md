@@ -1,46 +1,65 @@
-[![Tests](https://github.com/nansencenter/arktalas_ice_drift_experiments/actions/workflows/test.yaml/badge.svg?branch=limosat)](https://github.com/nansencenter/arktalas_ice_drift_experiments/actions/workflows/test.yaml) [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.15111936.svg)](https://doi.org/10.5281/zenodo.15111936)
+# LiMOSAT
 
-# limosat - Lagrangian Ice Motion from Satellites
+LiMOSAT produces EfficientLoFTR sea-ice displacement fields, observed
+Lagrangian trajectories, and deformation products from chronological satellite
+image catalogues. The operational coordinate system is float64 EPSG:3413
+metres. Time is explicit UTC; velocity limits use metres per day; deformation
+rates use inverse seconds.
 
-limosat is an open source, highly configurable algorithm for calculating sea ice drift from remote sensing imagery. It processes satellite images like so:
+This branch intentionally has one matching method. It does not contain the old
+ORB detector/descriptor/template pipeline or the frozen ALIKED research code.
 
-1.	Keypoint Detection: Identify points representing ice features in a semi-constrained grid.
-2.	Interpolation: Interpolate positions for unmatched keypoints using homography.
-3.	Pattern Matching: Refine keypoint positions using template matching and discard points with low correlation.
-4.	Persistent Storage: Optionally save drift data for later analysis.
-
-## Citation
-
-Chua, S. M. T., & Korosov, A. (2025). limosat - Lagrangian Ice Motion from Satellites (v0.1.0). Zenodo. https://doi.org/10.5281/zenodo.15111936
-
-## Repository Structure
-```
-.
-├── LICENSE              # MIT License information
-├── README.md            # Project documentation
-├── environment.yaml     # Conda environment specification
-├── examples/            # Usage examples
-├── limosat/             # LiMOSAT library source code
-└── tests/               # Tests
-```
-## Setup Environment
+## Install
 
 ```bash
-conda env create -f environment.yaml && conda activate limosat
+mamba env create -f environment.yaml
+mamba activate limosat
+pip install -e .
 ```
 
-## Run limosat
-1.	Prepare Your Data:
-Organize your satellite imagery into a folder and run `preprocessing.py`.
-   If you use the gridded descriptor cache, note that changing stride or descriptor
-   parameters (ORB settings, border size, octave) requires regenerating the cache.
-2. Build catalog:
-Use create_image_gdf to build a catalog of imagery metadata.
-3.	Set-up database(optional):
-Enable persistence by providing a SQL engine and Zarr storage path to store both the drift keypoints and pattern matching templates. limosat can also be run without persistence.
-4.	Run `examples/limosat_drift.ipynb`
-5. Visualise results
+The official EfficientLoFTR source checkout and optimized outdoor checkpoint
+are external scientific inputs. Record their local paths in the run
+configuration; the checkpoint SHA256 is written to the manifest.
 
-## License
+## Run
 
-This project is licensed under the MIT License. See the LICENSE file for details.
+Copy `config.defaults.yaml`, set the catalogue, output, model repository, and
+checkpoint paths, then run:
+
+```bash
+limosat run config.yaml
+limosat status config.yaml
+```
+
+The run command processes each catalogue component, resumes completed pairs
+without overwriting them, schedules sparse skip-pair recovery only after
+measured trajectory loss, rebuilds stable trajectories, writes adjacent-pair
+deformation cells, and emits `run-manifest-v1.json`.
+
+The public Python entry point is direct:
+
+```python
+from limosat import LiMOSATRun, load_config
+
+summary = LiMOSATRun(load_config("config.yaml")).execute()
+```
+
+See [operations](docs/operations.md) for catalogue and recovery behavior and
+[schemas](docs/schemas.md) for the SQLite and manifest contracts.
+
+## Scientific semantics
+
+- Pair fields are independently measured EfficientLoFTR products.
+- Unsupported field nodes have `available = false` and `dx_m = dy_m = NULL`
+  in SQLite; they are never encoded as zero displacement.
+- Trajectories are virtual material points advected only through supported,
+  orientation-preserving fields. Dormant points have no coordinate.
+- Reappearance requires an observed skip field; no temporal prediction is
+  included in the primary trajectory product.
+- Sparse targeted recovery fields reconnect trajectories but are not emitted as
+  standalone deformation products.
+
+## License and citation
+
+LiMOSAT is MIT licensed. Cite Chua and Korosov (2025), *limosat - Lagrangian
+Ice Motion from Satellites*, <https://doi.org/10.5281/zenodo.15111936>.

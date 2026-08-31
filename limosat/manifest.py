@@ -47,12 +47,17 @@ def write_manifest(
         },
         "config": config.to_dict(),
         "config_sha256": config.sha256,
-        "checkpoint_sha256": (
-            file_sha256(config.matcher.checkpoint)
-            if config.matcher.checkpoint and Path(config.matcher.checkpoint).is_file()
-            else None
-        ),
-        "git": _git_state(),
+        "implementation_sha256": store.implementation_sha256,
+        "checkpoint_sha256": store.model_sha256,
+        "git": {
+            "limosat": _git_state(),
+            "efficientloftr": (
+                _git_state(Path(config.matcher.repository))
+                if config.matcher.repository
+                and Path(config.matcher.repository).is_dir()
+                else None
+            ),
+        },
         "command": list(command),
         "started_utc": started_utc.isoformat(),
         "completed_utc": completed_utc.isoformat(),
@@ -78,11 +83,15 @@ def write_manifest(
     return path, file_sha256(path)
 
 
-def _git_state() -> dict[str, str | bool | None]:
+def _git_state(repository: Path | None = None) -> dict[str, str | bool | None]:
     def run(*arguments: str) -> str | None:
         try:
             return subprocess.run(
-                ["git", *arguments],
+                [
+                    "git",
+                    *([] if repository is None else ["-C", str(repository)]),
+                    *arguments,
+                ],
                 check=True,
                 capture_output=True,
                 text=True,

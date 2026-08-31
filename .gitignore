@@ -34,3 +34,23 @@ dist/
 /examples/logs/
 /run.log
 /validation/limosat_debug_record_*.geojson
+
+# LiMOSAT runtime products and external scientific inputs
+/outputs/
+/results/
+/runs/
+/data/
+/checkpoints/
+*.sqlite
+*.sqlite3
+*.db
+*.npz
+*.npy
+*.zarr/
+*.tif
+*.tiff
+*.ckpt
+*.pt
+*.pth
+*.log
+slurm-*.out

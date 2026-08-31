@@ -28,6 +28,13 @@ class RunStore:
     def __init__(self, config: RunConfig) -> None:
         self.config = config
         self.path = Path(config.database)
+        self.implementation_sha256 = implementation_sha256()
+        self.model_sha256 = (
+            file_sha256(config.matcher.checkpoint)
+            if config.matcher.checkpoint
+            and Path(config.matcher.checkpoint).is_file()
+            else None
+        )
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._ensure_schema()
         self._ensure_run()
@@ -399,22 +406,35 @@ class RunStore:
         )
         with closing(self._connect()) as connection, connection:
             row = connection.execute(
-                "SELECT config_sha256 FROM runs WHERE run_id=?",
+                """
+                SELECT config_sha256,implementation_sha256,model_sha256
+                FROM runs WHERE run_id=?
+                """,
                 (self.config.run_id,),
             ).fetchone()
-            if row is not None and row[0] != self.config.sha256:
-                raise ValueError(f"run {self.config.run_id!r} uses a different config")
+            expected = (
+                self.config.sha256,
+                self.implementation_sha256,
+                self.model_sha256,
+            )
+            if row is not None and tuple(row) != expected:
+                raise ValueError(
+                    f"run {self.config.run_id!r} uses different code, model, or config"
+                )
             connection.execute(
                 """
                 INSERT OR IGNORE INTO runs
-                (run_id,schema_version,config_sha256,config_json,status,created_utc)
-                VALUES (?,?,?,?, 'created', ?)
+                (run_id,schema_version,config_sha256,config_json,
+                 implementation_sha256,model_sha256,status,created_utc)
+                VALUES (?,?,?,?,?,?, 'created', ?)
                 """,
                 (
                     self.config.run_id,
                     DATABASE_SCHEMA_VERSION,
                     self.config.sha256,
                     config_json,
+                    self.implementation_sha256,
+                    self.model_sha256,
                     _utc_now(),
                 ),
             )
@@ -447,6 +467,16 @@ def file_sha256(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+def implementation_sha256() -> str:
+    """Hash package source so resume cannot mix different local code."""
+    digest = hashlib.sha256()
+    package = Path(__file__).resolve().parent
+    for path in sorted(package.glob("*.py")):
+        digest.update(path.name.encode("utf-8"))
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
 def _finite_or_none(value):
     return None if value is None or not np.isfinite(value) else float(value)
 
@@ -461,6 +491,8 @@ CREATE TABLE IF NOT EXISTS runs (
   schema_version INTEGER NOT NULL,
   config_sha256 TEXT NOT NULL,
   config_json TEXT NOT NULL,
+  implementation_sha256 TEXT NOT NULL,
+  model_sha256 TEXT,
   status TEXT NOT NULL CHECK(status IN ('created','running','complete','failed')),
   created_utc TEXT NOT NULL,
   started_utc TEXT,

@@ -139,6 +139,7 @@ def test_sequence_recovers_measured_loss_and_resumes_with_versioned_manifest(tmp
     assert first["computed_pairs"] == 3
     assert processor.calls == [("a__b", False), ("b__c", False), ("a__c", True)]
     assert manifest["manifest_schema_version"] == 1
+    assert len(manifest["implementation_sha256"]) == 64
     assert manifest["product_schemas"]["lagrangian_trajectory"] == 2
     assert manifest["coordinates"]["crs"] == "EPSG:3413"
     assert manifest["product_counts"]["trajectories"] == 4

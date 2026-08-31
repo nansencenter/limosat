@@ -34,7 +34,7 @@ class ImageRecord:
         if self.time_utc.tzinfo is None or self.time_utc.utcoffset() is None:
             raise ValueError("image chronology must be timezone-aware")
         object.__setattr__(self, "time_utc", self.time_utc.astimezone(timezone.utc))
-        object.__setattr__(self, "path", self.path.resolve())
+        object.__setattr__(self, "path", Path(self.path).expanduser().resolve())
 
 
 @dataclass(frozen=True)
@@ -116,6 +116,9 @@ def load_catalogue(path: str | Path, analysis_epsg: int = 3413) -> ImageCatalogu
     )
     records = []
     for row in rows:
+        row = dict(row)
+        row["path"] = row.get("path") or row.get("filepath")
+        row["time_utc"] = row.get("time_utc") or row.get("timestamp")
         missing = [
             name for name in ("image_id", "path", "time_utc") if not row.get(name)
         ]

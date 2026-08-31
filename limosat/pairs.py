@@ -150,8 +150,16 @@ class PairProcessor:
         )
 
     def _overlap(self, pair: ImagePair) -> BaseGeometry:
-        source = pair.source.footprint or projected_footprint(pair.source.path)
-        target = pair.target.footprint or projected_footprint(pair.target.path)
+        source = (
+            pair.source.footprint
+            if pair.source.footprint is not None
+            else projected_footprint(pair.source.path)
+        )
+        target = (
+            pair.target.footprint
+            if pair.target.footprint is not None
+            else projected_footprint(pair.target.path)
+        )
         overlap = source.intersection(target).buffer(0)
         if overlap.is_empty:
             raise ValueError(f"pair {pair.pair_id} has no projected overlap")

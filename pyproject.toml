@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "limosat"
+version = "0.2.0"
+description = "EfficientLoFTR Lagrangian sea-ice motion fields and trajectories"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {file = "LICENSE"}
+authors = [
+  {name = "Sean Minhui Tashi Chua"},
+  {name = "Anton Korosov"},
+]
+dependencies = [
+  "kornia",
+  "numpy",
+  "opencv-python",
+  "pyproj",
+  "PyYAML",
+  "rasterio",
+  "scipy",
+  "shapely",
+  "torch",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+limosat = "limosat.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["limosat*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"

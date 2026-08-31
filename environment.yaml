@@ -2,36 +2,17 @@ name: limosat
 channels:
   - conda-forge
 dependencies:
-  - python=3.11.3
+  - python=3.11
   - pip
-  - cartopy=0.23.0
-  - geopandas
-  - gdal 
-  - netcdf4
-  - ca-certificates
-  - certifi
-  - openssl
-  - urllib3
-  - pillow
-  - psycopg2
-  - shapely
-  - matplotlib=3.8.0
   - numpy
-  - opencv
-  - pandas
-  - pytest
-  - pytz
-  - scikit-image
-  - scikit-learn
   - scipy
-  - xarray
-  - ipykernel
-  - parameterized
-  - plotly
-  - sqlalchemy
-  - geoalchemy2
-  - zarr
+  - shapely
+  - pyproj
+  - rasterio
+  - opencv
+  - pytorch
+  - kornia
+  - pyyaml
+  - pytest
   - pip:
-      - nansat
-      - pythesint
-      - pystac>=1.8.4
+      - -e .
