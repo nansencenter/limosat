@@ -1,0 +1,68 @@
+{
+  "schema": "limosat.fair-aliked-cuda-handoff/v1",
+  "frozen_utc": "2026-08-20T00:00:00Z",
+  "analysis_role": "unmeasured_cuda_handoff",
+  "cpu_benchmark_manifest": {
+    "path": "experiments/configs/fair_orb_aliked_runtime_20260819.json",
+    "sha256": "50614fb7c7cb0a6de08ba4b7367be95c47cb2db1bd966448e40f71557cd31aa4"
+  },
+  "runner": {
+    "path": "experiments/run_fair_aliked_cuda_hpc_20260820.sh",
+    "sha256": "29790f1db050cbcfb7c1223749334a07c152e8a63629abb492307ce6fd0a489f"
+  },
+  "scientific_runner_code": [
+    {
+      "path": "experiments/run_aliked_selected_sequence.py",
+      "sha256": "7093f7a97fa070f29d444711d834236fb8d2ad48f5ee9410dae33885b039d77b"
+    },
+    {
+      "path": "experiments/run_aliked_dense_pair.py",
+      "sha256": "0305c076d9677bb364d043f42016976248e3a887d717caa388973028f479e1c4"
+    },
+    {
+      "path": "experiments/refine_aliked_dense_topology.py",
+      "sha256": "10ea067a658bd1ebf21a3431ca86bab3cf9be1ae4d694bdfb0a8a0fdaef659c8"
+    }
+  ],
+  "source_pair_manifest_sha256": [
+    "bff5b9948a1359ad0b82f901610839af3b6a81e84e0843e95abfd5bab0fa9f97",
+    "c34555864c494dcb437dee4257a5d13a600c26c58c5875a4abc55eb939e11c2a"
+  ],
+  "standard_vae_image_sha256": {
+    "10245": "0175c9cd54e57ff5ffceace5f471dc98374d5a9db15d5f7ec98d36f23f859a0f",
+    "10341": "47485c5303aecfd5d029efb6c72ef4d4cd414523b298bb470281bdb42f88c1d9",
+    "10352": "37a9ed3cde3449d8a96387438979f1e22dd6a178e8bfd4ed72b16f790ae34413"
+  },
+  "cuda_policy": {
+    "device": "cuda",
+    "precision": "unchanged runner defaults; no automatic or mixed-precision flag",
+    "images": [10245, 10341, 10352],
+    "pairs": ["10245_10341", "10341_10352"],
+    "features_per_tile": 1024,
+    "matching": "physics-conditioned LightGlue with only the immediately preceding accepted ALIKED field as prior",
+    "prior_uncertainty_m": 15000.0,
+    "fallback": "full physics window when the prior is absent, stale, or inconsistent",
+    "estimation": "nearest 12 within 6000 m; at least 8 vectors coherent within 1000 m",
+    "topology": "fixed-point fold-node rejection",
+    "pattern_matching": false,
+    "setup_repetitions_excluded": 1,
+    "measured_cold_repetitions": 3,
+    "measured_warm_repetitions": 3
+  },
+  "required_environment": [
+    "LIMOSAT_HPC_PYTHON: CUDA-enabled environment Python",
+    "LIMOSAT_HPC_PAIR_ROOT: mirrored learned_feature_pilots directory",
+    "LIMOSAT_HPC_STANDARD_VAE_ROOT: mirrored standard-VAE TIFF tree",
+    "LIMOSAT_HPC_MODEL_CACHE: writable installed model cache",
+    "LIMOSAT_HPC_OUTPUT: a new writable output directory"
+  ],
+  "exact_command": "LIMOSAT_HPC_PYTHON=/path/to/cuda/env/bin/python LIMOSAT_HPC_PAIR_ROOT=/path/to/learned_feature_pilots LIMOSAT_HPC_STANDARD_VAE_ROOT=/path/to/standard_vae LIMOSAT_HPC_MODEL_CACHE=/path/to/model_cache LIMOSAT_HPC_OUTPUT=/scratch/fair_aliked_cuda_v1 experiments/run_fair_aliked_cuda_hpc_20260820.sh",
+  "local_device_audit": {
+    "torch": "2.10.0",
+    "cuda_available": false,
+    "cuda_device_count": 0,
+    "mps_built": true,
+    "mps_available": false
+  },
+  "acceptance": "Treat CUDA timing as measured only after run_complete.json exists. Before operational use, verify CUDA-vs-CPU exact-grid vector differences, common support, buoy errors, topology, and prior audits; do not infer a GPU speed from the CPU result."
+}

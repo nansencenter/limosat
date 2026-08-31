@@ -1,0 +1,134 @@
+{
+  "experiment": "aliked_lightglue_candidate_routing_confirmation_20260822",
+  "status": "frozen_before_match_evaluation",
+  "selection_scope": "full70_2020 confirmation fold only",
+  "selection_uses_match_or_accuracy_results": false,
+  "input_hashes": {
+    "transitions.csv": "cc239dd8ff24accf854870ed38f361d28f79e2bba19bfc5c4f35db85d1d8e189",
+    "observations.csv": "fe6e76d967ff917b17873bfbbfd488846f1abc9a8e48bafd67db128caf577b02",
+    "split_manifest.json": "783671bdcd24c005d326d7e8fe5e26505294699b27ba94e1d3a5d0d6ff26e82f",
+    "run_aliked_dense_pair.py": "e5a54e2b8854ff96bd6c9412fd94a85da93956865e6527559e5b7817f74ab83a",
+    "run_aliked_selected_sequence.py": "93f68bf84d2fdd9cd78ef19b5840a54f8b60ea21b6f7aa43a1be67010de1712d",
+    "aliked_matchers.py": "bcce21c463dbc00276f69667e2cfb8f8c6a8669173cb7734f00143fb50bfa09b"
+  },
+  "candidate_selection": {
+    "minimum_confirmation_buoys": 10,
+    "elapsed_hours_range": [12.0, 30.0],
+    "maximum_speed_m_per_day": 30000.0,
+    "tile_pixels": 512,
+    "tile_margin_pixels": 32,
+    "pixel_size_m": 80.0,
+    "tile_grid_origin_m": 0.0,
+    "candidate_definition": "source core buffered by the physics displacement intersects target core; no motion prior and no descriptor or accuracy value",
+    "eligible_pairs": [
+      {
+        "source_image_id": 10245,
+        "target_image_id": 10341,
+        "confirmation_buoys": 29,
+        "elapsed_hours": 19.77138888888889,
+        "source_tiles": 80,
+        "target_tiles": 79,
+        "reachable_tile_edges": 573,
+        "reachable_target_tiles_median": 8.0,
+        "reachable_target_tiles_maximum": 9
+      },
+      {
+        "source_image_id": 10107,
+        "target_image_id": 10217,
+        "confirmation_buoys": 28,
+        "elapsed_hours": 21.40888888888889,
+        "source_tiles": 127,
+        "target_tiles": 121,
+        "reachable_tile_edges": 950,
+        "reachable_target_tiles_median": 9.0,
+        "reachable_target_tiles_maximum": 9
+      },
+      {
+        "source_image_id": 740,
+        "target_image_id": 849,
+        "confirmation_buoys": 15,
+        "elapsed_hours": 21.413055555555555,
+        "source_tiles": 134,
+        "target_tiles": 136,
+        "reachable_tile_edges": 1051,
+        "reachable_target_tiles_median": 9.0,
+        "reachable_target_tiles_maximum": 9
+      },
+      {
+        "source_image_id": 731,
+        "target_image_id": 849,
+        "confirmation_buoys": 10,
+        "elapsed_hours": 23.046944444444446,
+        "source_tiles": 151,
+        "target_tiles": 151,
+        "reachable_tile_edges": 1180,
+        "reachable_target_tiles_median": 9.0,
+        "reachable_target_tiles_maximum": 9
+      }
+    ],
+    "selected_image_chain": [721, 731, 740, 849],
+    "selected_pairs": [[721, 731], [731, 740], [740, 849]],
+    "selection_reason": "contiguous three-pair chain with 49 confirmation transition rows; final pair has 15 buoys, median nine reachable target tiles, and more reachable edges than the alternative contiguous March long pair",
+    "limitation": "the primary split holds out whole buoy paths, not SAR images; these images were used by earlier development experiments"
+  },
+  "output_root": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/learned_feature_pilots/confirmation_lightglue_candidate_routing_v1_20260822",
+  "feature_cache_dir": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/learned_feature_pilots/confirmation_lightglue_candidate_routing_v1_20260822/feature_cache",
+  "common_config": {
+    "within_dataset_split": "confirmation",
+    "features_per_tile": 1024,
+    "physics_subset_matching": true,
+    "matching_feature_cap_per_tile": null,
+    "matching_prior": null,
+    "sequential_prior": false,
+    "grid_spacing_m": 4000.0,
+    "maximum_speed_m_per_day": 30000.0,
+    "maximum_radius_m": 6000.0,
+    "candidate_count": 12,
+    "minimum_selected_vectors": 8,
+    "consensus_radius_m": 1000.0,
+    "device": "cpu"
+  },
+  "arms": {
+    "scientific_reference": {
+      "lightglue_layers": 9,
+      "lightglue_adapter": "kornia",
+      "mnn_candidate_limit": null,
+      "timing_repetitions": 1
+    },
+    "five_layer_all_candidates": {
+      "lightglue_layers": 5,
+      "lightglue_adapter": "direct",
+      "lightglue_depth_confidence": 0.95,
+      "lightglue_width_confidence": 0.99,
+      "lightglue_filter_threshold": 0.1,
+      "mnn_candidate_limit": null,
+      "timing_repetitions": 3
+    },
+    "five_layer_mnn_top8": {
+      "lightglue_layers": 5,
+      "lightglue_adapter": "direct",
+      "lightglue_depth_confidence": 0.95,
+      "lightglue_width_confidence": 0.99,
+      "lightglue_filter_threshold": 0.1,
+      "mnn_candidate_limit": 8,
+      "timing_repetitions": 3
+    }
+  },
+  "warm_timing_order": [
+    "five_layer_all_candidates_1",
+    "five_layer_mnn_top8_1",
+    "five_layer_mnn_top8_2",
+    "five_layer_all_candidates_2",
+    "five_layer_all_candidates_3",
+    "five_layer_mnn_top8_3"
+  ],
+  "promotion_checks": {
+    "buoy_availability_loss_allowed": 0,
+    "minimum_fold_free_nodes_fraction_of_all_candidate_per_pair": 0.99,
+    "maximum_common_vector_p90_m": 80.0,
+    "maximum_pairwise_deformation_p90_relative_increase": 0.10,
+    "folded_triangles_after_rejection_allowed": 0,
+    "minimum_warm_end_to_end_speed_reduction": 0.10,
+    "map_common_vector_differences_above_m": 500.0
+  }
+}

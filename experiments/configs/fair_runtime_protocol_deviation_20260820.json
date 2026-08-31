@@ -1,0 +1,14 @@
+{
+  "schema": "limosat.runtime-protocol-deviation/v1",
+  "recorded_utc_date": "2026-08-20",
+  "benchmark": "fair_orb_aliked_runtime_v3_20260819",
+  "affected_repetition": "warm_rep2",
+  "affected_method": "ALIKED",
+  "reason": "The separately frozen exact-common ICESat-2 benchmark validation ran concurrently during ALIKED warm_rep2 and competed for local CPU and I/O resources.",
+  "disposition": "Exclude both methods' warm_rep2 rows from paired benchmark reporting and run warm_rep4 with no concurrent scientific workload. Retain warm_rep2 outputs as an explicit excluded case.",
+  "valid_reported_repetitions": {
+    "cold": ["cold_rep1", "cold_rep2", "cold_rep3"],
+    "warm": ["warm_rep1", "warm_rep3", "warm_rep4"]
+  },
+  "scientific_parameters_changed": false
+}

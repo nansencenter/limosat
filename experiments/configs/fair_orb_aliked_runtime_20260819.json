@@ -1,0 +1,113 @@
+{
+  "schema": "limosat.fair-orb-aliked-runtime/v1",
+  "frozen_utc": "2026-08-19T00:00:00Z",
+  "analysis_role": "development_runtime_gate",
+  "supersedes_output": "v1 was interrupted after setup and the first ORB cold repetition to separate image preparation from detection/description; v2 was interrupted during ORB setup to also separate ALIKED field estimation, topology/QC, and accuracy-evaluation timing. Neither superseded output contains a complete measured comparison.",
+  "device": "cpu",
+  "sequence": {
+    "catalog_image_ids": [10245, 10341, 10352],
+    "unique_images": 3,
+    "evaluated_pairs": ["10245_10341", "10341_10352"],
+    "pair_count": 2,
+    "schedule": "ascending acquisition time; only adjacent pairs are evaluated",
+    "geographic_domain": "For each pair, the physics-reachable intersection of the identical source and target standard-VAE image footprints; normalization and accuracy use the exact common valid 4 km ORB/ALIKED nodes.",
+    "output_grid_spacing_m": 4000.0,
+    "crs": "EPSG:3413"
+  },
+  "inputs": {
+    "runner_code": [
+      {
+        "path": "/Users/seachu/projects/limosat/experiments/run_operational_baseline.py",
+        "sha256": "c92c2ee6fcc4e360f79ef5de8bd3eabffb020879b5f0ca147087696a0c1fe0d2"
+      },
+      {
+        "path": "/Users/seachu/projects/limosat/experiments/run_aliked_selected_sequence.py",
+        "sha256": "7093f7a97fa070f29d444711d834236fb8d2ad48f5ee9410dae33885b039d77b"
+      },
+      {
+        "path": "/Users/seachu/projects/limosat/experiments/run_aliked_dense_pair.py",
+        "sha256": "0305c076d9677bb364d043f42016976248e3a887d717caa388973028f479e1c4"
+      },
+      {
+        "path": "/Users/seachu/projects/limosat/experiments/refine_aliked_dense_topology.py",
+        "sha256": "10ea067a658bd1ebf21a3431ca86bab3cf9be1ae4d694bdfb0a8a0fdaef659c8"
+      }
+    ],
+    "observations": {
+      "path": "/Users/seachu/projects/limosat/results/arctic_tracking_next_experiment/splits/full70_2020/observations.csv",
+      "sha256": "fe6e76d967ff917b17873bfbbfd488846f1abc9a8e48bafd67db128caf577b02"
+    },
+    "orb_config": {
+      "path": "/Users/seachu/projects/limosat/experiments/configs/limosat_dense_30000_full70_local.yaml",
+      "sha256": "b8605c43c225cd72d8fe822988118804c2d5ea96bfacd88d42ecddfd8ea9c1b1"
+    },
+    "aliked_pair_manifests": [
+      {
+        "path": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/learned_feature_pilots/dense_pair_10245_10341_aliked1024_fixedgrid_cache_fullcontext_dev_marchseq_v1_20260818/run_manifest.json",
+        "sha256": "bff5b9948a1359ad0b82f901610839af3b6a81e84e0843e95abfd5bab0fa9f97"
+      },
+      {
+        "path": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/learned_feature_pilots/dense_pair_10341_10352_aliked1024_fixedgrid_cache_fullcontext_dev_marchseq_v1_20260818/run_manifest.json",
+        "sha256": "c34555864c494dcb437dee4257a5d13a600c26c58c5875a4abc55eb939e11c2a"
+      }
+    ]
+  },
+  "orb_policy": {
+    "configuration": "current production ORB",
+    "maximum_speed_m_per_day": 30000.0,
+    "model": "legacy homography fit in kilometre-conditioned coordinates",
+    "model_coordinate_scale_m": 1000.0,
+    "model_threshold_m": 15000.0,
+    "direct_pattern_border_pixels": 24,
+    "interpolated_pattern_border_pixels": 48,
+    "pattern_subpixel_method": "quadratic",
+    "template_sampling": "bilinear",
+    "persistence": "SQLite plus Zarr enabled"
+  },
+  "aliked_policy": {
+    "model": "aliked-n16",
+    "features_per_tile": 1024,
+    "feature_cache": "one deterministic cache record per image tile",
+    "matching": "physics-conditioned LightGlue with sequential preceding-field prior",
+    "prior_uncertainty_m": 15000.0,
+    "prior_source": "median velocity of only the immediately preceding accepted fold-free ALIKED field",
+    "fallback": "full absolute 30 km/day physics window when prior is absent, noncontiguous/stale, or the preceding field is inconsistent",
+    "estimator": "nearest 12 within 6 km with at least 8 vectors coherent within 1 km",
+    "topology": "fixed-point fold-node rejection",
+    "pattern_matching": false,
+    "persistence": "per-image cache, per-pair matches/fields/audits, and run manifest enabled"
+  },
+  "timing_design": {
+    "setup_repetitions_excluded": 1,
+    "measured_repetitions_per_cache_state": 3,
+    "cache_states": ["cold", "warm"],
+    "cold_definition": "A distinct initially empty deterministic detector-feature/grid cache for every measured repetition; model weights remain locally installed.",
+    "warm_definition": "The setup run populates one shared deterministic detector-feature/grid cache, reused without modification by all measured repetitions.",
+    "stages": [
+      "model_setup",
+      "image_preparation",
+      "detection_and_description",
+      "matching",
+      "orb_pattern_matching",
+      "deformation_field_estimation",
+      "topology_and_qc",
+      "writing_and_persistence",
+      "total_wall"
+    ]
+  },
+  "normalization": [
+    "seconds per unique image",
+    "seconds per evaluated pair",
+    "seconds per square kilometre of exact common valid 4 km support",
+    "seconds per 1000 accepted exact-common 4 km vectors"
+  ],
+  "accuracy_outputs": [
+    "buoy endpoint error",
+    "pairwise relative-displacement error",
+    "fold-free coverage",
+    "cycle closure where the sequence supplies a cycle",
+    "ORB/ALIKED vector agreement on exact common support",
+    "multisensor statistics on exact common support"
+  ],
+  "interpretation_guard": "No speed percentage is operational until the sequential-prior held sequence and absent/stale/inconsistent fallback audits pass. CUDA results must be measured separately and never inferred from CPU."
+}
