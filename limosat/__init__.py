@@ -1,25 +1,29 @@
-# MIT License
-#
-# Copyright (c) 2025 Sean Minhui Tashi Chua, and Anton Korosov
-#
-# Licensed under the MIT License. See the LICENSE file in the project root for full details.
+"""LiMOSAT: EfficientLoFTR sea-ice fields and Lagrangian trajectories."""
 
-"""
-LiMOSAT: A Python package for sea ice drift analysis.
-"""
-
-from .image_processor import ImageProcessor
-from .image import Image
-from .keypoints import Keypoints
-from .keypoint_detector import KeypointDetector
-from .matcher import Matcher
-from .templates import Templates
+from .catalog import ImageCatalogue, ImagePair, ImageRecord, load_catalogue
+from .config import (
+    FieldConfig,
+    MatcherConfig,
+    RoutingConfig,
+    RunConfig,
+    TrajectoryConfig,
+    load_config,
+)
+from .models import DisplacementField, FieldEdge, MotionMatches, PairResult
 
 __all__ = [
-    "ImageProcessor",
-    "Image",
-    "Keypoints",
-    "KeypointDetector",
-    "Matcher",
-    "Templates",
+    "DisplacementField",
+    "FieldConfig",
+    "FieldEdge",
+    "ImageCatalogue",
+    "ImagePair",
+    "ImageRecord",
+    "MatcherConfig",
+    "MotionMatches",
+    "PairResult",
+    "RoutingConfig",
+    "RunConfig",
+    "TrajectoryConfig",
+    "load_catalogue",
+    "load_config",
 ]

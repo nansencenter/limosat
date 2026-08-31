@@ -1,214 +1,156 @@
-import os
-import re
+"""Catalogue-driven image identity and UTC chronology."""
+
+from __future__ import annotations
+
+import csv
 import json
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Iterable, Optional, Literal, List, Dict, Any
-import geopandas as gpd
-import pystac
-import shapely
+from pathlib import Path
+from typing import Iterable
 
-# Sentinel-1 filename pattern:
-# S1C_EW_GRDM_1SDH_20200101T015602_20200101T015706_019617_025132_32F2.tiff
-_S1_PATTERN = re.compile(
-    r"^S1[A-D]_EW_GRDM_1SDH_"
-    r"(?P<start>\d{8}T\d{6})_"
-    r"(?P<end>\d{8}T\d{6})_"
-    r"(?P<orbit>\d{6})_"
-    r"(?P<take>\w{6})_"
-    r"(?P<uid>\w{4})"
-    r"\.tiff$"
-)
-
-def _parse_s1_meta(path: str):
-    """Parse S1 filename to extract start datetime (UTC), scene id, product UID, and orbit number."""
-    base = os.path.basename(path)
-    m = _S1_PATTERN.match(base)
-    if not m:
-        return None, None, None, None
-    dt = datetime.strptime(m.group("start"), "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
-    scene_id = os.path.splitext(base)[0]
-    uid = m.group("uid")
-    orbit = int(m.group("orbit"))
-    return dt, scene_id, uid, orbit
+from pyproj import Transformer
+from shapely import from_wkt
+from shapely.geometry import shape
+from shapely.geometry.base import BaseGeometry
+from shapely.ops import transform
 
 
-GeometryMode = Literal["none", "bbox"]
+@dataclass(frozen=True)
+class ImageRecord:
+    """One immutable catalogue image."""
 
-def build_stac_item_collection(
-    files: Iterable[str],
-    out_path: Optional[str] = None,
-    check_exists: bool = False,
-) -> pystac.ItemCollection:
-    """
-    Build a STAC ItemCollection. If out_path is provided,
-    also write a single JSON file.
-    """
-    files = list(files)
-    if not files:
-        raise ValueError("No files provided to build_stac_item_collection.")
+    image_id: str
+    path: Path
+    time_utc: datetime
+    component_id: str = "default"
+    footprint: BaseGeometry | None = None
 
-    records: List[Dict[str, Any]] = []
-    seen_scene_paths: Dict[str, str] = {}
+    def __post_init__(self) -> None:
+        if not self.image_id.strip():
+            raise ValueError("image_id cannot be empty")
+        if not self.component_id.strip():
+            raise ValueError("component_id cannot be empty")
+        if self.time_utc.tzinfo is None or self.time_utc.utcoffset() is None:
+            raise ValueError("image chronology must be timezone-aware")
+        object.__setattr__(self, "time_utc", self.time_utc.astimezone(timezone.utc))
+        object.__setattr__(self, "path", self.path.resolve())
 
-    for p in files:
-        if check_exists and not os.path.exists(p):
-            raise FileNotFoundError(f"Missing file: {p}")
 
-        dt, scene_id, uid, orbit = _parse_s1_meta(p)
-        if dt is None or scene_id is None:
-            # Skip non-matching filenames.
-            continue
-        previous_path = seen_scene_paths.get(scene_id)
-        if previous_path is not None:
-            raise ValueError(
-                f"Duplicate Sentinel-1 scene id '{scene_id}' in catalog input: "
-                f"{previous_path} and {p}"
-            )
-        seen_scene_paths[scene_id] = p
+@dataclass(frozen=True)
+class ImagePair:
+    source: ImageRecord
+    target: ImageRecord
 
-        records.append(
-            {
-                "path": p,
-                "basename": os.path.basename(p),
-                "dt": dt,
-                "scene_id": scene_id,
-                "uid": uid,
-                "orbit": orbit,
-            }
+    def __post_init__(self) -> None:
+        if self.source.component_id != self.target.component_id:
+            raise ValueError("pair images must belong to one component")
+        if self.target.time_utc <= self.source.time_utc:
+            raise ValueError("pair chronology must be strictly increasing")
+
+    @property
+    def elapsed_seconds(self) -> float:
+        return (self.target.time_utc - self.source.time_utc).total_seconds()
+
+    @property
+    def pair_id(self) -> str:
+        return f"{self.source.image_id}__{self.target.image_id}"
+
+
+class ImageCatalogue:
+    """Validated images grouped into deterministic chronological components."""
+
+    def __init__(self, records: Iterable[ImageRecord]) -> None:
+        ordered = sorted(
+            records,
+            key=lambda item: (item.component_id, item.time_utc, item.image_id),
         )
+        if not ordered:
+            raise ValueError("catalogue contains no images")
+        ids = [item.image_id for item in ordered]
+        if len(ids) != len(set(ids)):
+            raise ValueError("catalogue image_id values must be globally unique")
+        self.records = tuple(ordered)
+        for component in self.components().values():
+            times = [item.time_utc for item in component]
+            if any(right <= left for left, right in zip(times, times[1:])):
+                raise ValueError("component image times must be strictly increasing")
 
-    # Deterministic order for integer image_id assignment
-    records.sort(key=lambda r: (r["dt"], r["basename"]))
+    def components(self) -> dict[str, tuple[ImageRecord, ...]]:
+        grouped: dict[str, list[ImageRecord]] = {}
+        for record in self.records:
+            grouped.setdefault(record.component_id, []).append(record)
+        return {name: tuple(values) for name, values in grouped.items()}
 
-    items: List[pystac.Item] = []
-    for idx, rec in enumerate(records, start=1):
-        it = pystac.Item(
-            id=str(rec["scene_id"]),
-            geometry=None,  # minimal: no geometry
-            bbox=None,      # minimal: no bbox
-            datetime=rec["dt"],
-            properties={},
-        )
-        it.properties["image_id"] = int(idx)
-        it.properties["scene_id"] = rec["scene_id"]
-        it.properties["product_uid"] = rec["uid"]
-        it.properties["filename"] = rec["basename"]
-        it.properties["filepath"] = rec["path"]
-        if rec.get("orbit") is not None:
-            it.properties["orbit_num"] = int(rec["orbit"])
-        it.add_asset(
-            "image",
-            pystac.Asset(href=rec["path"], media_type="image/tiff", roles=["data"]),
-        )
-        items.append(it)
-
-    coll = pystac.ItemCollection(items)
-
-    if out_path:
-        tmp = f"{out_path}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(coll.to_dict(), f, ensure_ascii=False)
-        os.replace(tmp, out_path)
-    return coll
+    def adjacent_pairs(self, component_id: str) -> tuple[ImagePair, ...]:
+        images = self.components()[component_id]
+        return tuple(ImagePair(a, b) for a, b in zip(images, images[1:]))
 
 
-def compute_footprint_wgs84(path: str):
-    """
-    Compute image footprint in WGS84 as a shapely geometry.
-    Separated from stac_item_collection_to_gdf so ProcessPoolExecutor can pickle it.
-    """
-    from limosat.image import Image
-    gj = Image(path).get_border_geojson()  # WGS84 GeoJSON string
-    return shapely.from_geojson(gj)
-
-
-def stac_item_collection_to_gdf(
-    coll: pystac.ItemCollection,
-    target_crs: str = "EPSG:3413",
-    max_workers: Optional[int] = None,
-    chunksize: int = 64,
-) -> gpd.GeoDataFrame:
-    """
-    Convert an in-memory STAC ItemCollection to a GeoDataFrame.
-    - Computes exact footprints (optionally in parallel) to mimic previous geometry setup.
-    - Reprojects to target_crs (default EPSG:3413).
-    - Adds orbit_num (6-digit string) and per-row bounds minx, miny, maxx, maxy in target_crs.
-
-    Columns:
-        image_id, filename (basename), filepath (full path), timestamp,
-        orbit_num, minx, miny, maxx, maxy, geometry
-    """
-    from concurrent.futures import ProcessPoolExecutor
-
-    items = list(getattr(coll, "items", []))
-    if not items:
-        return gpd.GeoDataFrame(
-            columns=[
-                "image_id", "filename", "filepath", "timestamp",
-                "orbit_num", "minx", "miny", "maxx", "maxy", "geometry"
-            ],
-            geometry="geometry",
-            crs=target_crs,
-        )
-
-    props_list = [it.properties or {} for it in items]
-    image_ids = [int(p.get("image_id")) for p in props_list]
-    basenames = [p.get("filename") for p in props_list]
-    filepaths = [p.get("filepath") for p in props_list]
-    timestamps = [it.datetime for it in items]
-
-    # Orbit number: keep as zero-padded 6-char string to match prior output style (e.g., "019617")
-    raw_orbits = [p.get("orbit_num") for p in props_list]
-    orbit_nums = []
-    for o in raw_orbits:
-        if o is None:
-            orbit_nums.append(None)
-        else:
-            try:
-                orbit_nums.append(f"{int(o):06d}")
-            except Exception:
-                # If not numeric, keep as string
-                orbit_nums.append(str(o))
-
-    # Compute footprints (WGS84). Parallelize if max_workers is provided.
-    if max_workers and max_workers > 1:
-        with ProcessPoolExecutor(max_workers=max_workers) as ex:
-            geoms = list(ex.map(compute_footprint_wgs84, filepaths, chunksize=chunksize))
+def load_catalogue(path: str | Path, analysis_epsg: int = 3413) -> ImageCatalogue:
+    """Read CSV or GeoJSON with image_id, path, time_utc, and component_id."""
+    catalogue_path = Path(path).resolve()
+    if catalogue_path.suffix.lower() in {".json", ".geojson"}:
+        document = json.loads(catalogue_path.read_text(encoding="utf-8"))
+        source_epsg = _geojson_epsg(document)
+        rows = []
+        for feature in document.get("features", []):
+            row = dict(feature.get("properties") or {})
+            geometry = feature.get("geometry")
+            row["footprint"] = None if geometry is None else shape(geometry)
+            rows.append(row)
     else:
-        geoms = [compute_footprint_wgs84(p) for p in filepaths]
-
-    # Build GeoDataFrame in WGS84, then reproject to target_crs
-    gdf = gpd.GeoDataFrame(
-        {
-            "image_id": image_ids,
-            "filename": basenames,
-            "filepath": filepaths,
-            "timestamp": timestamps,
-            "orbit_num": orbit_nums,
-            "geometry": geoms,
-        },
-        geometry="geometry",
-        crs="EPSG:4326",
+        source_epsg = analysis_epsg
+        with catalogue_path.open(newline="", encoding="utf-8") as stream:
+            rows = list(csv.DictReader(stream))
+        for row in rows:
+            row["footprint"] = (
+                from_wkt(row["footprint_wkt"]) if row.get("footprint_wkt") else None
+            )
+    projector = (
+        None
+        if source_epsg == analysis_epsg
+        else Transformer.from_crs(
+            source_epsg, analysis_epsg, always_xy=True
+        ).transform
     )
+    records = []
+    for row in rows:
+        missing = [
+            name for name in ("image_id", "path", "time_utc") if not row.get(name)
+        ]
+        if missing:
+            raise ValueError(f"catalogue row is missing values: {missing}")
+        image_path = Path(str(row["path"])).expanduser()
+        if not image_path.is_absolute():
+            image_path = catalogue_path.parent / image_path
+        footprint = row.get("footprint")
+        if footprint is not None and projector is not None:
+            footprint = transform(projector, footprint)
+        records.append(
+            ImageRecord(
+                image_id=str(row["image_id"]),
+                path=image_path,
+                time_utc=_parse_utc(str(row["time_utc"])),
+                component_id=str(row.get("component_id") or "default"),
+                footprint=footprint,
+            )
+        )
+    return ImageCatalogue(records)
 
-    if target_crs:
-        gdf = gdf.to_crs(target_crs)
 
-    # Per-row bounds in target_crs
-    b = gdf.geometry.bounds  # DataFrame with columns: minx, miny, maxx, maxy
-    gdf["minx"] = b["minx"]
-    gdf["miny"] = b["miny"]
-    gdf["maxx"] = b["maxx"]
-    gdf["maxy"] = b["maxy"]
+def _parse_utc(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"timestamp must include a UTC offset: {value}")
+    return parsed.astimezone(timezone.utc)
 
-    # Stable ordering
-    gdf = gdf.sort_values("image_id").reset_index(drop=True)
 
-    # Reorder columns to match your example (keeping filepath as an extra, useful field)
-    ordered_cols = [
-        "filename", "timestamp", "minx", "miny", "maxx", "maxy", "orbit_num",
-        "image_id", "filepath", "geometry"
-    ]
-    # Only keep columns that exist (in case of schema drift)
-    ordered_cols = [c for c in ordered_cols if c in gdf.columns]
-    return gdf[ordered_cols]
+def _geojson_epsg(document: dict) -> int:
+    name = str(
+        (document.get("crs") or {}).get("properties", {}).get("name", "EPSG:3413")
+    )
+    try:
+        return int(name.rsplit(":", 1)[-1])
+    except ValueError as error:
+        raise ValueError(f"unsupported GeoJSON CRS: {name}") from error
