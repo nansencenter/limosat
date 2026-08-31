@@ -21,6 +21,32 @@ ENV/
 htmlcov/
 .pytest_cache/
 
+# Scientific runtime products and downloaded data
+results/
+outputs/
+runs/
+validation/
+data/
+downloads/
+figures/
+plots/
+checkpoints/
+*.npy
+*.npz
+*.parquet
+*.sqlite
+*.sqlite3
+*.db
+*.zarr/
+*.tif
+*.tiff
+*.nc
+*.ckpt
+*.pt
+*.pth
+*.log
+slurm-*.out
+
 # Jupyter Notebook
 .ipynb_checkpoints
 
