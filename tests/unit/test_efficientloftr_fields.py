@@ -7,11 +7,14 @@ from shapely import box
 
 from limosat import (
     FieldConfig,
+    FieldEdge,
     ImagePair,
     ImageRecord,
     MatcherConfig,
     RoutingConfig,
     RunConfig,
+    TrajectoryConfig,
+    build_trajectories,
 )
 from limosat.efficientloftr import speed_limit_mask
 from limosat.imagery import north_up_patch, projected_coordinates
@@ -29,6 +32,12 @@ class TranslationMatcher:
 class EmptyMatcher:
     def match(self, source, target):
         return np.empty((0, 2)), np.empty((0, 2)), np.empty(0)
+
+
+class StationaryMatcher(TranslationMatcher):
+    def match(self, source, target):
+        source_px, _target_px, score = super().match(source, target)
+        return source_px, source_px.copy(), score
 
 
 def _write_image(path):
@@ -126,3 +135,39 @@ def test_speed_limit_uses_elapsed_seconds_and_metres_per_day():
         30_000.0,
     )
     assert keep.tolist() == [True, False]
+
+
+def test_small_synthetic_sequence_flows_from_tiles_to_trajectories(tmp_path):
+    paths = [tmp_path / f"image-{index}.tif" for index in range(3)]
+    for path in paths:
+        _write_image(path)
+    footprint = box(-800.0, -800.0, 800.0, 800.0)
+    start = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    images = [
+        ImageRecord(
+            f"image-{index}",
+            path,
+            start + timedelta(days=index),
+            "component",
+            footprint,
+        )
+        for index, path in enumerate(paths)
+    ]
+    processor = PairProcessor(_config(tmp_path), StationaryMatcher())
+    first_pair, second_pair = ImagePair(images[0], images[1]), ImagePair(images[1], images[2])
+    first = processor.process(first_pair)
+    second = processor.process(
+        second_pair, first.field, first_pair.elapsed_seconds
+    )
+
+    trajectories = build_trajectories(
+        [FieldEdge(first.field), FieldEdge(second.field)],
+        images,
+        _config(tmp_path).field,
+        TrajectoryConfig(),
+    )
+
+    assert {point.state for point in trajectories if point.image_id == "image-2"} == {
+        "observed"
+    }
+    assert all(point.x_m is not None for point in trajectories)
