@@ -8,6 +8,7 @@ from experiments.run_efficientloftr_sequence import (
     field_sha256,
     pair_identity,
     regions_near_points,
+    routing_recovery_diagnostic,
     save_trajectory_products,
 )
 from experiments.run_efficientloftr_targeted_recovery import recovery_positions
@@ -159,6 +160,61 @@ def test_coarse_phase_translation_has_projected_y_sign(monkeypatch):
 
     np.testing.assert_allclose(result.displacement_m, [7.0, -5.0], atol=0.1)
     assert result.response > 0.9
+
+
+def test_routing_recovery_requires_large_residual_and_aligned_edge_pressure():
+    config = EfficientLoFTRConfig()
+    source = np.column_stack((np.arange(20) * 100.0, np.zeros(20)))
+    target = source + np.array([-3000.0, 1500.0])
+    target_px = np.column_stack(
+        (np.full(20, 30.0), np.full(20, 250.0))
+    )
+
+    result = routing_recovery_diagnostic(
+        source, target, target_px, np.zeros(2), config
+    )
+
+    assert result["triggered"]
+    assert result["aligned_axes"] == ["x_negative"]
+    assert result["usable_routing_slack_m"] == 1280.0
+    assert result["median_residual_dx_m"] == -3000.0
+    assert result["median_residual_dy_m"] == 1500.0
+
+
+def test_routing_recovery_does_not_trigger_on_residual_without_edge_pressure():
+    config = EfficientLoFTRConfig()
+    source = np.column_stack((np.arange(20) * 100.0, np.zeros(20)))
+    target = source + np.array([-3000.0, 0.0])
+    target_px = np.full((20, 2), 255.5)
+
+    result = routing_recovery_diagnostic(
+        source, target, target_px, np.zeros(2), config
+    )
+
+    assert result["eligible"]
+    assert not result["triggered"]
+
+
+def test_larger_context_increases_recovery_slack_without_changing_core():
+    baseline = EfficientLoFTRConfig(tile_size_px=512, tile_margin_px=32)
+    larger = EfficientLoFTRConfig(tile_size_px=576, tile_margin_px=64)
+
+    assert baseline.tile_core_size_m == larger.tile_core_size_m == 35_840.0
+    source = np.column_stack((np.arange(20) * 100.0, np.zeros(20)))
+    target = source + np.array([-3000.0, 0.0])
+    target_px = np.column_stack(
+        (np.full(20, 30.0), np.full(20, 250.0))
+    )
+    baseline_result = routing_recovery_diagnostic(
+        source, target, target_px, np.zeros(2), baseline
+    )
+    larger_result = routing_recovery_diagnostic(
+        source, target, target_px, np.zeros(2), larger
+    )
+
+    assert baseline_result["triggered"]
+    assert not larger_result["triggered"]
+    assert larger_result["usable_routing_slack_m"] == 3840.0
 
 
 def test_field_hash_survives_csv_resume_round_trip(tmp_path):

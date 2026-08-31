@@ -69,6 +69,9 @@ from limosat.learned_drift.types import DriftField, MotionMatches
 
 
 SENTINEL1_TIME_RE = re.compile(r"_(\d{8}T\d{6})_")
+ROUTING_RECOVERY_MINIMUM_MATCHES = 12
+ROUTING_RECOVERY_EDGE_BAND_PX = 32
+ROUTING_RECOVERY_MINIMUM_EDGE_IMBALANCE = 0.05
 
 
 @dataclass(frozen=True)
@@ -104,6 +107,14 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=30.0,
         help="Radial physics gate; test 30, 40, and 50 before changing the default.",
+    )
+    parser.add_argument("--tile-size-px", type=int, default=512)
+    parser.add_argument("--tile-margin-px", type=int, default=32)
+    parser.add_argument(
+        "--routing-recovery",
+        choices=("none", "residual_edge"),
+        default="none",
+        help="Optionally recenter and rematch tiles with aligned residual and edge pressure.",
     )
     parser.add_argument(
         "--sic-root",
@@ -280,6 +291,7 @@ def pair_identity(
     target_sic_path: Path | None = None,
     sic_open_water_threshold_percent: float = 15.0,
     sic_samples_per_axis: int = 5,
+    routing_recovery: str = "none",
 ) -> str:
     identity = {
         "source_image_id": spec.source_image_id,
@@ -310,10 +322,82 @@ def pair_identity(
     if source_selection_xy_m is not None:
         identity["source_selection_sha256"] = array_sha256(source_selection_xy_m)
         identity["source_selection_buffer_m"] = source_selection_buffer_m
+    if routing_recovery != "none":
+        identity["routing_recovery"] = routing_recovery
     encoded = json.dumps(
         identity, sort_keys=True, separators=(",", ":"), allow_nan=False
     )
     return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def routing_recovery_diagnostic(
+    source_xy_m: np.ndarray,
+    target_xy_m: np.ndarray,
+    target_px: np.ndarray,
+    routing_shift_m: np.ndarray,
+    config: EfficientLoFTRConfig,
+) -> dict:
+    """Diagnose a target-window routing error from accepted image matches."""
+
+    match_count = len(source_xy_m)
+    slack_px = config.tile_margin_px - config.endpoint_support_radius_px
+    slack_m = max(0.0, slack_px * config.pixel_size_m)
+    result = {
+        "eligible": False,
+        "triggered": False,
+        "match_count": int(match_count),
+        "usable_routing_slack_m": float(slack_m),
+        "median_residual_dx_m": None,
+        "median_residual_dy_m": None,
+        "left_edge_fraction": None,
+        "right_edge_fraction": None,
+        "top_edge_fraction": None,
+        "bottom_edge_fraction": None,
+        "aligned_axes": [],
+    }
+    if match_count < ROUTING_RECOVERY_MINIMUM_MATCHES:
+        return result
+    displacement = target_xy_m - source_xy_m
+    residual = np.median(displacement, axis=0) - np.asarray(
+        routing_shift_m, dtype=np.float64
+    )
+    lower_edge = (
+        config.endpoint_support_radius_px + ROUTING_RECOVERY_EDGE_BAND_PX
+    )
+    upper_edge = (
+        config.tile_size_px
+        - config.endpoint_support_radius_px
+        - ROUTING_RECOVERY_EDGE_BAND_PX
+    )
+    left = float(np.mean(target_px[:, 0] < lower_edge))
+    right = float(np.mean(target_px[:, 0] >= upper_edge))
+    top = float(np.mean(target_px[:, 1] < lower_edge))
+    bottom = float(np.mean(target_px[:, 1] >= upper_edge))
+    aligned_axes = []
+    threshold = ROUTING_RECOVERY_MINIMUM_EDGE_IMBALANCE
+    if residual[0] < -slack_m and left - right >= threshold:
+        aligned_axes.append("x_negative")
+    if residual[0] > slack_m and right - left >= threshold:
+        aligned_axes.append("x_positive")
+    # Projected y increases upward while image-row y increases downward.
+    if residual[1] > slack_m and top - bottom >= threshold:
+        aligned_axes.append("y_positive")
+    if residual[1] < -slack_m and bottom - top >= threshold:
+        aligned_axes.append("y_negative")
+    result.update(
+        {
+            "eligible": True,
+            "triggered": bool(aligned_axes),
+            "median_residual_dx_m": float(residual[0]),
+            "median_residual_dy_m": float(residual[1]),
+            "left_edge_fraction": left,
+            "right_edge_fraction": right,
+            "top_edge_fraction": top,
+            "bottom_edge_fraction": bottom,
+            "aligned_axes": aligned_axes,
+        }
+    )
+    return result
 
 
 def array_sha256(values: np.ndarray | None) -> str | None:
@@ -414,7 +498,10 @@ def track_pair(
     target_sic: SicField | None = None,
     sic_open_water_threshold_percent: float = 15.0,
     sic_samples_per_axis: int = 5,
+    routing_recovery: str = "none",
 ) -> tuple[DriftField, dict]:
+    if routing_recovery not in {"none", "residual_edge"}:
+        raise ValueError(f"unsupported routing recovery: {routing_recovery}")
     pair_started = time.perf_counter()
     source_domain, target_domain = pair_domains(spec, config)
     source_rows = []
@@ -580,6 +667,113 @@ def track_pair(
             & in_domains
             & speed_valid
         )
+        recovery = routing_recovery_diagnostic(
+            source_xy_m[accepted],
+            target_xy_m[accepted],
+            target_px[accepted],
+            shift_m,
+            config,
+        )
+        recovery_matching_seconds = 0.0
+        recovery_sampling_seconds = 0.0
+        first_pass_physics_valid_matches = int(accepted.sum())
+        first_pass_matching_seconds = tile_matching_seconds
+        if routing_recovery == "residual_edge" and recovery["triggered"]:
+            correction_m = np.array(
+                [
+                    recovery["median_residual_dx_m"],
+                    recovery["median_residual_dy_m"],
+                ],
+                dtype=np.float64,
+            )
+            recovered_center = tuple(np.asarray(target_center) + correction_m)
+            started = time.perf_counter()
+            recovered_patch, recovered_valid = north_up_patch(
+                spec.target_path,
+                recovered_center,
+                config.tile_size_px,
+                config.pixel_size_m,
+                config.analysis_epsg,
+                config.transform_grid_spacing_px,
+            )
+            recovered_support = valid_support(
+                recovered_valid, config.endpoint_support_radius_px
+            )
+            recovered_gate = valid_tile_overlap_gate(
+                source_core_support,
+                recovered_support,
+                region.center_xy_m,
+                recovered_center,
+                config.pixel_size_m,
+                config.maximum_displacement_m(spec.elapsed_hours),
+            )
+            recovery_sampling_seconds = time.perf_counter() - started
+            sampling_seconds += recovery_sampling_seconds
+            if not recovered_gate.skip:
+                recovered_inputs = matcher_inputs(
+                    source_patch, recovered_patch, device
+                )
+                started = time.perf_counter()
+                with torch.inference_mode():
+                    recovered_source_px, recovered_target_px, recovered_scores = (
+                        run_optimized_matcher(model, recovered_inputs)
+                    )
+                synchronize(device)
+                recovery_matching_seconds = time.perf_counter() - started
+                matching_seconds += recovery_matching_seconds
+                recovered_source_xy_m = projected_xy(
+                    recovered_source_px, region.center_xy_m, config
+                )
+                recovered_target_xy_m = projected_xy(
+                    recovered_target_px, recovered_center, config
+                )
+                recovered_accepted = (
+                    source_core_mask(
+                        recovered_source_px,
+                        config.tile_size_px,
+                        config.tile_margin_px,
+                    )
+                    & valid_endpoints(recovered_source_px, source_support)
+                    & valid_endpoints(recovered_target_px, recovered_support)
+                    & shapely.intersects_xy(
+                        source_domain,
+                        recovered_source_xy_m[:, 0],
+                        recovered_source_xy_m[:, 1],
+                    )
+                    & shapely.intersects_xy(
+                        target_domain,
+                        recovered_target_xy_m[:, 0],
+                        recovered_target_xy_m[:, 1],
+                    )
+                    & speed_limit_mask(
+                        recovered_source_xy_m,
+                        recovered_target_xy_m,
+                        spec.elapsed_hours,
+                        config.maximum_speed_m_per_day,
+                    )
+                )
+                recovery["post_recovery"] = routing_recovery_diagnostic(
+                    recovered_source_xy_m[recovered_accepted],
+                    recovered_target_xy_m[recovered_accepted],
+                    recovered_target_px[recovered_accepted],
+                    np.asarray(shift_m) + correction_m,
+                    config,
+                )
+                source_xy_m = recovered_source_xy_m
+                target_xy_m = recovered_target_xy_m
+                source_px = recovered_source_px
+                target_px = recovered_target_px
+                scores = recovered_scores
+                accepted = recovered_accepted
+                target_center = recovered_center
+                recovery["applied"] = True
+                recovery["correction_dx_m"] = float(correction_m[0])
+                recovery["correction_dy_m"] = float(correction_m[1])
+            else:
+                recovery["applied"] = False
+                recovery["failure_reason"] = recovered_gate.reason
+        else:
+            recovery["applied"] = False
         source_rows.append(source_xy_m[accepted])
         target_rows.append(target_xy_m[accepted])
         score_rows.append(scores[accepted].astype(np.float32))
@@ -587,9 +781,18 @@ def track_pair(
         tile_metrics.append(
             {
                 **tile_metric,
+                "target_center_x_m": target_center[0],
+                "target_center_y_m": target_center[1],
                 "raw_matches": int(len(scores)),
                 "physics_valid_matches": int(accepted.sum()),
-                "matching_seconds": tile_matching_seconds,
+                "matching_seconds": (
+                    tile_matching_seconds + recovery_matching_seconds
+                ),
+                "first_pass_matching_seconds": first_pass_matching_seconds,
+                "first_pass_physics_valid_matches": first_pass_physics_valid_matches,
+                "recovery_matching_seconds": recovery_matching_seconds,
+                "recovery_sampling_seconds": recovery_sampling_seconds,
+                "routing_recovery": json.dumps(recovery, sort_keys=True),
             }
         )
 
@@ -701,6 +904,26 @@ def track_pair(
             "shift_p90_magnitude": float(
                 np.quantile(np.linalg.norm(tile_shifts_m, axis=1), 0.90)
             ),
+            "recovery": {
+                "mode": routing_recovery,
+                "triggered_tiles": int(
+                    sum(
+                        json.loads(item.get("routing_recovery", "{}"))
+                        .get("triggered", False)
+                        for item in tile_metrics
+                    )
+                ),
+                "applied_tiles": int(
+                    sum(
+                        json.loads(item.get("routing_recovery", "{}"))
+                        .get("applied", False)
+                        for item in tile_metrics
+                    )
+                ),
+                "minimum_matches": ROUTING_RECOVERY_MINIMUM_MATCHES,
+                "edge_band_px": ROUTING_RECOVERY_EDGE_BAND_PX,
+                "minimum_edge_imbalance": ROUTING_RECOVERY_MINIMUM_EDGE_IMBALANCE,
+            },
         },
         "source_tiles": len(tile_metrics),
         "matched_source_tiles": len(tile_metrics) - sum(skip_counts.values()),
@@ -1023,7 +1246,9 @@ def main() -> int:
         raise ValueError("maximum SIC age cannot be negative")
     sic_index = SicFileIndex(args.sic_root) if args.sic_root is not None else None
     config = EfficientLoFTRConfig(
-        maximum_speed_m_per_day=args.maximum_speed_km_per_day * 1_000.0
+        maximum_speed_m_per_day=args.maximum_speed_km_per_day * 1_000.0,
+        tile_size_px=args.tile_size_px,
+        tile_margin_px=args.tile_margin_px,
     )
     device = torch.device(args.device)
     if device.type == "mps" and not torch.backends.mps.is_available():
@@ -1098,6 +1323,7 @@ def main() -> int:
                 args.sic_open_water_threshold_percent
             ),
             sic_samples_per_axis=args.sic_samples_per_axis,
+            routing_recovery=args.routing_recovery,
         )
         completed = load_completed_pair(pair_dir, identity)
         if completed is not None:
@@ -1133,6 +1359,7 @@ def main() -> int:
                     args.sic_open_water_threshold_percent
                 ),
                 sic_samples_per_axis=args.sic_samples_per_axis,
+                routing_recovery=args.routing_recovery,
             )
         previous_elapsed_days = spec.elapsed_hours / 24.0
         pair_summaries.append(summary)
@@ -1174,6 +1401,7 @@ def main() -> int:
         "matcher": "official EfficientLoFTR optimized",
         "routing_mode": args.routing_mode,
         "initial_routing": args.initial_routing,
+        "routing_recovery": args.routing_recovery,
         "initial_translation": (
             asdict(initial_translation) if initial_translation is not None else None
         ),
