@@ -978,6 +978,33 @@ def track_pair(
     return field, summary
 
 
+def _survival_by_image(trajectories: pd.DataFrame, image_count: int) -> pd.DataFrame:
+    """Return one explicit coverage row per image, including zero trajectories."""
+    survival = (
+        trajectories.groupby("image_index", sort=True)["active"]
+        .agg(["sum", "count"])
+        .reindex(range(image_count), fill_value=0)
+        .rename_axis("image_index")
+        .reset_index()
+    )
+    survival["sum"] = survival["sum"].astype(int)
+    survival["count"] = survival["count"].astype(int)
+    survival["fraction"] = np.where(
+        survival["count"] > 0,
+        survival["sum"] / survival["count"],
+        np.nan,
+    )
+    return survival
+
+
+def _optional_fraction(value: float) -> float | None:
+    return float(value) if np.isfinite(value) else None
+
+
+def _fraction_list(values: pd.Series) -> list[float | None]:
+    return [_optional_fraction(value) for value in values]
+
+
 def save_trajectory_products(
     specs: list[PairSpec],
     fields: list[DriftField],
@@ -994,19 +1021,14 @@ def save_trajectory_products(
         maximum_triangle_edge_m=config.maximum_triangle_edge_m,
     )
     trajectories.to_csv(output_dir / "trajectories_4km.csv", index=False)
-    survival = (
-        trajectories.groupby("image_index", sort=True)["active"]
-        .agg(["sum", "count"])
-        .reset_index()
-    )
-    survival["fraction"] = survival["sum"] / survival["count"]
+    survival = _survival_by_image(trajectories, len(image_ids))
     survival.to_csv(output_dir / "trajectory_survival.csv", index=False)
     summary = {
         "seeded": int(survival.iloc[0]["count"]),
         "complete": int(survival.iloc[-1]["sum"]),
-        "complete_fraction": float(survival.iloc[-1]["fraction"]),
+        "complete_fraction": _optional_fraction(survival.iloc[-1]["fraction"]),
         "active_by_image": survival["sum"].astype(int).tolist(),
-        "active_fraction_by_image": survival["fraction"].tolist(),
+        "active_fraction_by_image": _fraction_list(survival["fraction"]),
     }
     observed_edges = [
         FieldEdge(
@@ -1028,14 +1050,7 @@ def save_trajectory_products(
     points_graph.to_csv(
         output_dir / "trajectories_with_new_points_adjacent_graph.csv", index=False
     )
-    points_by_image = (
-        points_graph.groupby("image_index", sort=True)["active"]
-        .agg(["sum", "count"])
-        .reset_index()
-    )
-    points_by_image["fraction"] = (
-        points_by_image["sum"] / points_by_image["count"]
-    )
+    points_by_image = _survival_by_image(points_graph, len(image_ids))
     points_by_image.to_csv(
         output_dir / "trajectory_coverage_with_new_points_adjacent_graph.csv",
         index=False,
@@ -1061,7 +1076,7 @@ def save_trajectory_products(
         ),
         "active_by_image": points_by_image["sum"].astype(int).tolist(),
         "trajectory_count_by_image": points_by_image["count"].astype(int).tolist(),
-        "active_fraction_by_image": points_by_image["fraction"].tolist(),
+        "active_fraction_by_image": _fraction_list(points_by_image["fraction"]),
         "dormant_rows": int((points_graph.trajectory_state == "dormant").sum()),
         "reconnected_rows": int(points_graph.reconnected_after_gap.sum()),
         "observed_skip_edge_rows": int(
@@ -1079,20 +1094,15 @@ def save_trajectory_products(
         maximum_triangle_edge_m=config.maximum_triangle_edge_m,
     )
     gap_aware.to_csv(output_dir / "trajectories_gap96h.csv", index=False)
-    gap_survival = (
-        gap_aware.groupby("image_index", sort=True)["active"]
-        .agg(["sum", "count"])
-        .reset_index()
-    )
-    gap_survival["fraction"] = gap_survival["sum"] / gap_survival["count"]
+    gap_survival = _survival_by_image(gap_aware, len(image_ids))
     gap_survival.to_csv(
         output_dir / "trajectory_survival_gap96h.csv", index=False
     )
     summary["gap_aware_96h"] = {
         "complete": int(gap_survival.iloc[-1]["sum"]),
-        "complete_fraction": float(gap_survival.iloc[-1]["fraction"]),
+        "complete_fraction": _optional_fraction(gap_survival.iloc[-1]["fraction"]),
         "active_by_image": gap_survival["sum"].astype(int).tolist(),
-        "active_fraction_by_image": gap_survival["fraction"].tolist(),
+        "active_fraction_by_image": _fraction_list(gap_survival["fraction"]),
         "predicted_rows": int((gap_aware.trajectory_state == "predicted").sum()),
         "field_resupported_rows": int(
             (gap_aware.trajectory_state == "field_resupported").sum()

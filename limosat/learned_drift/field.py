@@ -6,7 +6,7 @@ import math
 
 import numpy as np
 import shapely
-from scipy.spatial import Delaunay, cKDTree
+from scipy.spatial import Delaunay, QhullError, cKDTree
 from shapely.geometry.base import BaseGeometry
 
 from .config import ALIKEDConfig, EfficientLoFTRConfig
@@ -167,7 +167,10 @@ def flipped_field_indices(
         return np.empty(0, dtype=int)
     source = field.source_xy_m[available_indices]
     target = source + field.displacement_m[available_indices]
-    triangles = Delaunay(source).simplices
+    try:
+        triangles = Delaunay(source).simplices
+    except QhullError:
+        return np.empty(0, dtype=int)
     source_triangles = source[triangles]
     target_triangles = target[triangles]
     edge_lengths = np.max(
@@ -228,7 +231,10 @@ def topology_summary(
         return {"triangles": 0}
     source = field.source_xy_m[available]
     target = source + field.displacement_m[available]
-    triangles = Delaunay(source).simplices
+    try:
+        triangles = Delaunay(source).simplices
+    except QhullError:
+        return {"triangles": 0}
     source_triangles = source[triangles]
     target_triangles = target[triangles]
     edge_lengths = np.max(

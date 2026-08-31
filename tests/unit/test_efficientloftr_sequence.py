@@ -1,3 +1,5 @@
+import json
+
 import numpy as np
 import pandas as pd
 import shapely
@@ -20,7 +22,12 @@ from limosat.learned_drift import (
     preceding_field_shifts,
 )
 from limosat.learned_drift.features import TileRegion
-from limosat.learned_drift.field import estimate_field, estimate_queries
+from limosat.learned_drift.field import (
+    estimate_field,
+    estimate_queries,
+    reject_folds,
+    topology_summary,
+)
 from limosat.learned_drift.types import MotionMatches
 
 
@@ -42,6 +49,42 @@ def varying_field() -> DriftField:
         support_radius_m=np.full(len(source), 5000.0),
         maximum_residual_m=np.full(len(source), 80.0),
     )
+
+
+def empty_field() -> DriftField:
+    field = varying_field()
+    return DriftField(
+        grid_row=field.grid_row,
+        grid_column=field.grid_column,
+        source_xy_m=field.source_xy_m,
+        displacement_m=np.full_like(field.displacement_m, np.nan),
+        available=np.zeros(len(field), dtype=bool),
+        selected_matches=np.zeros(len(field)),
+        candidate_matches=np.zeros(len(field)),
+        support_radius_m=np.full(len(field), np.nan),
+        maximum_residual_m=np.full(len(field), np.nan),
+    )
+
+
+def test_collinear_sparse_field_has_no_deformation_triangles():
+    source = np.array([[0.0, 0.0], [4000.0, 0.0], [8000.0, 0.0]])
+    field = DriftField(
+        grid_row=np.zeros(3, dtype=int),
+        grid_column=np.arange(3),
+        source_xy_m=source,
+        displacement_m=np.tile([100.0, -50.0], (3, 1)),
+        available=np.ones(3, dtype=bool),
+        selected_matches=np.full(3, 8),
+        candidate_matches=np.full(3, 12),
+        support_radius_m=np.full(3, 4000.0),
+        maximum_residual_m=np.full(3, 100.0),
+    )
+
+    accepted, rejected = reject_folds(field, 4000.0)
+
+    assert accepted.available.all()
+    assert rejected.size == 0
+    assert topology_summary(accepted, 4000.0) == {"triangles": 0}
 
 
 def test_supplied_point_consensus_matches_regular_field_estimation():
@@ -266,6 +309,69 @@ def test_sequence_outputs_preserve_strict_and_add_new_point_graph(tmp_path):
     points_graph = summary["adjacent_observed_graph_with_new_points"]
     assert points_graph["trajectory_count"] >= points_graph["initial_trajectories"]
     assert points_graph["new_point_exclusion_radius_m"] == 2000.0
+
+
+def test_sequence_with_no_supported_trajectories_is_valid_missing_data(tmp_path):
+    specs = [
+        PairSpec(1, 2, "a.tif", "b.tif", 24.0, None),
+        PairSpec(2, 3, "b.tif", "c.tif", 24.0, None),
+    ]
+
+    summary = save_trajectory_products(
+        specs,
+        [empty_field(), empty_field()],
+        tmp_path,
+        EfficientLoFTRConfig(),
+    )
+
+    assert summary["seeded"] == 0
+    assert summary["complete"] == 0
+    assert summary["complete_fraction"] is None
+    assert summary["active_by_image"] == [0, 0, 0]
+    assert summary["active_fraction_by_image"] == [None, None, None]
+    assert summary["adjacent_observed_graph_with_new_points"]["trajectory_count"] == 0
+    assert summary["adjacent_observed_graph_with_new_points"][
+        "active_fraction_by_image"
+    ] == [None, None, None]
+    assert summary["gap_aware_96h"]["complete"] == 0
+    assert summary["gap_aware_96h"]["complete_fraction"] is None
+    assert summary["gap_aware_96h"]["active_fraction_by_image"] == [None, None, None]
+    json.dumps(summary, allow_nan=False)
+    survival = pd.read_csv(tmp_path / "trajectory_survival.csv")
+    assert survival[["sum", "count"]].to_numpy().tolist() == [[0, 0], [0, 0], [0, 0]]
+
+
+def test_single_pair_with_no_supported_trajectories_is_valid(tmp_path):
+    summary = save_trajectory_products(
+        [PairSpec(1, 2, "a.tif", "b.tif", 24.0, None)],
+        [empty_field()],
+        tmp_path,
+        EfficientLoFTRConfig(),
+    )
+
+    assert summary["seeded"] == 0
+    assert summary["active_by_image"] == [0, 0]
+    assert summary["active_fraction_by_image"] == [None, None]
+
+
+def test_new_point_graph_can_start_after_an_empty_first_pair(tmp_path):
+    specs = [
+        PairSpec(1, 2, "a.tif", "b.tif", 24.0, None),
+        PairSpec(2, 3, "b.tif", "c.tif", 24.0, None),
+    ]
+
+    summary = save_trajectory_products(
+        specs,
+        [empty_field(), varying_field()],
+        tmp_path,
+        EfficientLoFTRConfig(),
+    )
+
+    assert summary["seeded"] == 0
+    graph = summary["adjacent_observed_graph_with_new_points"]
+    assert graph["new_trajectories"] > 0
+    assert graph["final_active"] > 0
+    assert graph["active_fraction_by_image"][0] is None
 
 
 def test_targeted_regions_keep_only_tile_cores_near_dormant_positions():
