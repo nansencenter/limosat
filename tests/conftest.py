@@ -106,7 +106,8 @@ def _inject_limosat_stubs():
 
     if 'limosat' not in sys.modules:
         pkg = types.ModuleType('limosat')
-        pkg.__path__ = []  # mark as package
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        pkg.__path__ = [os.path.join(repo_root, 'limosat')]
         sys.modules['limosat'] = pkg
 
     # Keypoints stub

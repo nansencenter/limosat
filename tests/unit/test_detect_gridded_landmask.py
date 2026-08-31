@@ -9,8 +9,8 @@ def test_landmask_filtering_logic():
     """
     # Create a simple landmask
     landmask = np.zeros((50, 50), dtype=np.uint8)
-    # Mark region 10:20, 10:20 as land (value 2)
-    landmask[10:20, 10:20] = 2
+    # Mark region 10:20, 10:20 as excluded (noncanonical value 253).
+    landmask[10:20, 10:20] = 253
     
     stride = 10
     
@@ -18,7 +18,7 @@ def test_landmask_filtering_logic():
     keypoints_with_filter = []
     for r in range(0, landmask.shape[0], stride):
         for c in range(0, landmask.shape[1], stride):
-            if landmask is not None and landmask[r, c] == 2:
+            if landmask is not None and landmask[r, c] >= 2:
                 continue  # skip land cells
             keypoints_with_filter.append((c, r))
     
@@ -57,7 +57,7 @@ def test_landmask_none_handling():
     keypoints = []
     for r in range(0, img_shape[0], stride):
         for c in range(0, img_shape[1], stride):
-            if landmask is not None and landmask[r, c] == 2:
+            if landmask is not None and landmask[r, c] >= 2:
                 continue  # skip land cells
             keypoints.append((c, r))
     
@@ -82,7 +82,7 @@ def test_large_land_region_filtering():
     keypoints_with_filter = []
     for r in range(0, landmask.shape[0], stride):
         for c in range(0, landmask.shape[1], stride):
-            if landmask is not None and landmask[r, c] == 2:
+            if landmask is not None and landmask[r, c] >= 2:
                 continue  # skip land cells
             keypoints_with_filter.append((c, r))
     
@@ -116,4 +116,3 @@ if __name__ == '__main__':
     test_landmask_none_handling()
     test_large_land_region_filtering()
     print("\n✓ All tests passed!")
-

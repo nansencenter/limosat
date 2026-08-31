@@ -44,6 +44,8 @@ class ImageProcessor:
                  return_insitu_points_on_completion=False,
                  templates=None,
                  grid_cache_dir=None,
+                 audit_sink=None,
+                 validation_dir=None,
                  **kwargs
                 ):
         self.points = points
@@ -53,6 +55,7 @@ class ImageProcessor:
         self.run_name = run_name
         self.insitu_points = insitu_points
         self.return_insitu_points_on_completion = return_insitu_points_on_completion
+        self.audit_sink = audit_sink
 
         # Define default parameters
         default_params = {
@@ -157,12 +160,21 @@ class ImageProcessor:
         if self.persist_updates:
             if engine is None or zarr_path is None:
                 raise ValueError("engine and zarr_path must be provided when persist_updates=True")
-            self.db = DriftDatabase(engine=engine, zarr_path=zarr_path, run_name=run_name)
+            self.db = DriftDatabase(
+                engine=engine,
+                zarr_path=zarr_path,
+                run_name=run_name,
+                validation_dir=validation_dir or "validation",
+            )
 
         logger.info(f"Initialized ImageProcessor" + (f" for: {self.run_name}" if run_name else ""))
         logger.info(f"Interpolation: {'enabled' if self.use_interpolation else 'disabled'}")
         if self.insitu_points is not None:
             logger.info("Validation mode enabled with in-situ points")
+
+    def _audit_emit(self, stream, records):
+        if self.audit_sink is not None:
+            self.audit_sink.emit(stream, records)
 
     def _candidate_buffer_distance_m(self):
         # temporal_window is a day-based lookback, so this is meters/day * days.
@@ -380,6 +392,8 @@ class ImageProcessor:
             
             # Add the 'length' column to this temporary dataframe for sorting
             cluster_df['length'] = cluster_df['trajectory_id'].map(traj_lengths).fillna(1).astype(int)
+            if 'corr' not in cluster_df.columns:
+                cluster_df['corr'] = 0.0
             
             # Robustly find the winner using multi-level sorting:
             # 1. Sort by trajectory length (descending).
@@ -404,6 +418,27 @@ class ImageProcessor:
         # 5. Apply all updates in a single, vectorized operation
         if loser_tids:
             logger.info(f"Stopping {len(loser_tids)} trajectories due to convergence.")
+            target_image_id = (
+                int(points_matched["image_id"].iloc[0])
+                if "image_id" in points_matched.columns and len(points_matched)
+                else None
+            )
+            self._audit_emit(
+                "trajectory_stages",
+                [
+                    {
+                        "stage": "convergence",
+                        "target_image_id": target_image_id,
+                        "trajectory_id": int(loser),
+                        "accepted": False,
+                        "rejection_reason": "trajectory_convergence",
+                        "converged_to": int(loser_to_winner_map[loser]),
+                        "effective_radius_coordinate_units": self.convergence_radius_pixels,
+                        "geometry_crs": str(getattr(points_matched, "crs", None)),
+                    }
+                    for loser in sorted(loser_tids)
+                ],
+            )
             
             mask = self.points['trajectory_id'].isin(loser_tids)
             self.points.loc[mask, 'stopped'] = True
@@ -599,6 +634,27 @@ class ImageProcessor:
         points_fg2['trajectory_id'] = points_fg1.trajectory_id.values
         points_fg2['interpolated'] = 0
         points_matched = points_fg2
+        self._audit_emit(
+            "trajectory_stages",
+            [
+                {
+                    "stage": "post_model",
+                    "source_image_id": int(source.image_id),
+                    "target_image_id": int(target.image_id),
+                    "trajectory_id": int(source.trajectory_id),
+                    "source_x": float(source.geometry.x),
+                    "source_y": float(source.geometry.y),
+                    "target_x": float(target.geometry.x),
+                    "target_y": float(target.geometry.y),
+                    "accepted": True,
+                    "rejection_reason": None,
+                }
+                for source, target in zip(
+                    points_fg1.itertuples(index=False),
+                    points_fg2.itertuples(index=False),
+                )
+            ],
+        )
 
         # Interpolate drift if needed
         if self.use_interpolation and len(points_fg1) < len(points_poly_filtered):
@@ -620,6 +676,24 @@ class ImageProcessor:
             elif len(points_fg1) >= len(points_poly_filtered):
                 logger.info("All points matched, no interpolation needed")
 
+        self._audit_emit(
+            "trajectory_stages",
+            [
+                {
+                    "stage": "post_interpolation",
+                    "source_image_id": None,
+                    "target_image_id": int(row.image_id),
+                    "trajectory_id": int(row.trajectory_id),
+                    "target_x": float(row.geometry.x),
+                    "target_y": float(row.geometry.y),
+                    "interpolated": int(row.interpolated),
+                    "accepted": True,
+                    "rejection_reason": None,
+                }
+                for row in points_matched.itertuples(index=False)
+            ],
+        )
+
         # Global velocity filter
         if not points_matched.empty:
             num_before_speed_filter = len(points_matched)
@@ -637,6 +711,29 @@ class ImageProcessor:
                 where=time_diff_days > 1e-9
             )
             speed_filter_mask = speed_m_per_day <= self.max_valid_speed_m_per_day
+            candidates_with_history["audit_speed_m_per_day"] = np.asarray(
+                speed_m_per_day, dtype=float
+            )
+            candidates_with_history["audit_speed_pass"] = np.asarray(
+                speed_filter_mask, dtype=bool
+            )
+            self._audit_emit(
+                "trajectory_stages",
+                [
+                    {
+                        "stage": "velocity_filter",
+                        "target_image_id": int(row.image_id),
+                        "trajectory_id": int(row.trajectory_id),
+                        "speed_m_per_day": float(row.audit_speed_m_per_day),
+                        "max_speed_m_per_day": self.max_valid_speed_m_per_day,
+                        "accepted": bool(row.audit_speed_pass),
+                        "rejection_reason": (
+                            None if row.audit_speed_pass else "global_velocity"
+                        ),
+                    }
+                    for row in candidates_with_history.itertuples(index=False)
+                ],
+            )
             valid_trajectory_ids = candidates_with_history.loc[speed_filter_mask, 'trajectory_id']
             points_matched = points_matched[points_matched['trajectory_id'].isin(valid_trajectory_ids)]
             if len(points_matched) < num_before_speed_filter:
@@ -655,6 +752,21 @@ class ImageProcessor:
         all_traj_ids = points_matched.trajectory_id.values
         available_traj_ids = self.templates.trajectory_ids
         has_template_mask = np.isin(all_traj_ids, available_traj_ids)
+        self._audit_emit(
+            "trajectory_stages",
+            [
+                {
+                    "stage": "template_availability",
+                    "target_image_id": int(row.image_id),
+                    "trajectory_id": int(row.trajectory_id),
+                    "accepted": bool(available),
+                    "rejection_reason": None if available else "missing_template",
+                }
+                for row, available in zip(
+                    points_matched.itertuples(index=False), has_template_mask
+                )
+            ],
+        )
         if not np.all(has_template_mask):
             points_matched = points_matched[has_template_mask]
             all_traj_ids = points_matched.trajectory_id.values
@@ -685,6 +797,40 @@ class ImageProcessor:
 
         points_matched['corr'] = corr_values
         correlation_mask = corr_values >= self.min_correlation
+        self._audit_emit(
+            "trajectory_stages",
+            [
+                {
+                    "stage": "pattern_matching",
+                    "target_image_id": int(row.image_id),
+                    "trajectory_id": int(row.trajectory_id),
+                    "pre_pattern_x": float(row.geometry.x),
+                    "pre_pattern_y": float(row.geometry.y),
+                    "corrected_x": float(keypoints_corrected_xy[index, 0]),
+                    "corrected_y": float(keypoints_corrected_xy[index, 1]),
+                    "corrected_col": float(keypoints_corrected_rc[index, 0]),
+                    "corrected_row": float(keypoints_corrected_rc[index, 1]),
+                    "correlation": float(corr_values[index]),
+                    "pattern_available": bool(
+                        np.isfinite(corr_values[index]) and corr_values[index] >= 0
+                    ),
+                    "min_correlation": self.min_correlation,
+                    "accepted": bool(correlation_mask[index]),
+                    "rejection_reason": (
+                        None
+                        if correlation_mask[index]
+                        else (
+                            "pattern_unavailable"
+                            if not np.isfinite(corr_values[index])
+                            or corr_values[index] < 0
+                            else "pattern_correlation"
+                        )
+                    ),
+                    "interpolated": int(row.interpolated),
+                }
+                for index, row in enumerate(points_matched.itertuples(index=False))
+            ],
+        )
         
         if not np.any(correlation_mask):
             logger.debug("No points passed correlation filter.")
@@ -706,6 +852,29 @@ class ImageProcessor:
             points_matched.geometry_orig.y.to_numpy(),
             keypoints_corrected_xy[:, 0],
             keypoints_corrected_xy[:, 1],
+        )
+
+        topology_coordinate_valid = np.isfinite(x1_interp) & np.isfinite(y1_interp)
+        self._audit_emit(
+            "trajectory_stages",
+            [
+                {
+                    "stage": "topology_filter",
+                    "target_image_id": int(row.image_id),
+                    "trajectory_id": int(row.trajectory_id),
+                    "topology_replaced": bool(was_interpolated_mask[index]),
+                    "topology_x": float(x1_interp[index]),
+                    "topology_y": float(y1_interp[index]),
+                    "requires_pattern_recheck": bool(was_interpolated_mask[index]),
+                    "accepted": bool(topology_coordinate_valid[index]),
+                    "rejection_reason": (
+                        None
+                        if topology_coordinate_valid[index]
+                        else "topology_invalid_coordinate"
+                    ),
+                }
+                for index, row in enumerate(points_matched.itertuples(index=False))
+            ],
         )
 
         good_mask = ~was_interpolated_mask & ~np.isnan(x1_interp)
@@ -739,6 +908,27 @@ class ImageProcessor:
             )
             
             recheck_passed_mask = corr_rechecked >= self.min_correlation
+            self._audit_emit(
+                "trajectory_stages",
+                [
+                    {
+                        "stage": "topology_pattern_recheck",
+                        "target_image_id": int(row.image_id),
+                        "trajectory_id": int(row.trajectory_id),
+                        "correlation": float(corr_rechecked[index]),
+                        "min_correlation": self.min_correlation,
+                        "accepted": bool(recheck_passed_mask[index]),
+                        "rejection_reason": (
+                            None
+                            if recheck_passed_mask[index]
+                            else "topology_pattern_recheck"
+                        ),
+                    }
+                    for index, row in enumerate(
+                        points_to_recheck.itertuples(index=False)
+                    )
+                ],
+            )
 
             # collect failed (interpolated but did not pass recheck)
             if (~recheck_passed_mask).any():
@@ -799,6 +989,29 @@ class ImageProcessor:
             new_descriptors = None
 
         original_count = len(points_matched)
+        descriptor_batch_ok = (
+            new_descriptors is not None
+            and len(new_descriptors) == len(points_matched)
+        )
+        self._audit_emit(
+            "trajectory_stages",
+            [
+                {
+                    "stage": "descriptor_update",
+                    "target_image_id": int(row.image_id),
+                    "trajectory_id": int(row.trajectory_id),
+                    "descriptor_batch_count": (
+                        len(new_descriptors) if new_descriptors is not None else 0
+                    ),
+                    "expected_descriptor_count": original_count,
+                    "accepted": bool(descriptor_batch_ok),
+                    "rejection_reason": (
+                        None if descriptor_batch_ok else "descriptor_recompute"
+                    ),
+                }
+                for row in points_matched.itertuples(index=False)
+            ],
+        )
 
         if new_descriptors is not None and len(new_descriptors) == len(points_matched):
             points_matched['descriptors'] = list(new_descriptors)
@@ -825,6 +1038,24 @@ class ImageProcessor:
                 sampling=self.template_sampling,
             )
 
+        self._audit_emit(
+            "trajectory_stages",
+            [
+                {
+                    "stage": "final_acceptance",
+                    "target_image_id": int(row.image_id),
+                    "trajectory_id": int(row.trajectory_id),
+                    "target_x": float(row.geometry.x),
+                    "target_y": float(row.geometry.y),
+                    "correlation": float(row.corr),
+                    "interpolated": int(row.interpolated),
+                    "accepted": True,
+                    "rejection_reason": None,
+                }
+                for row in points_matched.itertuples(index=False)
+            ],
+        )
+
         logger.debug(f"Returning {len(points_matched)} final points")
         return points_matched, failed_predictions
 
@@ -847,5 +1078,8 @@ class ImageProcessor:
                     logger.info(
                         f"Final persistence completed. Last persisted ID set to {self._last_persisted_id}"
                     )
+                    return True
                 else:
                     logger.error("Final persistence FAILED. _last_persisted_id not updated.")
+                    return False
+        return True

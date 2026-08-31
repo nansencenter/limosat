@@ -237,7 +237,7 @@ class KeypointDetector:
         # land mask
         if img.bands().get(2, {'name': 'none'}).get('name') == 'mask':
             landmask = img[2]
-            img0[landmask == 2] = 0
+            img0[landmask >= 2] = 0
 
         if step is None:
             step = window_size
@@ -396,7 +396,7 @@ class KeypointDetector:
         landmask = None
         if img.bands().get(2, {'name': 'none'}).get('name') == 'mask':
             landmask = img[2]
-            img0[landmask == 2] = 0
+            img0[landmask >= 2] = 0
 
         # Vectorized grid generation to avoid Python double loop
         h, w = img0.shape
@@ -405,7 +405,7 @@ class KeypointDetector:
         cols_flat = cols.ravel()
 
         if landmask is not None:
-            landmask_bool = (landmask == 2)
+            landmask_bool = landmask >= 2
             valid_mask = ~landmask_bool[rows_flat, cols_flat]
             rows_flat = rows_flat[valid_mask]
             cols_flat = cols_flat[valid_mask]

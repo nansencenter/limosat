@@ -13,11 +13,13 @@ Class and methods for persisting keypoints and templates
 import os
 import json
 import shutil
+from datetime import date, datetime
 import numpy as np
 import pandas as pd
 import geopandas as gpd
 import xarray as xr
 from shapely import wkt as shapely_wkt
+from shapely.geometry.base import BaseGeometry
 from sqlalchemy import text, Float, Text, DateTime, inspect, Integer, bindparam
 from sqlalchemy import Boolean
 from .utils import logger, log_execution_time
@@ -32,10 +34,11 @@ class DriftDatabase:
         run_name: Identifier for this run (used for table naming)
     """
 
-    def __init__(self, engine=None, zarr_path=None, run_name=None):
+    def __init__(self, engine=None, zarr_path=None, run_name=None, validation_dir="validation"):
         self.engine = engine
         self.zarr_path = zarr_path
         self.run_name = run_name
+        self.validation_dir = validation_dir
         self.dialect_name = self.engine.dialect.name if self.engine is not None else None
         self.is_postgis = self.dialect_name in {"postgresql", "postgres"}
 
@@ -288,7 +291,7 @@ class DriftDatabase:
             insitu_points: GeoDataFrame containing validation points
         """
         # Create validation directory if it doesn't exist
-        validation_dir = 'validation'
+        validation_dir = self.validation_dir
         os.makedirs(validation_dir, exist_ok=True)
 
         # Save to GeoJSON
@@ -299,7 +302,33 @@ class DriftDatabase:
         if validation_data.crs is None:
             validation_data.set_crs('EPSG:3413', inplace=True)
 
-        validation_data.to_file(output_file, driver='GeoJSON')
+        geometry_column = validation_data.geometry.name
+
+        def geojson_safe(value):
+            if value is None or value is pd.NA:
+                return None
+            if isinstance(value, (pd.Timestamp, datetime, date)):
+                return value.isoformat()
+            if isinstance(value, BaseGeometry):
+                return value.wkt
+            if isinstance(value, np.generic):
+                return value.item()
+            if isinstance(value, (list, tuple, dict, set, np.ndarray)):
+                return json.dumps(value, default=str)
+            return value
+
+        for column in validation_data.columns:
+            if column == geometry_column:
+                continue
+            series = validation_data[column]
+            if pd.api.types.is_datetime64_any_dtype(series.dtype):
+                validation_data[column] = series.map(geojson_safe)
+            elif pd.api.types.is_object_dtype(series.dtype):
+                validation_data[column] = series.map(geojson_safe)
+
+        # The validation tables can retain an index named like a real column
+        # (for example ``probe_id``). The index is bookkeeping, not metadata.
+        validation_data.to_file(output_file, driver='GeoJSON', index=False)
         logger.info(f"Saved validation metadata to {output_file}")
 
     @staticmethod

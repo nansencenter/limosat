@@ -80,6 +80,146 @@ def test_matcher_filter_respects_motion_distance_limit():
 
 
 @pytest.mark.unit
+def test_matcher_audit_records_candidate_fates_without_changing_result():
+    Matcher = load_real_module("limosat.matcher").Matcher
+
+    class Sink:
+        def __init__(self):
+            self.records = []
+
+        def emit(self, stream, records):
+            self.records.extend((stream, record) for record in records)
+
+    sink = Sink()
+    matcher = Matcher(
+        descriptor_distance_max=100,
+        use_model_estimation=False,
+        audit_sink=sink,
+    )
+    matches = [
+        cv2.DMatch(_queryIdx=0, _trainIdx=0, _distance=10),
+        cv2.DMatch(_queryIdx=1, _trainIdx=1, _distance=110),
+        cv2.DMatch(_queryIdx=2, _trainIdx=2, _distance=10),
+    ]
+    pos0 = np.zeros((3, 2), dtype=float)
+    pos1 = np.array([[30.0, 0.0], [1.0, 0.0], [60.0, 0.0]], dtype=float)
+
+    idx0, idx1, _ = matcher.filter(
+        matches,
+        pos0,
+        pos1,
+        max_distance_m=50.0,
+        audit_context={
+            "source_image_id": 1,
+            "target_image_id": 2,
+            "source_trajectory_ids": np.array([10, 11, 12]),
+            "candidate_origins": {0: "crosscheck", 1: "crosscheck", 2: "lowe_ratio"},
+        },
+    )
+
+    assert idx0.tolist() == [0]
+    assert idx1.tolist() == [0]
+    rows = [record for stream, record in sink.records if stream == "matcher_candidates"]
+    assert [row["rejection_reason"] for row in rows] == [
+        "accepted",
+        "descriptor_distance",
+        "motion_distance",
+    ]
+    assert rows[0]["candidate_id"] == "2:1:10:0:0"
+
+
+@pytest.mark.unit
+def test_matcher_filter_zero_motion_limit_keeps_only_exact_matches():
+    Matcher = load_real_module("limosat.matcher").Matcher
+
+    matcher = Matcher(descriptor_distance_max=100, use_model_estimation=False)
+    matches = [
+        cv2.DMatch(_queryIdx=0, _trainIdx=0, _distance=10),
+        cv2.DMatch(_queryIdx=1, _trainIdx=1, _distance=10),
+    ]
+    pos0 = np.array([[0.0, 0.0], [0.0, 0.0]], dtype=float)
+    pos1 = np.array([[0.0, 0.0], [0.1, 0.0]], dtype=float)
+
+    idx0, idx1, _ = matcher.filter(matches, pos0, pos1, max_distance_m=0.0)
+
+    assert idx0.tolist() == [0]
+    assert idx1.tolist() == [0]
+
+
+@pytest.mark.unit
+def test_configured_affine_estimator_recovers_affine_inliers():
+    Matcher = load_real_module("limosat.matcher").Matcher
+
+    source = np.array(
+        [
+            [0.0, 0.0],
+            [10.0, 0.0],
+            [0.0, 10.0],
+            [10.0, 10.0],
+            [20.0, 0.0],
+            [0.0, 20.0],
+            [20.0, 20.0],
+            [30.0, 10.0],
+        ]
+    )
+    affine = np.array([[1.02, 0.01], [-0.02, 0.98]])
+    target = source @ affine.T + np.array([4.0, -3.0])
+    matches = [cv2.DMatch(i, i, 0, 10.0) for i in range(len(source))]
+    matcher = Matcher(
+        descriptor_distance_max=100,
+        model_threshold=0.5,
+        min_homography_inliers=3,
+        estimation_method="USAC_MAGSAC",
+        model_estimator="configured_affine",
+    )
+
+    idx0, idx1, residuals = matcher.filter(matches, source, target)
+
+    assert idx0.tolist() == list(range(len(source)))
+    assert idx1.tolist() == list(range(len(source)))
+    assert np.max(residuals) < 1e-6
+
+
+@pytest.mark.unit
+def test_homography_affine_union_retains_inliers_from_both_models(monkeypatch):
+    matcher_module = load_real_module("limosat.matcher")
+    Matcher = matcher_module.Matcher
+
+    source = np.array(
+        [[0.0, 0.0], [10.0, 0.0], [0.0, 10.0], [10.0, 10.0], [20.0, 0.0]]
+    )
+    target = source + np.array([3.0, -2.0])
+    matches = [cv2.DMatch(i, i, 0, 10.0) for i in range(len(source))]
+    monkeypatch.setattr(
+        matcher_module.cv2,
+        "findHomography",
+        lambda *args, **kwargs: (
+            np.eye(3),
+            np.array([[1], [1], [1], [0], [0]], dtype=np.uint8),
+        ),
+    )
+    monkeypatch.setattr(
+        matcher_module.cv2,
+        "estimateAffine2D",
+        lambda *args, **kwargs: (
+            np.array([[1.0, 0.0, 3.0], [0.0, 1.0, -2.0]]),
+            np.array([[0], [0], [1], [1], [1]], dtype=np.uint8),
+        ),
+    )
+    matcher = Matcher(
+        descriptor_distance_max=100,
+        min_homography_inliers=3,
+        model_estimator="homography_affine_union",
+    )
+
+    idx0, idx1, residuals = matcher.filter(matches, source, target)
+
+    assert idx0.tolist() == [0, 1, 2, 3, 4]
+    assert idx1.tolist() == [0, 1, 2, 3, 4]
+    assert residuals.shape == (5,)
+
+
+@pytest.mark.unit
 def test_configured_homography_scale_preserves_physical_threshold_and_residuals(
     monkeypatch,
 ):
@@ -130,21 +270,55 @@ def test_matcher_rejects_invalid_model_coordinate_scale(scale):
 
 
 @pytest.mark.unit
-def test_matcher_filter_zero_motion_limit_keeps_only_exact_matches():
-    Matcher = load_real_module("limosat.matcher").Matcher
+def test_local_physics_fallback_recovers_sources_after_global_mismatch_or_omission():
+    matcher_module = load_real_module("limosat.matcher")
+    Matcher = matcher_module.Matcher
 
-    matcher = Matcher(descriptor_distance_max=100, use_model_estimation=False)
-    matches = [
-        cv2.DMatch(_queryIdx=0, _trainIdx=0, _distance=10),
-        cv2.DMatch(_queryIdx=1, _trainIdx=1, _distance=10),
+    matcher = Matcher(
+        norm=cv2.NORM_HAMMING2,
+        descriptor_distance_max=120,
+        use_model_estimation=False,
+        candidate_selection="global_then_local_physics_fallback",
+    )
+    x0 = np.vstack(
+        [np.zeros(32, dtype=np.uint8), np.full(32, 255, dtype=np.uint8)]
+    )
+    x1 = np.vstack(
+        [
+            np.zeros(32, dtype=np.uint8),
+            np.r_[np.uint8(1), np.zeros(31, dtype=np.uint8)],
+            np.r_[np.uint8(254), np.full(31, 255, dtype=np.uint8)],
+        ]
+    )
+    pos0 = np.array([[0.0, 0.0], [100.0, 0.0]])
+    pos1 = np.array([[1000.0, 0.0], [1.0, 0.0], [101.0, 0.0]])
+    global_matches = [cv2.DMatch(0, 0, 0, 0.0)]
+
+    combined, origins = matcher._add_local_physics_fallback(
+        group_matches=global_matches,
+        group_query_indices=np.array([0, 1]),
+        x0=x0,
+        x1=x1,
+        pos0=pos0,
+        pos1=pos1,
+        target_tree=matcher_module.cKDTree(pos1),
+        max_distance_m=5.0,
+    )
+
+    assert [(match.queryIdx, match.trainIdx) for match in combined] == [
+        (0, 0),
+        (0, 1),
+        (1, 2),
     ]
-    pos0 = np.array([[0.0, 0.0], [0.0, 0.0]], dtype=float)
-    pos1 = np.array([[0.0, 0.0], [0.1, 0.0]], dtype=float)
-
-    idx0, idx1, _ = matcher.filter(matches, pos0, pos1, max_distance_m=0.0)
-
-    assert idx0.tolist() == [0]
-    assert idx1.tolist() == [0]
+    assert origins == {
+        (0, 1): "local_physics_fallback",
+        (1, 2): "local_physics_fallback",
+    }
+    idx0, idx1, _ = matcher.filter(
+        combined, pos0, pos1, max_distance_m=5.0
+    )
+    assert idx0.tolist() == [0, 1]
+    assert idx1.tolist() == [1, 2]
 
 
 @pytest.mark.unit
