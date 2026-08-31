@@ -1,0 +1,25 @@
+{
+  "schema": "limosat.multisensor-pair-application-manifest/v1",
+  "frozen_utc": "2026-08-19T00:00:00Z",
+  "selection_status": "frozen_before_component_pair_deformation_association",
+  "source_candidate_manifest": {
+    "path": "/Users/seachu/projects/limosat/experiments/configs/multisensor_march_expansion_20260819.json",
+    "sha256": "ae0f64641df7a44c983d970c06a1ca378e4f7aebf77fef7bc5c3c954e033cabe"
+  },
+  "sar_pair": {
+    "pair_id": "10245_10341",
+    "source_product_id": "10245",
+    "target_product_id": "10341",
+    "start_utc": "2020-03-28T12:13:29Z",
+    "end_utc": "2020-03-29T07:59:46Z",
+    "aliked_field": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/learned_feature_pilots/dense_pair_10245_10341_nearest12_flipnode_q4_v1_20260819/flip_rejected_field.csv",
+    "aliked_field_sha256": "fe8a4137430ca5ccbc26de87a9fb1305837d755d1a7713dac4307558e45ea676"
+  },
+  "application_rule": "Apply the component-pair field to every newly retrieved candidate whose timestamps intersect this component interval. Existing 0039 and 0040 component results are retained separately. No component-pair deformation association was used to select a product.",
+  "atl07_tracks": ["0030", "0041"],
+  "atl10_tracks": ["0030", "0039", "0040", "0041"],
+  "reporting_resolutions_m": {
+    "ATL07": [1000, 4000],
+    "ATL10": [4000]
+  }
+}

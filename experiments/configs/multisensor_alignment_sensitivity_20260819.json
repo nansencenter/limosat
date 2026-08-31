@@ -1,0 +1,100 @@
+{
+  "schema": "limosat.multisensor-alignment-sensitivity/v1",
+  "frozen_utc": "2026-08-19T00:00:00Z",
+  "offset_distance_m": 1310.0,
+  "offset_basis": "Frozen ORB buoy endpoint-error P90, the larger of the independently measured ORB 1310 m and ALIKED 1301 m scales.",
+  "material_magnitude_rule": "Alignment-sensitive if the direct-registration symmetric-offset envelope changes sign or spans at least 0.20 Spearman rho.",
+  "bin_sizes_m": [1000.0, 4000.0, 8000.0, 12000.0],
+  "minimum_interpretable_bins": 20,
+  "orb_database": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/operational_baseline/limosat_dense_30000__pm_q24_i48_quadratic_bilinear_full70_20260818.sqlite",
+  "orb_table": "limosat_dense_30000__pm_q24_i48_quadratic_bilinear_full70_20260818",
+  "pair_fields": {
+    "10107_10217": {
+      "source_database_id": 45,
+      "target_database_id": 48,
+      "pair_start_utc": "2020-03-27T11:32:28Z",
+      "pair_end_utc": "2020-03-28T08:57:00Z",
+      "aliked_field": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/learned_feature_pilots/dense_pair_10107_10217_nearest12_flipnode_q4_v1_20260819/flip_rejected_field.csv"
+    },
+    "10229_10245": {
+      "source_database_id": 49,
+      "target_database_id": 50,
+      "pair_start_utc": "2020-03-28T10:35:08Z",
+      "pair_end_utc": "2020-03-28T12:13:29Z",
+      "aliked_field": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/learned_feature_pilots/dense_pair_10229_10245_nearest12_flipnode_q4_v1_20260819/flip_rejected_field.csv"
+    },
+    "10245_10341": {
+      "source_database_id": 50,
+      "target_database_id": 52,
+      "pair_start_utc": "2020-03-28T12:13:29Z",
+      "pair_end_utc": "2020-03-29T07:59:46Z",
+      "aliked_field": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/learned_feature_pilots/dense_pair_10245_10341_nearest12_flipnode_q4_v1_20260819/flip_rejected_field.csv"
+    },
+    "10245_10352": {
+      "source_database_id": 50,
+      "target_database_id": 53,
+      "pair_start_utc": "2020-03-28T12:13:29Z",
+      "pair_end_utc": "2020-03-29T11:16:05Z",
+      "aliked_field": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/learned_feature_pilots/dense_pair_10245_10352_nearest12_flipnode_q4_v1_20260818/flip_rejected_field.csv",
+      "piecewise_pair_ids": ["10245_10341", "10341_10352"]
+    },
+    "10341_10352": {
+      "source_database_id": 52,
+      "target_database_id": 53,
+      "pair_start_utc": "2020-03-29T07:59:46Z",
+      "pair_end_utc": "2020-03-29T11:16:05Z",
+      "aliked_field": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/learned_feature_pilots/dense_pair_10341_10352_nearest12_flipnode_q4_v1_20260819/flip_rejected_field.csv"
+    }
+  },
+  "events": [
+    {
+      "event_id": "atl07_0024_pair_10107_10217",
+      "sensor": "ICESat-2",
+      "product": "ATL07",
+      "pair_id": "10107_10217",
+      "product_path": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/icesat2_validation/raw/ATL07/007/2020/03/28/ATL07-01_20200328022725_00240701_007_01.h5"
+    },
+    {
+      "event_id": "atl07_0029_pair_10229_10245",
+      "sensor": "ICESat-2",
+      "product": "ATL07",
+      "pair_id": "10229_10245",
+      "product_path": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/icesat2_validation/raw/ATL07/007/2020/03/28/ATL07-01_20200328101852_00290701_007_01.h5"
+    },
+    {
+      "event_id": "atl07_0039_pair_10245_10341",
+      "sensor": "ICESat-2",
+      "product": "ATL07",
+      "pair_id": "10245_10341",
+      "product_path": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/icesat2_validation/raw/ATL07/007/2020/03/29/ATL07-01_20200329020145_00390701_007_01.h5"
+    },
+    {
+      "event_id": "atl07_0039_pair_10245_10352",
+      "sensor": "ICESat-2",
+      "product": "ATL07",
+      "pair_id": "10245_10352",
+      "product_path": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/icesat2_validation/raw/ATL07/007/2020/03/29/ATL07-01_20200329020145_00390701_007_01.h5"
+    },
+    {
+      "event_id": "atl07_0040_pair_10245_10352",
+      "sensor": "ICESat-2",
+      "product": "ATL07",
+      "pair_id": "10245_10352",
+      "product_path": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/icesat2_validation/raw/ATL07/007/2020/03/29/ATL07-01_20200329033603_00400701_007_01.h5"
+    },
+    {
+      "event_id": "atl07_0044_pair_10245_10352",
+      "sensor": "ICESat-2",
+      "product": "ATL07",
+      "pair_id": "10245_10352",
+      "product_path": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/icesat2_validation/raw/ATL07/007/2020/03/29/ATL07-01_20200329095312_00440701_007_01.h5"
+    },
+    {
+      "event_id": "cryosat2_rdwes1b_pair_10245_10352",
+      "sensor": "CryoSat-2",
+      "product": "RDWES1B",
+      "pair_id": "10245_10352",
+      "product_path": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/cryosat2_validation/raw/RDWES1B/1/2020/03"
+    }
+  ]
+}

@@ -1,0 +1,101 @@
+{
+  "schema": "limosat.multisensor-candidate-manifest/v1",
+  "frozen_utc": "2026-08-19T00:00:00Z",
+  "analysis_role": "development",
+  "selection_status": "frozen_before_download_or_deformation_association",
+  "sar_pair": {
+    "pair_id": "10245_10352",
+    "source_product_id": "10245",
+    "target_product_id": "10352",
+    "start_utc": "2020-03-28T12:13:29Z",
+    "end_utc": "2020-03-29T11:16:05Z"
+  },
+  "selection_rule": {
+    "required": [
+      "granule time intersects the frozen SAR interval",
+      "positive CMR footprint overlap with the SAR deformation domain",
+      "Version 7 ATL07 or ATL10 product",
+      "not already present in the local archive"
+    ],
+    "priority": "Download every missing inside-interval product among the five CMR-ranked crossings. Existing products 0039, 0040, and 0044 remain retained; ATL07 expansion is therefore 0030 and 0041, while ATL10 expansion is 0030, 0039, 0040, and 0041.",
+    "prohibited": "No altimetry/deformation correlation, ridge result, lead result, or tracker-performance result was examined to select these products. Insufficient-support and null outcomes remain in scope."
+  },
+  "source_manifests": [
+    {
+      "path": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/icesat2_validation/manifests/pair_10245_10352_atl07_v007.csv",
+      "sha256": "69ea26ba046055d53389e75d63a70c2803c9dff037f3a05cdc54c16999b27a82"
+    },
+    {
+      "path": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/icesat2_validation/manifests/pair_10245_10352_atl10_v007.csv",
+      "sha256": "6d0da2c1e889b6d4d6fa534ad1ac5edbe65c8a2c028acbaf46039d670f9d9d2e"
+    }
+  ],
+  "candidates": [
+    {
+      "product": "ATL07",
+      "track": "0030",
+      "granule_id": "ATL07-01_20200328115309_00300701_007_01.h5",
+      "time_start_utc": "2020-03-28T12:08:22.523000Z",
+      "time_end_utc": "2020-03-28T12:21:51.430000Z",
+      "footprint_overlap_km2": 5272.240301840219,
+      "expected_size_mb": 432.0,
+      "download_url": "https://data.nsidc.earthdatacloud.nasa.gov/nsidc-cumulus-prod-protected/ATLAS/ATL07/007/2020/03/28/ATL07-01_20200328115309_00300701_007_01.h5",
+      "output_path": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/icesat2_validation/raw/ATL07/007/2020/03/28/ATL07-01_20200328115309_00300701_007_01.h5"
+    },
+    {
+      "product": "ATL07",
+      "track": "0041",
+      "granule_id": "ATL07-01_20200329051020_00410701_007_01.h5",
+      "time_start_utc": "2020-03-29T05:29:21.624000Z",
+      "time_end_utc": "2020-03-29T05:35:26.065000Z",
+      "footprint_overlap_km2": 2696.247081042419,
+      "expected_size_mb": 512.0,
+      "download_url": "https://data.nsidc.earthdatacloud.nasa.gov/nsidc-cumulus-prod-protected/ATLAS/ATL07/007/2020/03/29/ATL07-01_20200329051020_00410701_007_01.h5",
+      "output_path": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/icesat2_validation/raw/ATL07/007/2020/03/29/ATL07-01_20200329051020_00410701_007_01.h5"
+    },
+    {
+      "product": "ATL10",
+      "track": "0030",
+      "granule_id": "ATL10-01_20200328115309_00300701_007_01.h5",
+      "time_start_utc": "2020-03-28T12:08:22.523000Z",
+      "time_end_utc": "2020-03-28T12:21:51.430000Z",
+      "footprint_overlap_km2": 5272.240301840219,
+      "expected_size_mb": 120.0,
+      "download_url": "https://data.nsidc.earthdatacloud.nasa.gov/nsidc-cumulus-prod-protected/ATLAS/ATL10/007/2020/03/28/ATL10-01_20200328115309_00300701_007_01.h5",
+      "output_path": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/icesat2_validation/raw/ATL10/007/2020/03/28/ATL10-01_20200328115309_00300701_007_01.h5"
+    },
+    {
+      "product": "ATL10",
+      "track": "0039",
+      "granule_id": "ATL10-01_20200329020145_00390701_007_01.h5",
+      "time_start_utc": "2020-03-29T02:19:55.333000Z",
+      "time_end_utc": "2020-03-29T02:28:04.587000Z",
+      "footprint_overlap_km2": 4409.760057340195,
+      "expected_size_mb": 152.0,
+      "download_url": "https://data.nsidc.earthdatacloud.nasa.gov/nsidc-cumulus-prod-protected/ATLAS/ATL10/007/2020/03/29/ATL10-01_20200329020145_00390701_007_01.h5",
+      "output_path": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/icesat2_validation/raw/ATL10/007/2020/03/29/ATL10-01_20200329020145_00390701_007_01.h5"
+    },
+    {
+      "product": "ATL10",
+      "track": "0040",
+      "granule_id": "ATL10-01_20200329033603_00400701_007_01.h5",
+      "time_start_utc": "2020-03-29T03:51:30.781000Z",
+      "time_end_utc": "2020-03-29T04:05:02.406000Z",
+      "footprint_overlap_km2": 5412.485589034864,
+      "expected_size_mb": 176.0,
+      "download_url": "https://data.nsidc.earthdatacloud.nasa.gov/nsidc-cumulus-prod-protected/ATLAS/ATL10/007/2020/03/29/ATL10-01_20200329033603_00400701_007_01.h5",
+      "output_path": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/icesat2_validation/raw/ATL10/007/2020/03/29/ATL10-01_20200329033603_00400701_007_01.h5"
+    },
+    {
+      "product": "ATL10",
+      "track": "0041",
+      "granule_id": "ATL10-01_20200329051020_00410701_007_01.h5",
+      "time_start_utc": "2020-03-29T05:29:21.624000Z",
+      "time_end_utc": "2020-03-29T05:35:26.065000Z",
+      "footprint_overlap_km2": 2696.247081042419,
+      "expected_size_mb": 176.0,
+      "download_url": "https://data.nsidc.earthdatacloud.nasa.gov/nsidc-cumulus-prod-protected/ATLAS/ATL10/007/2020/03/29/ATL10-01_20200329051020_00410701_007_01.h5",
+      "output_path": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/icesat2_validation/raw/ATL10/007/2020/03/29/ATL10-01_20200329051020_00410701_007_01.h5"
+    }
+  ]
+}
