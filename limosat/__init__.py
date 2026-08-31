@@ -11,6 +11,8 @@ from .config import (
 )
 from .models import DisplacementField, FieldEdge, MotionMatches, PairResult
 from .trajectory import TrajectoryPoint, build_trajectories
+from .run import LiMOSATRun
+from .store import RunStore
 
 __all__ = [
     "DisplacementField",
@@ -20,10 +22,12 @@ __all__ = [
     "ImagePair",
     "ImageRecord",
     "MatcherConfig",
+    "LiMOSATRun",
     "MotionMatches",
     "PairResult",
     "RoutingConfig",
     "RunConfig",
+    "RunStore",
     "TrajectoryConfig",
     "TrajectoryPoint",
     "build_trajectories",
