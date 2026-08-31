@@ -22,6 +22,7 @@ from limosat.learned_drift import (
     preceding_field_shifts,
 )
 from limosat.learned_drift.features import TileRegion
+from limosat.learned_drift import routing as routing_module
 from limosat.learned_drift.field import (
     estimate_field,
     estimate_queries,
@@ -187,9 +188,7 @@ def test_coarse_phase_translation_has_projected_y_sign(monkeypatch):
             generated["target"] = np.roll(source, shift=(5, 7), axis=(0, 1))
         return generated[path].copy(), np.ones((pixels, pixels), dtype=bool)
 
-    monkeypatch.setattr(
-        "limosat.learned_drift.routing.north_up_patch", synthetic_patch
-    )
+    monkeypatch.setattr(routing_module, "north_up_patch", synthetic_patch)
     result = coarse_phase_translation(
         "source",
         "target",

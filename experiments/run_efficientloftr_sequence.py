@@ -499,6 +499,8 @@ def track_pair(
     sic_open_water_threshold_percent: float = 15.0,
     sic_samples_per_axis: int = 5,
     routing_recovery: str = "none",
+    tile_shifts_override_m: np.ndarray | None = None,
+    tile_routing_sources_override: np.ndarray | None = None,
 ) -> tuple[DriftField, dict]:
     if routing_recovery not in {"none", "residual_edge"}:
         raise ValueError(f"unsupported routing recovery: {routing_recovery}")
@@ -533,6 +535,25 @@ def track_pair(
         config.grid_spacing_m,
         initial_displacement_m,
     )
+    if tile_shifts_override_m is not None:
+        tile_shifts_override_m = np.asarray(
+            tile_shifts_override_m, dtype=np.float64
+        )
+        if tile_shifts_override_m.shape != (len(regions), 2):
+            raise ValueError("tile shift override must have shape (source tiles, 2)")
+        if not np.isfinite(tile_shifts_override_m).all():
+            raise ValueError("tile shift override must be finite")
+        tile_shifts_m = tile_shifts_override_m
+        if tile_routing_sources_override is None:
+            routing_sources = np.full(len(regions), "external_prior", dtype=object)
+        else:
+            routing_sources = np.asarray(
+                tile_routing_sources_override, dtype=object
+            )
+            if routing_sources.shape != (len(regions),):
+                raise ValueError(
+                    "tile routing-source override must have shape (source tiles,)"
+                )
 
     for region, shift_m, routing_source in zip(
         regions, tile_shifts_m, routing_sources, strict=True

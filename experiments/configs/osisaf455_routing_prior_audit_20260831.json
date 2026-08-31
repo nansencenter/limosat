@@ -1,0 +1,48 @@
+{
+  "analysis_epsg": 3413,
+  "maximum_speed_m_per_day": 30000.0,
+  "osi455_url_template": "https://ige-meom-opendap.univ-grenoble-alpes.fr/thredds/fileServer/meomopendap/extract/SASIP/observations/satellite/osisaf/merged/{year}/{month}/{filename}",
+  "reference_roots": [
+    {
+      "cohort": "full70_2020",
+      "path": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/learned_feature_pilots/efficientloftr_full70_components_phase_local_mps_v1_20260824/reference_pairs",
+      "glob": "pair_*/run_manifest.json"
+    }
+  ],
+  "reference_pairs": [
+    {
+      "cohort": "march_leave_one_out",
+      "manifest": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/learned_feature_pilots/efficientloftr_leave_one_out_march_v1_20260827/reference_pairs/pair_10107_10229/run_manifest.json"
+    },
+    {
+      "cohort": "march_leave_one_out",
+      "manifest": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/learned_feature_pilots/efficientloftr_leave_one_out_march_v1_20260827/reference_pairs/pair_10229_10341/run_manifest.json"
+    }
+  ],
+  "pair_outputs": [
+    {
+      "cohort": "nice_adjacent",
+      "path": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2015/learned_feature_pilots/efficientloftr_sequence_6775_6801_6901_6998_phase_local_mps_v1_20260823/pair_6775_6801"
+    },
+    {
+      "cohort": "nice_adjacent",
+      "path": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2015/learned_feature_pilots/efficientloftr_sequence_6775_6801_6901_6998_phase_local_mps_v1_20260823/pair_6801_6901"
+    },
+    {
+      "cohort": "nice_adjacent",
+      "path": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2015/learned_feature_pilots/efficientloftr_sequence_6775_6801_6901_6998_phase_local_mps_v1_20260823/pair_6901_6998"
+    },
+    {
+      "cohort": "nice_simulated_gap",
+      "path": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2015/learned_feature_pilots/efficientloftr_skip_pair_6775_6901_phase_mps_v1_20260823/pair_6775_6901"
+    },
+    {
+      "cohort": "nice_simulated_gap",
+      "path": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2015/learned_feature_pilots/efficientloftr_skip_pair_6801_6998_phase_mps_v1_20260823/pair_6801_6998"
+    },
+    {
+      "cohort": "nice_simulated_gap",
+      "path": "/Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2015/learned_feature_pilots/efficientloftr_skip_pair_6775_6998_phase_mps_v1_20260823/pair_6775_6998"
+    }
+  ]
+}

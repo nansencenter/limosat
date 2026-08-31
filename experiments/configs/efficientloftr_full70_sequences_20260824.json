@@ -1,0 +1,24 @@
+{
+  "experiment": "full70_2020_efficientloftr_components",
+  "analysis_crs": "EPSG:3413",
+  "description": "Physically connected paths through all 70 full-2020 products. The January 25-29 overlap component is represented by its two swath branches; no zero-overlap chronological links are introduced.",
+  "sequences": [
+    {"name": "jan02_05", "image_ids": [105, 222, 356, 498]},
+    {"name": "jan07_08", "image_ids": [721, 731, 740, 849]},
+    {"name": "jan16_20", "image_ids": [1793, 2039, 2162, 2276]},
+    {"name": "jan25_29_west", "image_ids": [2933, 3060, 3184, 3323, 3327, 3453]},
+    {"name": "jan25_29_east", "image_ids": [2933, 3060, 3185, 3324, 3327, 3453]},
+    {"name": "feb06_09", "image_ids": [4318, 4444, 4566, 4700]},
+    {"name": "feb15_18", "image_ids": [5450, 5570, 5677, 5794]},
+    {"name": "feb20_22", "image_ids": [6003, 6151, 6291, 6299]},
+    {"name": "feb24_25", "image_ids": [6440, 6450, 6459, 6561]},
+    {"name": "mar21_26", "image_ids": [9462, 9535, 9872, 9967]},
+    {"name": "mar25_27", "image_ids": [9893, 9985, 10089, 10094]},
+    {"name": "mar27_29_central", "image_ids": [10107, 10217, 10229, 10245, 10341, 10352]},
+    {"name": "mar27_29_east", "image_ids": [10126, 10130, 10269, 10382]},
+    {"name": "apr04", "image_ids": [10824, 10839, 10848, 10856]},
+    {"name": "apr06_08", "image_ids": [11079, 11173, 11288, 11292]},
+    {"name": "apr15_17", "image_ids": [12076, 12194, 12205, 12299]},
+    {"name": "apr28_29", "image_ids": [13520, 13527, 13615, 13623]}
+  ]
+}

@@ -1,0 +1,71 @@
+# Local/KINGSTON path adaptation of the authoritative operational config.
+# Algorithmic values are unchanged. The experiment runner records inherited
+# defaults (including template_size=16 and ORB WTA_K=2) in its run manifest.
+
+logging:
+  persist_log: true
+  log_directory: /Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/logs
+
+run_settings:
+  run_name: limosat_dense_30000
+  clear_existing_data: true
+  max_cpu_cores: null
+
+database:
+  engine_url: sqlite:////Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/operational_baseline/{run_name}.sqlite
+  zarr_path_template: /Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/operational_baseline/{run_name}.zarr
+
+paths:
+  tracking_observations: results/arctic_tracking_next_experiment/splits/full70_2020/observations.csv
+  insitu_points:
+    use_insitu_seeding: false
+    target_crs: EPSG:3413
+    seeding_selection:
+      max_attempts_per_buoy: 1000000
+      max_time_diff_minutes: 60
+      min_hours_between_seeds: 2
+      warmup_days: 0
+
+image_processor_params:
+  persist_updates: true
+  persist_interval: 50
+  pruning_interval: 25
+  temporal_window: 4
+  convergence_radius_pixels: 7
+  max_speed_m_per_day: 30000
+  window_size: 128
+  window_border: 6
+  border_size: 128
+  border_matched: 48
+  border_interpolated: 48
+  stride: 15
+  octave: 5
+  min_correlation: 0.30
+  response_threshold: 0.001
+  use_interpolation: true
+  max_interpolation_time_gap_hours: 96
+
+keypoint_detector:
+  grid_cache_dir: /Volumes/KINGSTON/arktalas/experiments/limosat_next_tracking_2020/grid_cache
+  type: ORB
+  orb_params:
+    nfeatures: 200
+    scaleFactor: 1.20
+    nlevels: 5
+    edgeThreshold: 24
+    firstLevel: 0
+    patchSize: 88
+    scoreType: HARRIS_SCORE
+
+matcher_params:
+  norm_type: NORM_HAMMING2
+  descriptor_distance_max: 120
+  model_threshold: 15000
+  lowe_ratio: 0.80
+  knn_k: 8
+  plot_matches: false
+  geometric_model:
+    type: AffineTransform
+    use_model_estimation: true
+    estimation_method: USAC_MAGSAC
+    min_homography_inliers: 3
