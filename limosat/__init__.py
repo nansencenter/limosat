@@ -10,6 +10,7 @@ from .config import (
     load_config,
 )
 from .models import DisplacementField, FieldEdge, MotionMatches, PairResult
+from .trajectory import TrajectoryPoint, build_trajectories
 
 __all__ = [
     "DisplacementField",
@@ -24,6 +25,8 @@ __all__ = [
     "RoutingConfig",
     "RunConfig",
     "TrajectoryConfig",
+    "TrajectoryPoint",
+    "build_trajectories",
     "load_catalogue",
     "load_config",
 ]
