@@ -1,25 +1,27 @@
-"""Sequence and component orchestration."""
+"""Deterministic global catalogue coordination."""
 
 from __future__ import annotations
 
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Sequence
 
-from .catalog import ImageCatalogue, ImagePair, load_catalogue
+from .catalog import ImageCatalogue, load_catalogue
 from .config import RunConfig
 from .deformation import deformation_from_field
 from .efficientloftr import EfficientLoFTR
 from .manifest import write_manifest
 from .models import FieldEdge
 from .pairs import PairProcessor
+from .planning import plan_candidate_pairs, recovery_candidates
 from .store import RunStore
 from .trajectory import build_trajectories, targeted_recovery_positions
 
 
 class LiMOSATRun:
-    """Execute catalogue components with pair-level deterministic resume."""
+    """Plan independent image pairs and recompose one global trajectory product."""
 
     def __init__(
         self,
@@ -39,37 +41,29 @@ class LiMOSATRun:
     def execute(self, command: Sequence[str] | None = None) -> dict:
         started_clock = time.perf_counter()
         started_utc = datetime.now(timezone.utc)
+        planned = plan_candidate_pairs(self.catalogue, self.config.routing)
         self.store.register_catalogue(self.catalogue)
+        self.store.register_candidate_pairs(planned)
         self.store.start_run()
         resumed_pairs = 0
         computed_pairs = 0
         try:
             edges: list[FieldEdge] = []
             primary_fields = []
-            component_primary_fields = {}
-            for component_id, images in self.catalogue.components().items():
-                if len(images) < 2:
-                    continue
-                adjacent_fields = []
-                previous_field = None
-                previous_elapsed = None
-                for pair in self.catalogue.adjacent_pairs(component_id):
-                    field, resumed = self._obtain_pair(
-                        pair,
-                        component_id,
-                        "primary",
-                        False,
-                        previous_field,
-                        previous_elapsed,
-                    )
-                    resumed_pairs += int(resumed)
-                    computed_pairs += int(not resumed)
-                    adjacent_fields.append(field)
-                    edges.append(FieldEdge(field))
-                    previous_field, previous_elapsed = field, pair.elapsed_seconds
-
-                primary_fields.extend(adjacent_fields)
-                component_primary_fields[component_id] = adjacent_fields
+            primary_items = [
+                item for item in planned if item.selection == "primary"
+            ]
+            with ThreadPoolExecutor(
+                max_workers=self.config.pair_workers
+            ) as pool:
+                primary_results = tuple(
+                    pool.map(self._obtain_primary, primary_items)
+                )
+            for field, resumed in primary_results:
+                resumed_pairs += int(resumed)
+                computed_pairs += int(not resumed)
+                primary_fields.append(field)
+                edges.append(FieldEdge(field))
 
             trajectories = build_trajectories(
                 edges,
@@ -77,61 +71,41 @@ class LiMOSATRun:
                 self.config.field,
                 self.config.trajectories,
             )
-            for component_id, images in self.catalogue.components().items():
-                if len(images) < 2:
-                    continue
-                adjacent_fields = component_primary_fields[component_id]
-                if self.config.routing.targeted_recovery:
-                    adjacent_pairs = self.catalogue.adjacent_pairs(component_id)
-                    for skipped_images in range(
-                        1, self.config.routing.maximum_skip_images + 1
-                    ):
-                        for target_index in range(skipped_images + 1, len(images)):
-                            source_index = target_index - skipped_images - 1
-                            positions = targeted_recovery_positions(
-                                trajectories,
-                                images[source_index].image_id,
-                                images[target_index].image_id,
-                            )
-                            if not len(positions):
-                                continue
-                            pair = ImagePair(
-                                images[source_index], images[target_index]
-                            )
-                            prior = (
-                                adjacent_fields[source_index - 1]
-                                if source_index
-                                else None
-                            )
-                            prior_elapsed = (
-                                adjacent_pairs[source_index - 1].elapsed_seconds
-                                if source_index
-                                else None
-                            )
-                            field, resumed = self._obtain_pair(
-                                pair,
-                                component_id,
-                                "recovery",
-                                True,
-                                prior,
-                                prior_elapsed,
-                                positions,
-                            )
-                            resumed_pairs += int(resumed)
-                            computed_pairs += int(not resumed)
-                            edges.append(
-                                FieldEdge(
-                                    field,
-                                    pair_kind="recovery",
-                                    skipped_images=skipped_images,
-                                )
-                            )
-                        trajectories = build_trajectories(
-                            edges,
-                            self.catalogue.chronological(),
-                            self.config.field,
-                            self.config.trajectories,
+            if self.config.routing.targeted_recovery:
+                recovery_work = []
+                for item in recovery_candidates(
+                    planned, self.config.routing.maximum_skip_images
+                ):
+                    positions = targeted_recovery_positions(
+                        trajectories,
+                        item.pair.source.image_id,
+                        item.pair.target.image_id,
+                    )
+                    if not len(positions):
+                        continue
+                    recovery_work.append((item, positions))
+                with ThreadPoolExecutor(
+                    max_workers=self.config.pair_workers
+                ) as pool:
+                    recovery_results = tuple(
+                        pool.map(self._obtain_recovery, recovery_work)
+                    )
+                for field, resumed in recovery_results:
+                    resumed_pairs += int(resumed)
+                    computed_pairs += int(not resumed)
+                    edges.append(
+                        FieldEdge(
+                            field,
+                            pair_kind="recovery",
+                            skipped_images=1,
                         )
+                    )
+                trajectories = build_trajectories(
+                    edges,
+                    self.catalogue.chronological(),
+                    self.config.field,
+                    self.config.trajectories,
+                )
             self.store.replace_global_trajectories(trajectories)
             for field in primary_fields:
                 self.store.replace_deformation(
@@ -162,6 +136,28 @@ class LiMOSATRun:
         except Exception as error:
             self.store.fail_run(error)
             raise
+
+    def _obtain_primary(self, item):
+        return self._obtain_pair(
+            item.pair,
+            item.planning_component_id,
+            "primary",
+            False,
+            None,
+            None,
+        )
+
+    def _obtain_recovery(self, work):
+        item, positions = work
+        return self._obtain_pair(
+            item.pair,
+            item.planning_component_id,
+            "recovery",
+            True,
+            None,
+            None,
+            positions,
+        )
 
     def _obtain_pair(
         self,

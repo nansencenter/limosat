@@ -67,6 +67,7 @@ def write_manifest(
             for name, images in catalogue.components().items()
         },
         "images": rows["images"],
+        "candidate_pairs": rows["candidate_pairs"],
         "pairs": rows["pairs"],
         "product_counts": rows["counts"],
         "recovery_deformation_policy": (

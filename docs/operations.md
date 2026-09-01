@@ -21,22 +21,36 @@ group pair computation, but it is not a scientific trajectory boundary.
 Parcels can continue through measured image pairs whose images carry different
 component labels.
 
+## Candidate and primary image pairs
+
+Candidate image pairs are frozen deterministically before inference. Defaults
+require 1--96 hours elapsed time and at least 0.25 overlap relative to the
+smaller footprint. For each target image, candidates from the most recent
+source acquisition are primary pairs. Equal-time sources are retained so the
+global composer can use measured field quality to choose deterministically.
+The remaining candidates are available only for measured-loss recovery.
+
+Primary pair fields have no preceding-pair dependency and can be claimed and
+processed independently. `pair_workers` controls local concurrency. Complete
+fields are immutable and are loaded on resume.
+
 ## Matching and recovery
 
-The first pair uses coarse phase correlation unless `initial: same_center` is
-configured. Later pairs use only earlier accepted fields: a global median prior
-with a local supported-field refinement by default. EfficientLoFTR runs on
-north-up tiles whose non-overlapping source cores prevent duplicate ownership.
-Endpoint validity, elapsed-time speed, local vector consensus, and fold gates
-are applied in EPSG:3413 metres.
+Each independently scheduled primary pair uses coarse phase correlation unless
+`initial: same_center` is configured. EfficientLoFTR runs on north-up tiles
+whose non-overlapping source cores prevent duplicate ownership. Endpoint
+validity, elapsed-time speed, local vector consensus, and fold gates are
+applied in EPSG:3413 metres.
 
 Residual field recovery may rerun a tile when a large routing residual and
-target-edge pressure agree. Sequence recovery is separate: after adjacent
-trajectories are composed, LiMOSAT identifies points measured at an earlier
-image but dormant at a later image and matches only source-tile cores within
-the configured 6.4 km buffer. The default permits one skipped image. Recovery
-fields can reconnect trajectories, but only full primary pair fields generate
-deformation cells.
+target-boundary pressure agree. Catalogue recovery is separate: after all
+primary pair fields are composed globally, LiMOSAT identifies parcels measured
+at an earlier source image but dormant at a candidate target image and matches
+only source-tile cores within the configured 6.4 km buffer. The default checks
+the most recent one unselected candidate per target. Recovery fields can
+reconnect trajectories, but only full primary pair fields generate deformation
+cells. After recovery completes, trajectories are recomposed from all
+completed fields.
 
 ## Resume and outputs
 

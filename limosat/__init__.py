@@ -13,6 +13,7 @@ from .models import DisplacementField, FieldEdge, MotionMatches, PairResult
 from .deformation import DeformationCell, deformation_from_field
 from .efficientloftr import EfficientLoFTR
 from .pairs import PairProcessor
+from .planning import PlannedPair, plan_candidate_pairs
 from .trajectory import (
     TrajectoryPoint,
     build_trajectories,
@@ -35,6 +36,7 @@ __all__ = [
     "MotionMatches",
     "PairResult",
     "PairProcessor",
+    "PlannedPair",
     "RoutingConfig",
     "RunConfig",
     "RunStore",
@@ -45,4 +47,5 @@ __all__ = [
     "deformation_from_field",
     "load_catalogue",
     "load_config",
+    "plan_candidate_pairs",
 ]

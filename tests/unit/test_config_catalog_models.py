@@ -3,7 +3,14 @@ from datetime import datetime, timezone
 import numpy as np
 import pytest
 
-from limosat import DisplacementField, ImageCatalogue, ImageRecord, MatcherConfig
+from limosat import (
+    DisplacementField,
+    ImageCatalogue,
+    ImageRecord,
+    MatcherConfig,
+    RoutingConfig,
+    RunConfig,
+)
 
 
 def test_catalogue_orders_utc_components_and_preserves_identity(tmp_path):
@@ -64,3 +71,12 @@ def test_matcher_defaults_retain_selected_scientific_values():
     assert config.pixel_size_m == 80.0
     assert config.maximum_speed_m_per_day == 30_000.0
     assert config.tile_size_px == 512
+
+
+def test_global_planning_defaults_are_explicit():
+    routing = RoutingConfig()
+    assert routing.candidate_minimum_elapsed_hours == 1.0
+    assert routing.candidate_maximum_elapsed_hours == 96.0
+    assert routing.candidate_minimum_overlap_fraction == 0.25
+    with pytest.raises(ValueError, match="pair_workers"):
+        RunConfig("run", "catalogue", "database", "output", pair_workers=0)

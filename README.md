@@ -37,6 +37,12 @@ schedules non-consecutive recovery pairs only after measured trajectory loss,
 writes deformation from primary pair fields, and emits
 `run-manifest-v2.json`.
 
+Candidate image pairs are registered before inference. By default they span
+1--96 hours and at least 25% footprint overlap. The most recent source
+acquisition for each target defines the primary pair; equal-time alternatives
+remain primary so field quality can resolve them. Primary pair fields are
+independent and `pair_workers` controls local concurrency.
+
 The public Python entry point is direct:
 
 ```python

@@ -16,6 +16,7 @@ from .catalog import ImageCatalogue, ImagePair
 from .config import RunConfig
 from .deformation import DeformationCell
 from .models import DisplacementField, PairResult
+from .planning import PlannedPair
 from .trajectory import TrajectoryPoint
 
 
@@ -80,6 +81,59 @@ class RunStore:
                     completed_utc=NULL, error=NULL WHERE run_id=?
                 """,
                 (_utc_now(), self.config.run_id),
+            )
+
+    def register_candidate_pairs(
+        self, planned: Iterable[PlannedPair]
+    ) -> None:
+        values = tuple(planned)
+        rows = [
+            (
+                self.config.run_id,
+                item.pair.pair_id,
+                item.ordinal,
+                item.selection,
+                item.planning_component_id,
+                item.pair.source.component_id,
+                item.pair.target.component_id,
+                item.pair.source.image_id,
+                item.pair.target.image_id,
+                item.pair.source.time_utc.isoformat(),
+                item.pair.target.time_utc.isoformat(),
+                item.pair.elapsed_seconds,
+                item.overlap_fraction,
+            )
+            for item in values
+        ]
+        with closing(self._connect()) as connection, connection:
+            existing = [
+                tuple(row)
+                for row in connection.execute(
+                    """
+                    SELECT run_id,pair_id,ordinal,selection,planning_component_id,
+                           source_component_id,target_component_id,source_image_id,
+                           target_image_id,source_time_utc,target_time_utc,
+                           elapsed_seconds,overlap_fraction
+                    FROM candidate_pairs WHERE run_id=? ORDER BY ordinal
+                    """,
+                    (self.config.run_id,),
+                )
+            ]
+            if existing and existing != rows:
+                raise ValueError(
+                    "candidate image-pair plan changed during resume; "
+                    "use a new database path and run_id"
+                )
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO candidate_pairs
+                (run_id,pair_id,ordinal,selection,planning_component_id,
+                 source_component_id,target_component_id,source_image_id,
+                 target_image_id,source_time_utc,target_time_utc,
+                 elapsed_seconds,overlap_fraction)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                rows,
             )
 
     def finish_run(
@@ -365,16 +419,28 @@ class RunStore:
                 "SELECT * FROM pairs WHERE run_id=? ORDER BY component_id,source_time_utc,target_time_utc",
                 (self.config.run_id,),
             )]
+            candidate_pairs = [dict(row) for row in connection.execute(
+                "SELECT * FROM candidate_pairs WHERE run_id=? ORDER BY ordinal",
+                (self.config.run_id,),
+            )]
             counts = dict(connection.execute(
                 """
                 SELECT
+                  (SELECT COUNT(*) FROM candidate_pairs WHERE run_id=?) candidate_pairs,
+                  (SELECT COUNT(*) FROM candidate_pairs
+                     WHERE run_id=? AND selection='primary') primary_pairs,
                   (SELECT COUNT(*) FROM trajectories WHERE run_id=?) trajectories,
                   (SELECT COUNT(*) FROM trajectory_points WHERE run_id=?) trajectory_points,
                   (SELECT COUNT(*) FROM deformation_cells WHERE run_id=?) deformation_cells
                 """,
-                (self.config.run_id,) * 3,
+                (self.config.run_id,) * 5,
             ).fetchone())
-        return {"images": images, "pairs": pairs, "counts": counts}
+        return {
+            "images": images,
+            "candidate_pairs": candidate_pairs,
+            "pairs": pairs,
+            "counts": counts,
+        }
 
     def status(self) -> dict:
         with closing(self._connect()) as connection:
@@ -413,6 +479,9 @@ class RunStore:
                 connection.execute(
                     f"PRAGMA user_version={DATABASE_SCHEMA_VERSION}"
                 )
+                connection.commit()
+            else:
+                connection.executescript(_SCHEMA)
                 connection.commit()
         finally:
             connection.close()
@@ -539,6 +608,17 @@ CREATE TABLE IF NOT EXISTS pairs (
   PRIMARY KEY(run_id,pair_id), FOREIGN KEY(run_id) REFERENCES runs(run_id)
 );
 CREATE INDEX IF NOT EXISTS pairs_run_status ON pairs(run_id,status);
+CREATE TABLE IF NOT EXISTS candidate_pairs (
+  run_id TEXT NOT NULL, pair_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
+  selection TEXT NOT NULL CHECK(selection IN ('candidate','primary')),
+  planning_component_id TEXT NOT NULL,
+  source_component_id TEXT NOT NULL, target_component_id TEXT NOT NULL,
+  source_image_id TEXT NOT NULL, target_image_id TEXT NOT NULL,
+  source_time_utc TEXT NOT NULL, target_time_utc TEXT NOT NULL,
+  elapsed_seconds REAL NOT NULL, overlap_fraction REAL,
+  PRIMARY KEY(run_id,pair_id), UNIQUE(run_id,ordinal),
+  FOREIGN KEY(run_id) REFERENCES runs(run_id)
+);
 CREATE TABLE IF NOT EXISTS field_nodes (
   run_id TEXT NOT NULL, pair_id TEXT NOT NULL, node_index INTEGER NOT NULL,
   grid_row INTEGER NOT NULL, grid_column INTEGER NOT NULL, x_m REAL NOT NULL,

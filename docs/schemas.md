@@ -13,6 +13,10 @@ layer.
 time, byte size, and SHA256. Resume rejects an image whose identity, time, path,
 or content hash changed.
 
+`candidate_pairs` stores the immutable deterministic plan: ordinal,
+candidate/primary selection, source and target compute labels, UTC times,
+elapsed seconds, and footprint-overlap fraction.
+
 `pairs` stores primary or recovery image-pair identity, source/target image and UTC
 times, elapsed seconds, targeted flag, state, field checksum, product counts,
 stage runtimes, matcher calls, and error text. Normal execution never changes a
@@ -35,7 +39,7 @@ contains `component_id`. `trajectory_points` uses states `created`,
 `NULL`. `position_basis` distinguishes `seed_grid`,
 `primary_pair_field`, `recovery_pair_field`, and `missing`.
 
-`deformation_cells` stores adjacent-pair Delaunay triangle centroid and area,
+`deformation_cells` stores primary-pair Delaunay triangle centroid and area,
 plus divergence, shear, total deformation, and vorticity in inverse seconds.
 
 ## Manifest schema version 2

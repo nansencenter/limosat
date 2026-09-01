@@ -3,6 +3,7 @@ catalogue: ./catalogue.csv
 database: ./outputs/limosat.sqlite
 output_directory: ./outputs
 analysis_epsg: 3413
+pair_workers: 1
 
 matcher:
   repository: /path/to/EfficientLoFTR
@@ -32,6 +33,9 @@ routing:
   targeted_recovery: true
   maximum_skip_images: 1
   targeted_selection_buffer_m: 6400.0
+  candidate_minimum_elapsed_hours: 1.0
+  candidate_maximum_elapsed_hours: 96.0
+  candidate_minimum_overlap_fraction: 0.25
 
 trajectories:
   add_as_coverage_enters: true

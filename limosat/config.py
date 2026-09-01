@@ -83,12 +83,28 @@ class RoutingConfig:
     targeted_recovery: bool = True
     maximum_skip_images: int = 1
     targeted_selection_buffer_m: float = 6_400.0
+    candidate_minimum_elapsed_hours: float = 1.0
+    candidate_maximum_elapsed_hours: float = 96.0
+    candidate_minimum_overlap_fraction: float = 0.25
 
     def __post_init__(self) -> None:
         if self.maximum_skip_images < 0:
             raise ValueError("maximum_skip_images cannot be negative")
         if self.targeted_selection_buffer_m <= 0:
             raise ValueError("targeted_selection_buffer_m must be positive")
+        if self.candidate_minimum_elapsed_hours <= 0:
+            raise ValueError("candidate_minimum_elapsed_hours must be positive")
+        if (
+            self.candidate_maximum_elapsed_hours
+            <= self.candidate_minimum_elapsed_hours
+        ):
+            raise ValueError(
+                "candidate_maximum_elapsed_hours must exceed the minimum"
+            )
+        if not 0 < self.candidate_minimum_overlap_fraction <= 1:
+            raise ValueError(
+                "candidate_minimum_overlap_fraction must be in (0, 1]"
+            )
 
 
 @dataclass(frozen=True)
@@ -112,6 +128,7 @@ class RunConfig:
     database: str
     output_directory: str
     analysis_epsg: int = 3413
+    pair_workers: int = 1
     matcher: MatcherConfig = dataclass_field(default_factory=MatcherConfig)
     field: FieldConfig = dataclass_field(default_factory=FieldConfig)
     routing: RoutingConfig = dataclass_field(default_factory=RoutingConfig)
@@ -124,6 +141,8 @@ class RunConfig:
             raise ValueError("run_id cannot be empty")
         if self.analysis_epsg != 3413:
             raise ValueError("LiMOSAT coordinates are fixed to EPSG:3413")
+        if self.pair_workers < 1:
+            raise ValueError("pair_workers must be at least one")
         if not self.catalogue or not self.database or not self.output_directory:
             raise ValueError("catalogue, database, and output_directory are required")
 

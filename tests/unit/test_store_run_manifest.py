@@ -2,6 +2,7 @@ import json
 import sqlite3
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -103,9 +104,22 @@ class SyntheticProcessor:
         previous_elapsed_seconds=None,
         targeted_positions_xy_m=None,
     ):
-        self.calls.append((pair.pair_id, targeted_positions_xy_m is not None))
+        self.calls.append(
+            (
+                pair.pair_id,
+                targeted_positions_xy_m is not None,
+                previous_field is not None,
+            )
+        )
         unavailable = pair.pair_id == "b__c" and targeted_positions_xy_m is None
         return _result(pair, available=not unavailable)
+
+
+class FailOnceProcessor(SyntheticProcessor):
+    def process(self, pair, *args, **kwargs):
+        if pair.pair_id == "b__c":
+            raise RuntimeError("synthetic interruption")
+        return super().process(pair, *args, **kwargs)
 
 
 class FailingProcessor:
@@ -141,12 +155,19 @@ def test_sequence_recovers_measured_loss_and_resumes_with_versioned_manifest(tmp
     manifest = json.loads((tmp_path / "products" / "run-manifest-v2.json").read_text())
 
     assert first["computed_pairs"] == 3
-    assert processor.calls == [("a__b", False), ("b__c", False), ("a__c", True)]
+    assert processor.calls == [
+        ("a__b", False, False),
+        ("b__c", False, False),
+        ("a__c", True, False),
+    ]
     assert manifest["manifest_schema_version"] == 2
     assert len(manifest["implementation_sha256"]) == 64
     assert manifest["product_schemas"]["lagrangian_trajectory"] == 3
     assert manifest["coordinates"]["crs"] == "EPSG:3413"
     assert manifest["product_counts"]["trajectories"] == 4
+    assert manifest["product_counts"]["candidate_pairs"] == 3
+    assert manifest["product_counts"]["primary_pairs"] == 2
+    assert len(manifest["candidate_pairs"]) == 3
     recovery = [pair for pair in manifest["pairs"] if pair["kind"] == "recovery"]
     assert len(recovery) == 1 and recovery[0]["targeted"] == 1
 
@@ -154,6 +175,65 @@ def test_sequence_recovers_measured_loss_and_resumes_with_versioned_manifest(tmp
 
     assert second["computed_pairs"] == 0
     assert second["resumed_pairs"] == 3
+
+    with sqlite3.connect(config.database) as connection:
+        deformation_by_kind = dict(
+            connection.execute(
+                """
+                SELECT pairs.kind,COUNT(deformation_cells.triangle_index)
+                FROM pairs LEFT JOIN deformation_cells
+                  ON pairs.run_id=deformation_cells.run_id
+                 AND pairs.pair_id=deformation_cells.pair_id
+                GROUP BY pairs.kind
+                """
+            )
+        )
+    assert deformation_by_kind["recovery"] == 0
+
+
+def test_interrupted_resume_matches_clean_global_rows_and_manifest_counts(tmp_path):
+    config = _config(tmp_path)
+    catalogue = _catalogue(tmp_path)
+    with pytest.raises(RuntimeError, match="synthetic interruption"):
+        LiMOSATRun(config, catalogue, FailOnceProcessor()).execute()
+
+    resumed = LiMOSATRun(config, catalogue, SyntheticProcessor()).execute()
+    resumed_manifest = json.loads(Path(resumed["manifest"]).read_text())
+    with sqlite3.connect(config.database) as connection:
+        resumed_rows = connection.execute(
+            """
+            SELECT trajectory_id,image_id,time_utc,state,position_basis,x_m,y_m,
+                   source_pair_id,selected_matches,support_radius_m,
+                   maximum_residual_m
+            FROM trajectory_points
+            ORDER BY trajectory_id,time_utc,image_id
+            """
+        ).fetchall()
+
+    clean_config = replace(
+        config,
+        database=str(tmp_path / "clean.sqlite"),
+        output_directory=str(tmp_path / "clean-products"),
+        pair_workers=2,
+    )
+    clean = LiMOSATRun(
+        clean_config, catalogue, SyntheticProcessor()
+    ).execute()
+    clean_manifest = json.loads(Path(clean["manifest"]).read_text())
+    with sqlite3.connect(clean_config.database) as connection:
+        clean_rows = connection.execute(
+            """
+            SELECT trajectory_id,image_id,time_utc,state,position_basis,x_m,y_m,
+                   source_pair_id,selected_matches,support_radius_m,
+                   maximum_residual_m
+            FROM trajectory_points
+            ORDER BY trajectory_id,time_utc,image_id
+            """
+        ).fetchall()
+
+    assert resumed["resumed_pairs"] == 1
+    assert resumed_rows == clean_rows
+    assert resumed_manifest["product_counts"] == clean_manifest["product_counts"]
 
 
 def test_cli_status_imports_without_loading_model(tmp_path, capsys):
