@@ -44,10 +44,12 @@ class LiMOSATRun:
         resumed_pairs = 0
         computed_pairs = 0
         try:
+            edges: list[FieldEdge] = []
+            primary_fields = []
+            component_primary_fields = {}
             for component_id, images in self.catalogue.components().items():
                 if len(images) < 2:
                     continue
-                edges: list[FieldEdge] = []
                 adjacent_fields = []
                 previous_field = None
                 previous_elapsed = None
@@ -55,7 +57,7 @@ class LiMOSATRun:
                     field, resumed = self._obtain_pair(
                         pair,
                         component_id,
-                        "adjacent",
+                        "primary",
                         False,
                         previous_field,
                         previous_elapsed,
@@ -66,12 +68,19 @@ class LiMOSATRun:
                     edges.append(FieldEdge(field))
                     previous_field, previous_elapsed = field, pair.elapsed_seconds
 
-                trajectories = build_trajectories(
-                    edges,
-                    images,
-                    self.config.field,
-                    self.config.trajectories,
-                )
+                primary_fields.extend(adjacent_fields)
+                component_primary_fields[component_id] = adjacent_fields
+
+            trajectories = build_trajectories(
+                edges,
+                self.catalogue.chronological(),
+                self.config.field,
+                self.config.trajectories,
+            )
+            for component_id, images in self.catalogue.components().items():
+                if len(images) < 2:
+                    continue
+                adjacent_fields = component_primary_fields[component_id]
                 if self.config.routing.targeted_recovery:
                     adjacent_pairs = self.catalogue.adjacent_pairs(component_id)
                     for skipped_images in range(
@@ -112,23 +121,25 @@ class LiMOSATRun:
                             computed_pairs += int(not resumed)
                             edges.append(
                                 FieldEdge(
-                                    field, skipped_images=skipped_images
+                                    field,
+                                    pair_kind="recovery",
+                                    skipped_images=skipped_images,
                                 )
                             )
                         trajectories = build_trajectories(
                             edges,
-                            images,
+                            self.catalogue.chronological(),
                             self.config.field,
                             self.config.trajectories,
                         )
-                self.store.replace_trajectories(component_id, trajectories)
-                for field in adjacent_fields:
-                    self.store.replace_deformation(
-                        field.pair_id,
-                        deformation_from_field(
-                            field, self.config.field.maximum_triangle_edge_m
-                        ),
-                    )
+            self.store.replace_global_trajectories(trajectories)
+            for field in primary_fields:
+                self.store.replace_deformation(
+                    field.pair_id,
+                    deformation_from_field(
+                        field, self.config.field.maximum_triangle_edge_m
+                    ),
+                )
             completed_utc = datetime.now(timezone.utc)
             runtime_seconds = time.perf_counter() - started_clock
             path, checksum = write_manifest(

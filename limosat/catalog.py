@@ -43,8 +43,6 @@ class ImagePair:
     target: ImageRecord
 
     def __post_init__(self) -> None:
-        if self.source.component_id != self.target.component_id:
-            raise ValueError("pair images must belong to one component")
         if self.target.time_utc <= self.source.time_utc:
             raise ValueError("pair chronology must be strictly increasing")
 
@@ -58,13 +56,10 @@ class ImagePair:
 
 
 class ImageCatalogue:
-    """Validated images grouped into deterministic chronological components."""
+    """Validated global chronology with optional compute-planning labels."""
 
     def __init__(self, records: Iterable[ImageRecord]) -> None:
-        ordered = sorted(
-            records,
-            key=lambda item: (item.component_id, item.time_utc, item.image_id),
-        )
+        ordered = sorted(records, key=lambda item: (item.time_utc, item.image_id))
         if not ordered:
             raise ValueError("catalogue contains no images")
         ids = [item.image_id for item in ordered]
@@ -75,6 +70,9 @@ class ImageCatalogue:
             times = [item.time_utc for item in component]
             if any(right <= left for left, right in zip(times, times[1:])):
                 raise ValueError("component image times must be strictly increasing")
+
+    def chronological(self) -> tuple[ImageRecord, ...]:
+        return self.records
 
     def components(self) -> dict[str, tuple[ImageRecord, ...]]:
         grouped: dict[str, list[ImageRecord]] = {}

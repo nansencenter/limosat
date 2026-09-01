@@ -63,7 +63,11 @@ def test_dormant_trajectory_reappears_only_on_observed_skip_edge():
     adjacent = _field("a", "b", 0, [100.0, 0.0])
     empty = _field("b", "c", 1, [0.0, 0.0], available=[False] * 4, points=GRID + [100.0, 0.0])
     skip = _field("b", "d", 1, [200.0, 0.0], points=GRID + [100.0, 0.0])
-    edges = [FieldEdge(adjacent), FieldEdge(empty), FieldEdge(skip, skipped_images=1)]
+    edges = [
+        FieldEdge(adjacent),
+        FieldEdge(empty),
+        FieldEdge(skip, pair_kind="recovery", skipped_images=1),
+    ]
 
     images = _images(("a", "b", "c", "d"))
     points = build_trajectories(edges, images, _settings(), TrajectoryConfig())
@@ -73,7 +77,7 @@ def test_dormant_trajectory_reappears_only_on_observed_skip_edge():
     assert at_c
     assert {point.state for point in at_c} == {"dormant"}
     assert {point.state for point in at_d} == {"reappeared"}
-    assert {point.position_basis for point in at_d} == {"field_advected_skip"}
+    assert {point.position_basis for point in at_d} == {"recovery_pair_field"}
     first_run_ids = [point.trajectory_id for point in points]
     second_run_ids = [
         point.trajectory_id
@@ -111,6 +115,120 @@ def test_new_trajectory_is_created_when_outgoing_coverage_enters():
 
     created_at_b = [point for point in points if point.image_id == "b" and point.state == "created"]
     assert len(created_at_b) == 4
+
+
+def test_global_continuation_crosses_former_component_boundaries():
+    images = [
+        ImageRecord(
+            name,
+            Path("/tmp/unused.tif"),
+            START + timedelta(days=index),
+            f"former-{index}",
+        )
+        for index, name in enumerate(("a", "b", "c"))
+    ]
+    first = _field("a", "b", 0, [100.0, 0.0])
+    second = _field(
+        "b", "c", 1, [50.0, 0.0], points=GRID + [100.0, 0.0]
+    )
+
+    points = build_trajectories(
+        [FieldEdge(first), FieldEdge(second)],
+        images,
+        _settings(),
+        TrajectoryConfig(),
+    )
+
+    created = {
+        point.trajectory_id for point in points if point.state == "created"
+    }
+    at_c = {
+        point.trajectory_id
+        for point in points
+        if point.image_id == "c" and point.state == "observed"
+    }
+    assert len(created) == 4
+    assert at_c == created
+
+
+def test_global_seed_suppression_prevents_duplicate_parcels():
+    first = _field("a", "b", 0, [100.0, 0.0])
+    second = _field(
+        "b", "c", 1, [50.0, 0.0], points=GRID + [100.0, 0.0]
+    )
+
+    points = build_trajectories(
+        [FieldEdge(first), FieldEdge(second)],
+        _images(),
+        _settings(),
+        TrajectoryConfig(new_point_exclusion_radius_m=500.0),
+    )
+
+    assert len([point for point in points if point.state == "created"]) == 4
+    assert not [
+        point
+        for point in points
+        if point.image_id == "b" and point.state == "created"
+    ]
+
+
+def test_equal_time_competing_fields_use_quality_then_pair_id_deterministically():
+    images = [
+        ImageRecord("s", Path("/tmp/unused.tif"), START, "seed"),
+        ImageRecord("a", Path("/tmp/unused.tif"), START + timedelta(days=1), "left"),
+        ImageRecord("b", Path("/tmp/unused.tif"), START + timedelta(days=1), "right"),
+        ImageRecord("t", Path("/tmp/unused.tif"), START + timedelta(days=2), "target"),
+    ]
+    to_a = _field("s", "a", 0, [0.0, 0.0])
+    to_b = _field("s", "b", 0, [0.0, 0.0])
+    low = _field("a", "t", 1, [100.0, 0.0])
+    high = _field("b", "t", 1, [200.0, 0.0])
+    values = dict(low.__dict__)
+    values["selected_matches"] = np.full(4, 5)
+    low = DisplacementField(**values)
+    values = dict(high.__dict__)
+    values["selected_matches"] = np.full(4, 10)
+    high = DisplacementField(**values)
+    edges = [FieldEdge(low), FieldEdge(to_b), FieldEdge(high), FieldEdge(to_a)]
+
+    first = build_trajectories(
+        edges, images, _settings(), TrajectoryConfig()
+    )
+    second = build_trajectories(
+        tuple(reversed(edges)), images, _settings(), TrajectoryConfig()
+    )
+    first_t = [
+        point for point in first if point.image_id == "t" and point.available
+    ]
+    second_t = [
+        point for point in second if point.image_id == "t" and point.available
+    ]
+
+    assert {point.source_pair_id for point in first_t} == {"b__t"}
+    assert [(point.trajectory_id, point.x_m) for point in first_t] == [
+        (point.trajectory_id, point.x_m) for point in second_t
+    ]
+
+
+def test_dormant_coordinates_are_explicitly_null():
+    empty = _field(
+        "b",
+        "c",
+        1,
+        [0.0, 0.0],
+        available=[False] * 4,
+        points=GRID + [100.0, 0.0],
+    )
+    points = build_trajectories(
+        [FieldEdge(_field("a", "b", 0, [100.0, 0.0])), FieldEdge(empty)],
+        _images(),
+        _settings(),
+        TrajectoryConfig(),
+    )
+
+    dormant = [point for point in points if point.image_id == "c"]
+    assert dormant and {point.state for point in dormant} == {"dormant"}
+    assert all(point.x_m is None and point.y_m is None for point in dormant)
 
 
 def test_deformation_uses_inverse_seconds_and_known_affine_gradient():

@@ -19,7 +19,7 @@ from .models import DisplacementField, PairResult
 from .trajectory import TrajectoryPoint
 
 
-DATABASE_SCHEMA_VERSION = 1
+DATABASE_SCHEMA_VERSION = 2
 
 
 class RunStore:
@@ -115,8 +115,8 @@ class RunStore:
         targeted: bool,
     ) -> bool:
         """Mark an incomplete pair running; return False for immutable completion."""
-        if kind not in {"adjacent", "recovery"}:
-            raise ValueError("pair kind must be adjacent or recovery")
+        if kind not in {"primary", "recovery"}:
+            raise ValueError("pair kind must be primary or recovery")
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -271,42 +271,41 @@ class RunStore:
             ),
         )
 
-    def replace_trajectories(
-        self, component_id: str, points: Iterable[TrajectoryPoint]
+    def replace_global_trajectories(
+        self, points: Iterable[TrajectoryPoint]
     ) -> None:
         values = tuple(points)
         with closing(self._connect()) as connection, connection:
             connection.execute(
-                "DELETE FROM trajectory_points WHERE run_id=? AND component_id=?",
-                (self.config.run_id, component_id),
+                "DELETE FROM trajectory_points WHERE run_id=?",
+                (self.config.run_id,),
             )
             connection.execute(
-                "DELETE FROM trajectories WHERE run_id=? AND component_id=?",
-                (self.config.run_id, component_id),
+                "DELETE FROM trajectories WHERE run_id=?",
+                (self.config.run_id,),
             )
             seed = {}
             for point in values:
                 if point.state == "created":
                     seed.setdefault(point.trajectory_id, point.image_id)
             connection.executemany(
-                "INSERT INTO trajectories(run_id,component_id,trajectory_id,seed_image_id) VALUES (?,?,?,?)",
+                "INSERT INTO trajectories(run_id,trajectory_id,seed_image_id) VALUES (?,?,?)",
                 [
-                    (self.config.run_id, component_id, identity, image_id)
+                    (self.config.run_id, identity, image_id)
                     for identity, image_id in sorted(seed.items())
                 ],
             )
             connection.executemany(
                 """
                 INSERT INTO trajectory_points
-                (run_id,component_id,trajectory_id,image_id,time_utc,state,
+                (run_id,trajectory_id,image_id,time_utc,state,
                  position_basis,x_m,y_m,source_pair_id,selected_matches,
                  support_radius_m,maximum_residual_m)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 [
                     (
                         self.config.run_id,
-                        component_id,
                         point.trajectory_id,
                         point.image_id,
                         point.time_utc.isoformat(),
@@ -359,7 +358,7 @@ class RunStore:
     def manifest_rows(self) -> dict[str, list[dict]]:
         with closing(self._connect()) as connection:
             images = [dict(row) for row in connection.execute(
-                "SELECT * FROM images WHERE run_id=? ORDER BY component_id,time_utc,image_id",
+                "SELECT * FROM images WHERE run_id=? ORDER BY time_utc,image_id",
                 (self.config.run_id,),
             )]
             pairs = [dict(row) for row in connection.execute(
@@ -397,8 +396,26 @@ class RunStore:
         return connection
 
     def _ensure_schema(self) -> None:
-        with closing(self._connect()) as connection, connection:
-            connection.executescript(_SCHEMA)
+        connection = sqlite3.connect(self.path, timeout=60.0)
+        try:
+            tables = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if tables and version != DATABASE_SCHEMA_VERSION:
+                raise ValueError(
+                    "unsupported LiMOSAT SQLite schema "
+                    f"{version or 'legacy'}; global catalogue runs require a new "
+                    "schema-v2 database path and run_id"
+                )
+            if not tables:
+                connection.executescript(_SCHEMA)
+                connection.execute(
+                    f"PRAGMA user_version={DATABASE_SCHEMA_VERSION}"
+                )
+                connection.commit()
+        finally:
+            connection.close()
 
     def _ensure_run(self) -> None:
         config_json = json.dumps(
@@ -407,12 +424,13 @@ class RunStore:
         with closing(self._connect()) as connection, connection:
             row = connection.execute(
                 """
-                SELECT config_sha256,implementation_sha256,model_sha256
+                SELECT schema_version,config_sha256,implementation_sha256,model_sha256
                 FROM runs WHERE run_id=?
                 """,
                 (self.config.run_id,),
             ).fetchone()
             expected = (
+                DATABASE_SCHEMA_VERSION,
                 self.config.sha256,
                 self.implementation_sha256,
                 self.model_sha256,
@@ -512,7 +530,7 @@ CREATE TABLE IF NOT EXISTS pairs (
   run_id TEXT NOT NULL, pair_id TEXT NOT NULL, component_id TEXT NOT NULL,
   source_image_id TEXT NOT NULL, target_image_id TEXT NOT NULL,
   source_time_utc TEXT NOT NULL, target_time_utc TEXT NOT NULL,
-  elapsed_seconds REAL NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('adjacent','recovery')),
+  elapsed_seconds REAL NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('primary','recovery')),
   targeted INTEGER NOT NULL, status TEXT NOT NULL CHECK(status IN ('running','complete','failed')),
   started_utc TEXT NOT NULL, completed_utc TEXT, field_sha256 TEXT,
   match_count INTEGER, node_count INTEGER, available_node_count INTEGER,
@@ -531,19 +549,19 @@ CREATE TABLE IF NOT EXISTS field_nodes (
   FOREIGN KEY(run_id,pair_id) REFERENCES pairs(run_id,pair_id)
 );
 CREATE TABLE IF NOT EXISTS trajectories (
-  run_id TEXT NOT NULL, component_id TEXT NOT NULL, trajectory_id TEXT NOT NULL,
-  seed_image_id TEXT NOT NULL, PRIMARY KEY(run_id,component_id,trajectory_id),
+  run_id TEXT NOT NULL, trajectory_id TEXT NOT NULL,
+  seed_image_id TEXT NOT NULL, PRIMARY KEY(run_id,trajectory_id),
   FOREIGN KEY(run_id) REFERENCES runs(run_id)
 );
 CREATE TABLE IF NOT EXISTS trajectory_points (
-  run_id TEXT NOT NULL, component_id TEXT NOT NULL, trajectory_id TEXT NOT NULL,
+  run_id TEXT NOT NULL, trajectory_id TEXT NOT NULL,
   image_id TEXT NOT NULL, time_utc TEXT NOT NULL,
   state TEXT NOT NULL CHECK(state IN ('created','observed','dormant','reappeared')),
   position_basis TEXT NOT NULL, x_m REAL, y_m REAL, source_pair_id TEXT,
   selected_matches REAL, support_radius_m REAL, maximum_residual_m REAL,
-  PRIMARY KEY(run_id,component_id,trajectory_id,image_id),
-  FOREIGN KEY(run_id,component_id,trajectory_id)
-    REFERENCES trajectories(run_id,component_id,trajectory_id)
+  PRIMARY KEY(run_id,trajectory_id,image_id),
+  FOREIGN KEY(run_id,trajectory_id)
+    REFERENCES trajectories(run_id,trajectory_id)
 );
 CREATE TABLE IF NOT EXISTS deformation_cells (
   run_id TEXT NOT NULL, pair_id TEXT NOT NULL, triangle_index INTEGER NOT NULL,

@@ -1,7 +1,10 @@
 import json
+import sqlite3
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
+import pytest
 
 from limosat import (
     DisplacementField,
@@ -15,6 +18,7 @@ from limosat import (
     PairResult,
     RoutingConfig,
     RunConfig,
+    TrajectoryPoint,
 )
 from limosat.cli import main
 from limosat.store import RunStore
@@ -117,13 +121,13 @@ def test_interrupted_pair_retries_but_complete_product_is_immutable(tmp_path):
     store.register_catalogue(catalogue)
     store.start_run()
 
-    assert store.claim_pair(pair, "component", "adjacent", False)
+    assert store.claim_pair(pair, "component", "primary", False)
     resumed_store = RunStore(config)
-    assert resumed_store.claim_pair(pair, "component", "adjacent", False)
+    assert resumed_store.claim_pair(pair, "component", "primary", False)
     assert resumed_store.save_pair(pair, _result(pair))
     checksum = resumed_store.load_field(pair.pair_id).checksum
 
-    assert not resumed_store.claim_pair(pair, "component", "adjacent", False)
+    assert not resumed_store.claim_pair(pair, "component", "primary", False)
     assert not resumed_store.save_pair(pair, _result(pair, available=False))
     assert resumed_store.load_field(pair.pair_id).checksum == checksum
 
@@ -134,13 +138,13 @@ def test_sequence_recovers_measured_loss_and_resumes_with_versioned_manifest(tmp
     processor = SyntheticProcessor()
 
     first = LiMOSATRun(config, catalogue, processor).execute(["limosat", "run", "config.yaml"])
-    manifest = json.loads((tmp_path / "products" / "run-manifest-v1.json").read_text())
+    manifest = json.loads((tmp_path / "products" / "run-manifest-v2.json").read_text())
 
     assert first["computed_pairs"] == 3
     assert processor.calls == [("a__b", False), ("b__c", False), ("a__c", True)]
-    assert manifest["manifest_schema_version"] == 1
+    assert manifest["manifest_schema_version"] == 2
     assert len(manifest["implementation_sha256"]) == 64
-    assert manifest["product_schemas"]["lagrangian_trajectory"] == 2
+    assert manifest["product_schemas"]["lagrangian_trajectory"] == 3
     assert manifest["coordinates"]["crs"] == "EPSG:3413"
     assert manifest["product_counts"]["trajectories"] == 4
     recovery = [pair for pair in manifest["pairs"] if pair["kind"] == "recovery"]
@@ -159,4 +163,54 @@ def test_cli_status_imports_without_loading_model(tmp_path, capsys):
 
     assert main(["status", str(config_path)]) == 0
     output = json.loads(capsys.readouterr().out)
-    assert output["run"]["schema_version"] == 1
+    assert output["run"]["schema_version"] == 2
+
+
+def test_schema_v2_is_global_and_persists_null_dormant_coordinates(tmp_path):
+    config = _config(tmp_path)
+    store = RunStore(config)
+    points = (
+        TrajectoryPoint(
+            "parcel",
+            "a",
+            START,
+            "created",
+            "seed_grid",
+            1.0,
+            2.0,
+            None,
+        ),
+        TrajectoryPoint(
+            "parcel",
+            "b",
+            START + timedelta(days=1),
+            "dormant",
+            "missing",
+            None,
+            None,
+            None,
+        ),
+    )
+    store.replace_global_trajectories(points)
+
+    with sqlite3.connect(config.database) as connection:
+        trajectory_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(trajectories)")
+        }
+        dormant = connection.execute(
+            "SELECT x_m,y_m FROM trajectory_points WHERE state='dormant'"
+        ).fetchone()
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+
+    assert "component_id" not in trajectory_columns
+    assert dormant == (None, None)
+    assert version == 2
+
+
+def test_legacy_database_is_rejected_without_migration(tmp_path):
+    legacy = tmp_path / "legacy.sqlite"
+    with sqlite3.connect(legacy) as connection:
+        connection.execute("CREATE TABLE runs(run_id TEXT PRIMARY KEY)")
+
+    with pytest.raises(ValueError, match="new schema-v2 database path and run_id"):
+        RunStore(replace(_config(tmp_path), database=str(legacy)))

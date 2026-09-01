@@ -13,7 +13,11 @@ from .models import DisplacementField, FieldEdge, MotionMatches, PairResult
 from .deformation import DeformationCell, deformation_from_field
 from .efficientloftr import EfficientLoFTR
 from .pairs import PairProcessor
-from .trajectory import TrajectoryPoint, build_trajectories
+from .trajectory import (
+    TrajectoryPoint,
+    build_trajectories,
+    compose_global_trajectories,
+)
 from .run import LiMOSATRun
 from .store import RunStore
 
@@ -37,6 +41,7 @@ __all__ = [
     "TrajectoryConfig",
     "TrajectoryPoint",
     "build_trajectories",
+    "compose_global_trajectories",
     "deformation_from_field",
     "load_catalogue",
     "load_config",

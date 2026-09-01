@@ -1,10 +1,10 @@
-"""Observed Lagrangian identities composed from pair-field edges."""
+"""Global observed Lagrangian identities composed from completed pair fields."""
 
 from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Sequence
 
 import numpy as np
@@ -30,9 +30,136 @@ class TrajectoryPoint:
     support_radius_m: float | None = None
     maximum_residual_m: float | None = None
 
+    def __post_init__(self) -> None:
+        if self.time_utc.tzinfo is None or self.time_utc.utcoffset() is None:
+            raise ValueError("trajectory times must be timezone-aware")
+        object.__setattr__(self, "time_utc", self.time_utc.astimezone(timezone.utc))
+        if self.state not in {"created", "observed", "dormant", "reappeared"}:
+            raise ValueError(f"unknown trajectory state: {self.state}")
+        if (self.x_m is None) != (self.y_m is None):
+            raise ValueError("trajectory coordinates must both be present or both be NULL")
+        if self.state == "dormant" and self.available:
+            raise ValueError("dormant trajectory coordinates must be NULL")
+        if self.state != "dormant" and not self.available:
+            raise ValueError("measured trajectory states require coordinates")
+
     @property
     def available(self) -> bool:
         return self.x_m is not None and self.y_m is not None
+
+
+@dataclass(frozen=True)
+class _Continuation:
+    source_step: int
+    edge: FieldEdge
+    displacement_m: np.ndarray
+    selected_matches: float
+    support_radius_m: float
+    maximum_residual_m: float
+
+
+def compose_global_trajectories(
+    edges: Sequence[FieldEdge],
+    images: Sequence[ImageRecord],
+    field_config: FieldConfig,
+    trajectory_config: TrajectoryConfig,
+) -> tuple[TrajectoryPoint, ...]:
+    """Recompose the catalogue without treating compute labels as boundaries."""
+    ordered_images = tuple(
+        sorted(images, key=lambda image: (image.time_utc, image.image_id))
+    )
+    if not ordered_images:
+        raise ValueError("trajectory composition requires catalogue images")
+    image_keys = [image.image_id for image in ordered_images]
+    if len(image_keys) != len(set(image_keys)):
+        raise ValueError("trajectory image identity must be globally unique")
+    image_index = {image_id: index for index, image_id in enumerate(image_keys)}
+    indexed: list[tuple[int, int, FieldEdge]] = []
+    for edge in edges:
+        source = image_index.get(edge.source_image_id)
+        target = image_index.get(edge.target_image_id)
+        if source is None or target is None or source >= target:
+            raise ValueError("every pair field must point forward between listed images")
+        indexed.append((source, target, edge))
+    indexed.sort(
+        key=lambda item: (
+            item[1],
+            item[0],
+            item[2].pair_kind,
+            item[2].field.pair_id,
+        )
+    )
+
+    positions: list[dict[str, np.ndarray]] = [dict() for _ in ordered_images]
+    states: list[dict[str, str]] = [dict() for _ in ordered_images]
+    identities: list[str] = []
+    points: list[TrajectoryPoint] = []
+
+    for step, image in enumerate(ordered_images):
+        if step:
+            incoming = [item for item in indexed if item[1] == step]
+            chosen = _choose_continuations(
+                incoming, positions, identities, field_config
+            )
+            for identity in identities:
+                continuation = chosen.get(identity)
+                if continuation is None:
+                    states[step][identity] = "dormant"
+                    points.append(
+                        _point(identity, image, "dormant", "missing", None, None)
+                    )
+                    continue
+                xy = (
+                    positions[continuation.source_step][identity]
+                    + continuation.displacement_m
+                )
+                positions[step][identity] = xy
+                state = (
+                    "reappeared"
+                    if continuation.edge.pair_kind == "recovery"
+                    else "observed"
+                )
+                states[step][identity] = state
+                points.append(
+                    _point(
+                        identity,
+                        image,
+                        state,
+                        f"{continuation.edge.pair_kind}_pair_field",
+                        xy,
+                        continuation.edge.field.pair_id,
+                        continuation.selected_matches,
+                        continuation.support_radius_m,
+                        continuation.maximum_residual_m,
+                    )
+                )
+
+        if trajectory_config.add_as_coverage_enters:
+            candidates = _outgoing_primary_points(indexed, step)
+            occupancy = _last_measured_positions(positions, identities, step)
+            for xy in _exclude_occupied(
+                candidates,
+                occupancy,
+                trajectory_config.new_point_exclusion_radius_m,
+            ):
+                identity = stable_trajectory_id(image.image_id, xy)
+                if identity in states[step]:
+                    continue
+                identities.append(identity)
+                positions[step][identity] = xy
+                states[step][identity] = "created"
+                points.append(
+                    _point(identity, image, "created", "seed_grid", xy, None)
+                )
+    return tuple(
+        sorted(
+            points,
+            key=lambda point: (
+                image_index[point.image_id],
+                point.trajectory_id,
+            ),
+        )
+    )
 
 
 def build_trajectories(
@@ -41,117 +168,10 @@ def build_trajectories(
     field_config: FieldConfig,
     trajectory_config: TrajectoryConfig,
 ) -> tuple[TrajectoryPoint, ...]:
-    """Build stable identities with creation, dormancy, and observed reappearance."""
-    if len(images) < 2 or not edges:
-        raise ValueError("trajectory construction requires images and field edges")
-    image_keys = [image.image_id for image in images]
-    if len(image_keys) != len(set(image_keys)):
-        raise ValueError("trajectory image identity must be unique")
-    if any(right.time_utc <= left.time_utc for left, right in zip(images, images[1:])):
-        raise ValueError("trajectory images must be strictly chronological")
-    image_index = {image_id: index for index, image_id in enumerate(image_keys)}
-    indexed: list[tuple[int, int, FieldEdge]] = []
-    for edge in edges:
-        source = image_index.get(edge.source_image_id)
-        target = image_index.get(edge.target_image_id)
-        if source is None or target is None or source >= target:
-            raise ValueError("every field edge must point forward between listed images")
-        indexed.append((source, target, edge))
-
-    initial = _outgoing_points(indexed, 0)
-    if not len(initial):
-        raise ValueError("first image has no supported outgoing field")
-    positions: list[dict[str, np.ndarray]] = [dict() for _ in images]
-    points: list[TrajectoryPoint] = []
-    for xy in initial:
-        identity = stable_trajectory_id(images[0].image_id, xy)
-        positions[0][identity] = xy
-        points.append(_point(identity, images[0], "created", "seed_grid", xy, None))
-    identities = list(positions[0])
-
-    for target_step in range(1, len(images)):
-        target_edges = sorted(
-            ((source, edge) for source, target, edge in indexed if target == target_step),
-            key=lambda item: target_step - item[0],
-        )
-        chosen: dict[str, tuple[int, FieldEdge, np.ndarray, float, float, float]] = {}
-        for source_step, edge in target_edges:
-            eligible = [identity for identity in identities if identity in positions[source_step]]
-            if not eligible:
-                continue
-            queries = np.vstack([positions[source_step][identity] for identity in eligible])
-            sampled = sample_field(
-                edge.field, queries, field_config.maximum_triangle_edge_m
-            )
-            for local_index in np.flatnonzero(sampled.available):
-                identity = eligible[local_index]
-                candidate = (
-                    source_step,
-                    edge,
-                    sampled.displacement_m[local_index],
-                    float(sampled.selected_matches[local_index]),
-                    float(sampled.support_radius_m[local_index]),
-                    float(sampled.maximum_residual_m[local_index]),
-                )
-                current = chosen.get(identity)
-                if current is None or _edge_better(
-                    candidate, current, target_step
-                ):
-                    chosen[identity] = candidate
-
-        previous_available = positions[target_step - 1]
-        for identity in identities:
-            if identity not in chosen:
-                points.append(
-                    _point(identity, images[target_step], "dormant", "missing", None, None)
-                )
-                continue
-            source_step, edge, displacement, selected, radius, residual = chosen[identity]
-            xy = positions[source_step][identity] + displacement
-            positions[target_step][identity] = xy
-            reappeared = identity not in previous_available
-            points.append(
-                _point(
-                    identity,
-                    images[target_step],
-                    "reappeared" if reappeared else "observed",
-                    (
-                        "field_advected_adjacent"
-                        if target_step - source_step == 1
-                        else "field_advected_skip"
-                    ),
-                    xy,
-                    edge.field.pair_id,
-                    selected,
-                    radius,
-                    residual,
-                )
-            )
-
-        if trajectory_config.add_as_coverage_enters:
-            candidates = _outgoing_points(indexed, target_step)
-            occupancy = _occupancy(positions, identities, target_step)
-            for xy in _exclude_occupied(
-                candidates,
-                occupancy,
-                trajectory_config.new_point_exclusion_radius_m,
-            ):
-                identity = stable_trajectory_id(images[target_step].image_id, xy)
-                if identity in identities:
-                    continue
-                identities.append(identity)
-                positions[target_step][identity] = xy
-                points.append(
-                    _point(
-                        identity,
-                        images[target_step],
-                        "created",
-                        "seed_grid",
-                        xy,
-                        None,
-                    )
-                )
-    return tuple(points)
+    """Compatibility name for the global catalogue composer."""
+    return compose_global_trajectories(
+        edges, images, field_config, trajectory_config
+    )
 
 
 def targeted_recovery_positions(
@@ -159,7 +179,7 @@ def targeted_recovery_positions(
     source_image_id: str,
     target_image_id: str,
 ) -> np.ndarray:
-    """Return measured source positions for identities dormant at a later target."""
+    """Return measured source positions for parcels dormant at a later target."""
     source = {
         point.trajectory_id: point
         for point in points
@@ -173,30 +193,98 @@ def targeted_recovery_positions(
     selected = [source[identity] for identity in sorted(dormant & source.keys())]
     if not selected:
         return np.empty((0, 2), dtype=np.float64)
-    return np.asarray([[point.x_m, point.y_m] for point in selected], dtype=np.float64)
+    return np.asarray(
+        [[point.x_m, point.y_m] for point in selected], dtype=np.float64
+    )
 
 
 def stable_trajectory_id(seed_image_id: str, xy_m: np.ndarray) -> str:
-    """Derive an identity from the exact seed image and millimetre-rounded position."""
+    """Derive a global identity from seed image and millimetre-rounded position."""
     xy = np.asarray(xy_m, dtype=np.float64)
     encoded = f"{seed_image_id}|{xy[0]:.3f}|{xy[1]:.3f}".encode("utf-8")
     return "trj_" + hashlib.sha256(encoded).hexdigest()[:20]
 
 
-def _edge_better(candidate, current, target_step: int) -> bool:
-    candidate_skip = target_step - candidate[0] - 1
-    current_skip = target_step - current[0] - 1
-    return candidate_skip < current_skip or (
-        candidate_skip == current_skip and candidate[3] > current[3]
+def _choose_continuations(
+    incoming: Sequence[tuple[int, int, FieldEdge]],
+    positions: Sequence[dict[str, np.ndarray]],
+    identities: Sequence[str],
+    field_config: FieldConfig,
+) -> dict[str, _Continuation]:
+    primary = _supported_continuations(
+        [item for item in incoming if item[2].pair_kind == "primary"],
+        positions,
+        identities,
+        field_config,
+    )
+    remaining = [identity for identity in identities if identity not in primary]
+    recovery = _supported_continuations(
+        [item for item in incoming if item[2].pair_kind == "recovery"],
+        positions,
+        remaining,
+        field_config,
+    )
+    return {**primary, **recovery}
+
+
+def _supported_continuations(
+    incoming: Sequence[tuple[int, int, FieldEdge]],
+    positions: Sequence[dict[str, np.ndarray]],
+    identities: Sequence[str],
+    field_config: FieldConfig,
+) -> dict[str, _Continuation]:
+    chosen: dict[str, _Continuation] = {}
+    for source_step, _target_step, edge in incoming:
+        eligible = [
+            identity for identity in identities if identity in positions[source_step]
+        ]
+        if not eligible:
+            continue
+        queries = np.vstack([positions[source_step][identity] for identity in eligible])
+        sampled = sample_field(
+            edge.field, queries, field_config.maximum_triangle_edge_m
+        )
+        for local_index in np.flatnonzero(sampled.available):
+            identity = eligible[local_index]
+            candidate = _Continuation(
+                source_step,
+                edge,
+                sampled.displacement_m[local_index],
+                float(sampled.selected_matches[local_index]),
+                float(sampled.support_radius_m[local_index]),
+                float(sampled.maximum_residual_m[local_index]),
+            )
+            current = chosen.get(identity)
+            if current is None or _continuation_key(candidate) > _continuation_key(
+                current
+            ):
+                chosen[identity] = candidate
+    return chosen
+
+
+def _continuation_key(candidate: _Continuation) -> tuple:
+    residual = candidate.maximum_residual_m
+    radius = candidate.support_radius_m
+    return (
+        candidate.edge.field.source_time_utc,
+        candidate.selected_matches,
+        -residual if np.isfinite(residual) else -np.inf,
+        -radius if np.isfinite(radius) else -np.inf,
+        _reverse_text(candidate.edge.field.pair_id),
     )
 
 
-def _outgoing_points(indexed, source_step: int) -> np.ndarray:
-    values = []
-    for source, _target, edge in indexed:
-        if source == source_step:
-            valid = edge.field.available
-            values.append(edge.field.source_xy_m[valid])
+def _reverse_text(value: str) -> tuple[int, ...]:
+    return tuple(-ord(character) for character in value)
+
+
+def _outgoing_primary_points(indexed, source_step: int) -> np.ndarray:
+    values = [
+        edge.field.source_xy_m[edge.field.available]
+        for source, _target, edge in indexed
+        if source == source_step and edge.pair_kind == "primary"
+    ]
+    values = [value for value in values if len(value)]
     return (
         np.unique(np.vstack(values), axis=0)
         if values
@@ -204,14 +292,18 @@ def _outgoing_points(indexed, source_step: int) -> np.ndarray:
     )
 
 
-def _occupancy(positions, identities, target_step: int) -> np.ndarray:
+def _last_measured_positions(positions, identities, target_step: int) -> np.ndarray:
     values = []
     for identity in identities:
         for step in range(target_step, -1, -1):
             if identity in positions[step]:
                 values.append(positions[step][identity])
                 break
-    return np.asarray(values, dtype=np.float64) if values else np.empty((0, 2))
+    return (
+        np.asarray(values, dtype=np.float64)
+        if values
+        else np.empty((0, 2), dtype=np.float64)
+    )
 
 
 def _exclude_occupied(candidates, occupancy, radius_m: float) -> np.ndarray:

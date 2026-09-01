@@ -31,10 +31,11 @@ limosat run config.yaml
 limosat status config.yaml
 ```
 
-The run command processes each catalogue component, resumes completed pairs
-without overwriting them, schedules sparse skip-pair recovery only after
-measured trajectory loss, rebuilds stable trajectories, writes adjacent-pair
-deformation cells, and emits `run-manifest-v1.json`.
+The run command uses component labels only to plan compute, resumes completed
+image pairs without overwriting them, composes one global parcel catalogue,
+schedules non-consecutive recovery pairs only after measured trajectory loss,
+writes deformation from primary pair fields, and emits
+`run-manifest-v2.json`.
 
 The public Python entry point is direct:
 
@@ -54,8 +55,8 @@ See [operations](docs/operations.md) for catalogue and recovery behavior and
   in SQLite; they are never encoded as zero displacement.
 - Trajectories are virtual material points advected only through supported,
   orientation-preserving fields. Dormant points have no coordinate.
-- Reappearance requires an observed skip field; no temporal prediction is
-  included in the primary trajectory product.
+- Reappearance requires a measured non-consecutive recovery pair; no temporal
+  prediction is included in the primary trajectory product.
 - Sparse targeted recovery fields reconnect trajectories but are not emitted as
   standalone deformation products.
 

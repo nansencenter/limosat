@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Literal
 
 import numpy as np
 
@@ -147,7 +148,16 @@ class PairResult:
 @dataclass(frozen=True)
 class FieldEdge:
     field: DisplacementField
+    pair_kind: Literal["primary", "recovery"] = "primary"
     skipped_images: int = 0
+
+    def __post_init__(self) -> None:
+        if self.pair_kind not in {"primary", "recovery"}:
+            raise ValueError("field pair_kind must be primary or recovery")
+        if self.skipped_images < 0:
+            raise ValueError("skipped_images cannot be negative")
+        if self.pair_kind == "primary" and self.skipped_images:
+            raise ValueError("primary pair fields cannot skip catalogue images")
 
     @property
     def source_image_id(self) -> str:

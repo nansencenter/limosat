@@ -13,7 +13,7 @@ from .config import RunConfig
 from .store import RunStore, file_sha256
 
 
-MANIFEST_SCHEMA_VERSION = 1
+MANIFEST_SCHEMA_VERSION = 2
 
 
 def write_manifest(
@@ -33,9 +33,9 @@ def write_manifest(
         "status": "complete",
         "method": "EfficientLoFTR",
         "product_schemas": {
-            "sqlite": 1,
+            "sqlite": 2,
             "pair_displacement_field": 1,
-            "lagrangian_trajectory": 2,
+            "lagrangian_trajectory": 3,
             "deformation_cell": 1,
         },
         "coordinates": {
@@ -62,19 +62,22 @@ def write_manifest(
         "started_utc": started_utc.isoformat(),
         "completed_utc": completed_utc.isoformat(),
         "runtime_seconds": float(runtime_seconds),
-        "components": {
+        "compute_planning_labels": {
             name: [image.image_id for image in images]
             for name, images in catalogue.components().items()
         },
         "images": rows["images"],
         "pairs": rows["pairs"],
         "product_counts": rows["counts"],
-        "recovery_deformation_policy": "recovery fields reconnect trajectories only",
+        "recovery_deformation_policy": (
+            "non-consecutive recovery pair fields reconnect trajectories only; "
+            "only primary pair fields produce deformation cells"
+        ),
     }
     output = Path(config.output_directory)
     output.mkdir(parents=True, exist_ok=True)
-    path = output / "run-manifest-v1.json"
-    temporary = output / ".run-manifest-v1.json.writing"
+    path = output / "run-manifest-v2.json"
+    temporary = output / ".run-manifest-v2.json.writing"
     temporary.write_text(
         json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n",
         encoding="utf-8",
