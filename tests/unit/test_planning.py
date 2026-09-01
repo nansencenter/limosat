@@ -64,6 +64,25 @@ def test_equal_time_sources_remain_competing_primary_pairs():
     } == {"a__target", "b__target"}
 
 
+def test_missing_footprints_do_not_restore_component_boundaries():
+    catalogue = ImageCatalogue(
+        [
+            ImageRecord("a", Path("/tmp/missing-a.tif"), START, "former-a"),
+            ImageRecord(
+                "b",
+                Path("/tmp/missing-b.tif"),
+                START + timedelta(days=1),
+                "former-b",
+            ),
+        ]
+    )
+
+    planned = plan_candidate_pairs(catalogue, RoutingConfig())
+
+    assert [item.pair.pair_id for item in planned] == ["a__b"]
+    assert planned[0].overlap_fraction is None
+
+
 def test_recovery_candidates_are_bounded_and_recent_first():
     catalogue = ImageCatalogue(
         [_image(name, day, name) for day, name in enumerate(("a", "b", "c", "d"))]

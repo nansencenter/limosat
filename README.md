@@ -54,6 +54,13 @@ summary = LiMOSATRun(load_config("config.yaml")).execute()
 See [operations](docs/operations.md) for catalogue and recovery behavior and
 [schemas](docs/schemas.md) for the SQLite and manifest contracts.
 
+Completed production CSV fields can also be composed without imagery or GPU
+inference. `scripts/replay_global_catalogue_fields.py` creates a new schema-v2
+SQLite catalogue and checksummed field-replay provenance file;
+`scripts/render_global_catalogue.py` creates the static distributions and
+thin-trail pan-Arctic animation. Replay products are analysis outputs outside
+Git, not substitutes for a native run manifest.
+
 ## Scientific semantics
 
 - Pair fields are independently measured EfficientLoFTR products.

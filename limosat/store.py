@@ -328,7 +328,11 @@ class RunStore:
     def replace_global_trajectories(
         self, points: Iterable[TrajectoryPoint]
     ) -> None:
-        values = tuple(points)
+        self.replace_global_trajectory_batches((points,))
+
+    def replace_global_trajectory_batches(
+        self, batches: Iterable[Iterable[TrajectoryPoint]]
+    ) -> None:
         with closing(self._connect()) as connection, connection:
             connection.execute(
                 "DELETE FROM trajectory_points WHERE run_id=?",
@@ -338,43 +342,49 @@ class RunStore:
                 "DELETE FROM trajectories WHERE run_id=?",
                 (self.config.run_id,),
             )
-            seed = {}
-            for point in values:
-                if point.state == "created":
-                    seed.setdefault(point.trajectory_id, point.image_id)
-            connection.executemany(
-                "INSERT INTO trajectories(run_id,trajectory_id,seed_image_id) VALUES (?,?,?)",
-                [
-                    (self.config.run_id, identity, image_id)
-                    for identity, image_id in sorted(seed.items())
-                ],
-            )
-            connection.executemany(
-                """
-                INSERT INTO trajectory_points
-                (run_id,trajectory_id,image_id,time_utc,state,
-                 position_basis,x_m,y_m,source_pair_id,selected_matches,
-                 support_radius_m,maximum_residual_m)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                [
-                    (
-                        self.config.run_id,
-                        point.trajectory_id,
-                        point.image_id,
-                        point.time_utc.isoformat(),
-                        point.state,
-                        point.position_basis,
-                        point.x_m,
-                        point.y_m,
-                        point.source_pair_id,
-                        _finite_or_none(point.selected_matches),
-                        _finite_or_none(point.support_radius_m),
-                        _finite_or_none(point.maximum_residual_m),
-                    )
-                    for point in values
-                ],
-            )
+            for batch in batches:
+                values = tuple(batch)
+                connection.executemany(
+                    """
+                    INSERT OR IGNORE INTO trajectories
+                    (run_id,trajectory_id,seed_image_id) VALUES (?,?,?)
+                    """,
+                    [
+                        (
+                            self.config.run_id,
+                            point.trajectory_id,
+                            point.image_id,
+                        )
+                        for point in values
+                        if point.state == "created"
+                    ],
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO trajectory_points
+                    (run_id,trajectory_id,image_id,time_utc,state,
+                     position_basis,x_m,y_m,source_pair_id,selected_matches,
+                     support_radius_m,maximum_residual_m)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    [
+                        (
+                            self.config.run_id,
+                            point.trajectory_id,
+                            point.image_id,
+                            point.time_utc.isoformat(),
+                            point.state,
+                            point.position_basis,
+                            point.x_m,
+                            point.y_m,
+                            point.source_pair_id,
+                            _finite_or_none(point.selected_matches),
+                            _finite_or_none(point.support_radius_m),
+                            _finite_or_none(point.maximum_residual_m),
+                        )
+                        for point in values
+                    ],
+                )
 
     def replace_deformation(
         self, pair_id: str, cells: Iterable[DeformationCell]

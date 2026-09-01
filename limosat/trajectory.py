@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from collections.abc import Iterator
 from typing import Sequence
 
 import numpy as np
@@ -65,6 +66,22 @@ def compose_global_trajectories(
     trajectory_config: TrajectoryConfig,
 ) -> tuple[TrajectoryPoint, ...]:
     """Recompose the catalogue without treating compute labels as boundaries."""
+    return tuple(
+        point
+        for batch in iter_global_trajectory_points(
+            edges, images, field_config, trajectory_config
+        )
+        for point in batch
+    )
+
+
+def iter_global_trajectory_points(
+    edges: Sequence[FieldEdge],
+    images: Sequence[ImageRecord],
+    field_config: FieldConfig,
+    trajectory_config: TrajectoryConfig,
+) -> Iterator[tuple[TrajectoryPoint, ...]]:
+    """Yield deterministic per-image rows while retaining only needed positions."""
     ordered_images = tuple(
         sorted(images, key=lambda image: (image.time_utc, image.image_id))
     )
@@ -89,22 +106,33 @@ def compose_global_trajectories(
             item[2].field.pair_id,
         )
     )
+    incoming_by_target: dict[int, list[tuple[int, int, FieldEdge]]] = {}
+    for item in indexed:
+        incoming_by_target.setdefault(item[1], []).append(item)
 
     positions: list[dict[str, np.ndarray]] = [dict() for _ in ordered_images]
-    states: list[dict[str, str]] = [dict() for _ in ordered_images]
-    identities: list[str] = []
-    points: list[TrajectoryPoint] = []
+    identities: set[str] = set()
+    last_use: dict[int, int] = {}
+    for source, target, _edge in indexed:
+        last_use[source] = max(last_use.get(source, target), target)
 
     for step, image in enumerate(ordered_images):
+        points: list[TrajectoryPoint] = []
         if step:
-            incoming = [item for item in indexed if item[1] == step]
-            chosen = _choose_continuations(
-                incoming, positions, identities, field_config
+            incoming = incoming_by_target.get(step, ())
+            eligible = sorted(
+                {
+                    identity
+                    for source_step, _target_step, _edge in incoming
+                    for identity in positions[source_step]
+                }
             )
-            for identity in identities:
+            chosen = _choose_continuations(
+                incoming, positions, eligible, field_config
+            )
+            for identity in eligible:
                 continuation = chosen.get(identity)
                 if continuation is None:
-                    states[step][identity] = "dormant"
                     points.append(
                         _point(identity, image, "dormant", "missing", None, None)
                     )
@@ -119,7 +147,6 @@ def compose_global_trajectories(
                     if continuation.edge.pair_kind == "recovery"
                     else "observed"
                 )
-                states[step][identity] = state
                 points.append(
                     _point(
                         identity,
@@ -136,30 +163,31 @@ def compose_global_trajectories(
 
         if trajectory_config.add_as_coverage_enters:
             candidates = _outgoing_primary_points(indexed, step)
-            occupancy = _last_measured_positions(positions, identities, step)
+            occupancy = _active_positions(positions[step])
             for xy in _exclude_occupied(
                 candidates,
                 occupancy,
                 trajectory_config.new_point_exclusion_radius_m,
             ):
                 identity = stable_trajectory_id(image.image_id, xy)
-                if identity in states[step]:
+                if identity in identities:
                     continue
-                identities.append(identity)
+                identities.add(identity)
                 positions[step][identity] = xy
-                states[step][identity] = "created"
                 points.append(
                     _point(identity, image, "created", "seed_grid", xy, None)
                 )
-    return tuple(
-        sorted(
-            points,
-            key=lambda point: (
-                image_index[point.image_id],
-                point.trajectory_id,
-            ),
+        yield tuple(
+            sorted(
+                points,
+                key=lambda point: point.trajectory_id,
+            )
         )
-    )
+        for source_step, target_step in tuple(last_use.items()):
+            if target_step == step:
+                positions[source_step].clear()
+        if step not in last_use:
+            positions[step].clear()
 
 
 def build_trajectories(
@@ -292,16 +320,10 @@ def _outgoing_primary_points(indexed, source_step: int) -> np.ndarray:
     )
 
 
-def _last_measured_positions(positions, identities, target_step: int) -> np.ndarray:
-    values = []
-    for identity in identities:
-        for step in range(target_step, -1, -1):
-            if identity in positions[step]:
-                values.append(positions[step][identity])
-                break
+def _active_positions(positions: dict[str, np.ndarray]) -> np.ndarray:
     return (
-        np.asarray(values, dtype=np.float64)
-        if values
+        np.vstack([positions[identity] for identity in sorted(positions)])
+        if positions
         else np.empty((0, 2), dtype=np.float64)
     )
 

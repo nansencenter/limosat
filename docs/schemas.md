@@ -60,3 +60,13 @@ plus divergence, shear, total deformation, and vorticity in inverse seconds.
 
 Product schema versions are listed independently so additive trajectory or
 deformation revisions do not silently change the pair-field contract.
+
+## Field-replay provenance version 1
+
+`field-replay-provenance-v1.json` is an analysis provenance record, not the
+native run manifest. It identifies the immutable production state/plan and
+ordered completed-field set, reports whether each field checksum was verified,
+records SQLite schema 2 and trajectory product schema 3, and compares the new
+global catalogue with the prior component-sharded summary. A separate
+`render-report-v1.json` records deterministic trajectory selection, frame
+timing, source checksums, and checksums for figures, MP4, and GIF outputs.

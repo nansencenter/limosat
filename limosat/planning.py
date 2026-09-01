@@ -40,8 +40,7 @@ def plan_candidate_pairs(
             source_footprint = footprints[source.image_id]
             target_footprint = footprints[target.image_id]
             if source_footprint is None or target_footprint is None:
-                if source.component_id == target.component_id:
-                    candidates.append((ImagePair(source, target), None))
+                candidates.append((ImagePair(source, target), None))
                 continue
             overlap = _overlap_fraction(source_footprint, target_footprint)
             if overlap >= config.candidate_minimum_overlap_fraction:

@@ -52,6 +52,13 @@ reconnect trajectories, but only full primary pair fields generate deformation
 cells. After recovery completes, trajectories are recomposed from all
 completed fields.
 
+At a target image, the composer evaluates parcels whose last measured row is
+at the source of an incoming completed pair field. A parcel unsupported by all
+such fields gets a dormant row with SQL `NULL` coordinates. Images with no
+incoming measurement do not cause catalogue-wide Cartesian dormant rows. New
+seeds are compared with all measured parcel positions active at that image,
+irrespective of compute label.
+
 ## Resume and outputs
 
 SQLite is the source of run truth. A pair is marked `running` before inference;
@@ -66,3 +73,26 @@ reports the run and pair status counts.
 For a controlled restart under a changed configuration, choose a new `run_id`
 and database/output path. Reusing a `run_id` with a different resolved config is
 rejected.
+
+## Read-only production field replay
+
+The replay script consumes completed production field CSVs and their recorded
+checksums without opening source imagery or invoking EfficientLoFTR:
+
+```bash
+python scripts/replay_global_catalogue_fields.py \
+  --source /path/to/completed-production-run \
+  --output /path/outside/git/global-field-replay
+python scripts/render_global_catalogue.py \
+  --database /path/outside/git/global-field-replay/global-trajectories.sqlite \
+  --source /path/to/completed-production-run \
+  --output /path/outside/git/global-field-replay/visuals
+```
+
+The replay is explicitly labelled `FIELD REPLAY`; its provenance records the
+source state, plan, environment, individual completed-field verification, and
+ordered field-set checksum. It does not reconstruct deformation, recovery
+pairs, or a native run manifest. The renderer chooses at most 30,000
+multi-observation trajectories by deterministic spatially balanced sampling
+and draws only measured source-to-target segments, so dormant intervals have
+no visual bridge.
