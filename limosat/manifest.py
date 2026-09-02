@@ -13,7 +13,7 @@ from .config import RunConfig
 from .store import RunStore, file_sha256
 
 
-MANIFEST_SCHEMA_VERSION = 3
+MANIFEST_SCHEMA_VERSION = 4
 
 
 def write_manifest(
@@ -33,9 +33,10 @@ def write_manifest(
         "status": "complete",
         "method": "EfficientLoFTR",
         "product_schemas": {
-            "sqlite": 3,
+            "sqlite": 4,
             "pair_displacement_field": 1,
-            "lagrangian_trajectory": 3,
+            "pair_match_archive": 1,
+            "lagrangian_trajectory": 4,
             "deformation_cell": 1,
         },
         "coordinates": {
@@ -72,6 +73,11 @@ def write_manifest(
         "ancillary_inputs": rows["ancillary_inputs"],
         "pairs": rows["pairs"],
         "product_counts": rows["counts"],
+        "pair_match_retention": {
+            "enabled": config.retain_pair_matches,
+            "stage": "post-gate, pre-field-consensus selected hypothesis",
+            "storage": "checksummed compressed SQLite BLOB per completed pair",
+        },
         "recovery_deformation_policy": (
             "non-consecutive recovery pair fields reconnect trajectories only; "
             "only primary pair fields produce deformation cells"
@@ -79,8 +85,8 @@ def write_manifest(
     }
     output = Path(config.output_directory)
     output.mkdir(parents=True, exist_ok=True)
-    path = output / "run-manifest-v3.json"
-    temporary = output / ".run-manifest-v3.json.writing"
+    path = output / "run-manifest-v4.json"
+    temporary = output / ".run-manifest-v4.json.writing"
     temporary.write_text(
         json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n",
         encoding="utf-8",

@@ -122,6 +122,12 @@ builder before a production rebuild.
 
 ### P1 — required before full global trajectory acceptance
 
+- [x] **Lean assessment products.** Optionally retain selected post-gate,
+  pre-consensus matches as one compressed, checksummed SQLite record per
+  completed image pair. Finalize a complete run into one compact global
+  trajectory Parquet catalogue plus a checksummed statistics/provenance
+  summary. Keep SQLite as the single authoritative resume/audit product and
+  avoid per-pair output directories.
 - [ ] **Measured-loss recovery audit.** Compose primary fields first, identify
   genuine dormant parcels, compute only bounded non-consecutive recovery
   pairs, and deterministically recompose. Recovery fields never generate

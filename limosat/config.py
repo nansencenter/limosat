@@ -180,6 +180,7 @@ class RunConfig:
     trajectories: TrajectoryConfig = dataclass_field(
         default_factory=TrajectoryConfig
     )
+    retain_pair_matches: bool = False
 
     def __post_init__(self) -> None:
         if not self.run_id.strip():

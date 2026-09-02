@@ -35,12 +35,14 @@ The run command uses component labels only to plan compute, resumes completed
 image pairs without overwriting them, composes one global parcel catalogue,
 schedules non-consecutive recovery pairs only after measured trajectory loss,
 writes deformation from primary pair fields, and emits
-`run-manifest-v3.json`.
+`run-manifest-v4.json`. Set `retain_pair_matches: true` for assessment runs to
+keep the selected post-gate, pre-consensus EfficientLoFTR matches as one
+compressed, checksummed SQLite record per completed image pair.
 
 Candidate image pairs are registered before inference. By default they span
 1--96 hours, overlap at least 5% of the smaller footprint, and have at least
 1,024 km2 of direct overlap (the area of 64 nominal 4 km field cells). The most
-most recent eligible source is selected independently for every fixed 4 km
+recent eligible source is selected independently for every fixed 4 km
 planning cell. The union of those cell choices defines the target's primary
 image pairs without a per-target cap. Primary pair fields are independent and
 `pair_workers` controls local concurrency.
@@ -58,6 +60,19 @@ Inspect the frozen plan without loading the model with `limosat plan
 config.yaml`. See [the April-week GPU rerun procedure](docs/gpu-april-week-rerun.md)
 before inference.
 
+After a native run is complete, package the compact trajectory product and
+assessment checksums with:
+
+```bash
+limosat finalize config.yaml
+```
+
+This writes `global-trajectory-catalogue-v1.parquet` and
+`assessment-summary-v1.json`. SQLite remains the authoritative resumable run
+and contains fields, deformation, provenance, and optional retained matches.
+Parquet finalization imports PyArrow only when requested; PyArrow is not a core
+runtime dependency.
+
 The public Python entry point is direct:
 
 ```python
@@ -72,7 +87,7 @@ See [operations](docs/operations.md) for catalogue and recovery behavior,
 pending scientific and operational decision gates.
 
 Completed production CSV fields can also be composed without imagery or GPU
-inference. `scripts/replay_global_catalogue_fields.py` creates a new schema-v3
+inference. `scripts/replay_global_catalogue_fields.py` creates a new schema-v4
 SQLite catalogue and checksummed field-replay provenance file;
 `scripts/render_global_catalogue.py` creates the static distributions and
 thin-trail pan-Arctic animation. Replay products are analysis outputs outside

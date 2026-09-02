@@ -84,6 +84,7 @@ def test_global_planning_defaults_are_explicit():
     assert routing.maximum_recovery_elapsed_hours == 96.0
     assert routing.phase_correlation_failure == "same_center"
     assert routing.phase_correlation_minimum_response == 0.05
+    assert RunConfig("run", "catalogue", "database", "output").retain_pair_matches is False
     with pytest.raises(ValueError, match="pair_workers"):
         RunConfig("run", "catalogue", "database", "output", pair_workers=0)
 

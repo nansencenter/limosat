@@ -113,9 +113,17 @@ its field nodes and completion record are committed in one transaction. A
 stopped `running` or `failed` pair is safe to retry. A `complete` pair is loaded
 and never overwritten by normal resume.
 
-The output directory contains `run-manifest-v3.json`. Scientific arrays and
+The output directory contains `run-manifest-v4.json`. Scientific arrays and
 tables live in SQLite; no result products belong in Git. `limosat status`
-reports the run and pair status counts.
+reports the run and pair status counts. Assessment runs should set
+`retain_pair_matches: true`; production runs may disable it after the field
+policy is frozen.
+
+Once `limosat status` reports `complete`, run `limosat finalize CONFIG` to
+write the compact global trajectory Parquet catalogue and a checksummed
+assessment summary. This command does not alter scientific rows. Use
+`--skip-parquet` only where PyArrow is unavailable and a validation/summary
+report is sufficient.
 
 For a controlled restart under a changed configuration, choose a new `run_id`
 and database/output path. Reusing a `run_id` with a different resolved config is

@@ -4,6 +4,7 @@ database: ./outputs/limosat.sqlite
 output_directory: ./outputs
 analysis_epsg: 3413
 pair_workers: 1
+retain_pair_matches: false
 
 matcher:
   repository: /path/to/EfficientLoFTR

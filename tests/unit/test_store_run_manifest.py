@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import sqlite3
 from dataclasses import replace
@@ -35,6 +36,7 @@ def _config(tmp_path):
         catalogue=str(tmp_path / "catalogue.csv"),
         database=str(tmp_path / "run.sqlite"),
         output_directory=str(tmp_path / "products"),
+        retain_pair_matches=True,
         matcher=MatcherConfig(),
         field=FieldConfig(
             grid_spacing_m=1_000.0,
@@ -154,7 +156,7 @@ def test_sequence_recovers_measured_loss_and_resumes_with_versioned_manifest(tmp
     processor = SyntheticProcessor()
 
     first = LiMOSATRun(config, catalogue, processor).execute(["limosat", "run", "config.yaml"])
-    manifest = json.loads((tmp_path / "products" / "run-manifest-v3.json").read_text())
+    manifest = json.loads((tmp_path / "products" / "run-manifest-v4.json").read_text())
 
     assert first["computed_pairs"] == 3
     assert processor.calls == [
@@ -162,17 +164,23 @@ def test_sequence_recovers_measured_loss_and_resumes_with_versioned_manifest(tmp
         ("b__c", False, False),
         ("a__c", True, False),
     ]
-    assert manifest["manifest_schema_version"] == 3
+    assert manifest["manifest_schema_version"] == 4
     assert len(manifest["implementation_sha256"]) == 64
-    assert manifest["product_schemas"]["lagrangian_trajectory"] == 3
+    assert manifest["product_schemas"]["lagrangian_trajectory"] == 4
+    assert manifest["product_schemas"]["pair_match_archive"] == 1
     assert manifest["coordinates"]["crs"] == "EPSG:3413"
     assert manifest["product_counts"]["trajectories"] == 4
     assert manifest["product_counts"]["candidate_pairs"] == 3
     assert manifest["product_counts"]["primary_pairs"] == 2
+    assert manifest["product_counts"]["retained_pair_match_archives"] == 3
+    assert manifest["product_counts"]["retained_pair_matches"] == 0
+    assert manifest["pair_match_retention"]["enabled"] is True
     assert len(manifest["candidate_pairs"]) == 3
     assert manifest["candidate_pair_planning_counts"]["accepted_candidate_pairs"] == 3
     recovery = [pair for pair in manifest["pairs"] if pair["kind"] == "recovery"]
     assert len(recovery) == 1 and recovery[0]["targeted"] == 1
+    assert recovery[0]["retained_matches"]["encoding"] == "zlib-le-v1"
+    assert len(recovery[0]["retained_matches"]["payload_sha256"]) == 64
     assert recovery[0]["diagnostics"]["phase_correlation_status"] == "synthetic"
     assert recovery[0]["ancillary_inputs"] == {
         "/fixture.nc": "0" * 64
@@ -253,10 +261,10 @@ def test_cli_status_imports_without_loading_model(tmp_path, capsys):
 
     assert main(["status", str(config_path)]) == 0
     output = json.loads(capsys.readouterr().out)
-    assert output["run"]["schema_version"] == 3
+    assert output["run"]["schema_version"] == 4
 
 
-def test_schema_v3_is_global_and_persists_null_dormant_coordinates(tmp_path):
+def test_schema_v4_is_global_and_persists_null_dormant_coordinates(tmp_path):
     config = _config(tmp_path)
     store = RunStore(config)
     points = (
@@ -294,7 +302,7 @@ def test_schema_v3_is_global_and_persists_null_dormant_coordinates(tmp_path):
 
     assert "component_id" not in trajectory_columns
     assert dormant == (None, None)
-    assert version == 3
+    assert version == 4
 
 
 def test_legacy_database_is_rejected_without_migration(tmp_path):
@@ -302,5 +310,112 @@ def test_legacy_database_is_rejected_without_migration(tmp_path):
     with sqlite3.connect(legacy) as connection:
         connection.execute("CREATE TABLE runs(run_id TEXT PRIMARY KEY)")
 
-    with pytest.raises(ValueError, match="new schema-v3 database path and run_id"):
+    with pytest.raises(ValueError, match="new schema-v4 database path and run_id"):
         RunStore(replace(_config(tmp_path), database=str(legacy)))
+
+
+def test_retained_pair_matches_round_trip_exactly_and_are_immutable(tmp_path):
+    config = _config(tmp_path)
+    catalogue = _catalogue(tmp_path)
+    pair = catalogue.adjacent_pairs("component")[0]
+    matches = MotionMatches(
+        source_xy_m=np.array([[1.25, -2.5], [3.75, 4.5]]),
+        target_xy_m=np.array([[11.25, -1.5], [14.75, 6.5]]),
+        score=np.array([0.9, 0.7]),
+        source_tile=np.array([2, 3]),
+        target_tile=np.array([4, 5]),
+    )
+    store = RunStore(config)
+    store.register_catalogue(catalogue)
+    store.start_run()
+    assert store.claim_pair(pair, "component", "primary", False)
+    assert store.save_pair(pair, replace(_result(pair), matches=matches))
+
+    loaded = store.load_pair_matches(pair.pair_id)
+
+    assert loaded is not None
+    np.testing.assert_array_equal(loaded.source_xy_m, matches.source_xy_m)
+    np.testing.assert_array_equal(loaded.target_xy_m, matches.target_xy_m)
+    np.testing.assert_array_equal(loaded.score, matches.score)
+    np.testing.assert_array_equal(loaded.source_tile, matches.source_tile)
+    np.testing.assert_array_equal(loaded.target_tile, matches.target_tile)
+    assert loaded.source_xy_m.dtype == np.float64
+    assert loaded.source_tile.dtype == np.int32
+
+    assert not store.save_pair(
+        pair, replace(_result(pair), matches=MotionMatches.empty())
+    )
+    assert len(store.load_pair_matches(pair.pair_id)) == 2
+
+    with sqlite3.connect(config.database) as connection:
+        connection.execute(
+            "UPDATE pair_match_archives SET payload=? WHERE pair_id=?",
+            (b"corrupt", pair.pair_id),
+        )
+    with pytest.raises(ValueError, match="failed checksum"):
+        store.load_pair_matches(pair.pair_id)
+
+
+def test_pair_matches_are_not_archived_when_retention_is_disabled(tmp_path):
+    config = replace(_config(tmp_path), retain_pair_matches=False)
+    catalogue = _catalogue(tmp_path)
+    pair = catalogue.adjacent_pairs("component")[0]
+    store = RunStore(config)
+    store.register_catalogue(catalogue)
+    store.start_run()
+    assert store.claim_pair(pair, "component", "primary", False)
+    assert store.save_pair(pair, _result(pair))
+    assert store.load_pair_matches(pair.pair_id) is None
+
+
+def test_finalize_validates_complete_run_and_writes_summary_without_parquet(
+    tmp_path, capsys
+):
+    config = _config(tmp_path)
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config.to_dict()))
+    LiMOSATRun(config, _catalogue(tmp_path), SyntheticProcessor()).execute()
+
+    assert main(["finalize", str(config_path), "--skip-parquet"]) == 0
+    output = json.loads(capsys.readouterr().out)
+    report_path = Path(output["assessment_summary"])
+    report = json.loads(report_path.read_text())
+
+    assert output["trajectory_parquet"] is None
+    assert len(output["assessment_summary_sha256"]) == 64
+    assert report["sqlite_schema_version"] == 4
+    assert report["integrity"]["quick_check"] == "ok"
+    assert report["integrity"]["verified_pair_match_archives"] == 3
+    assert report["counts"]["retained_pair_match_archives"] == 3
+    assert report["raw_match_retention"]["enabled"] is True
+    assert report["products"]["trajectory_parquet"] is None
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("pyarrow") is None,
+    reason="optional Parquet runtime is not installed",
+)
+def test_finalize_writes_nullable_utc_trajectory_parquet(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    config = _config(tmp_path)
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config.to_dict()))
+    LiMOSATRun(config, _catalogue(tmp_path), SyntheticProcessor()).execute()
+
+    assert main(["finalize", str(config_path), "--batch-size", "3"]) == 0
+    path = tmp_path / "products" / "global-trajectory-catalogue-v1.parquet"
+    table = pq.read_table(path)
+
+    assert table.num_rows > 0
+    assert table.schema.field("x_m").type == pa.float64()
+    assert table.schema.field("selected_matches").type == pa.int32()
+    assert table.schema.field("time_utc").type.tz == "UTC"
+    states = table.column("state").to_pylist()
+    x_coordinates = table.column("x_m").to_pylist()
+    assert all(
+        coordinate is None
+        for state, coordinate in zip(states, x_coordinates, strict=True)
+        if state == "dormant"
+    )

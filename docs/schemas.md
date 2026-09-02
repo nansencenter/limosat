@@ -1,6 +1,6 @@
 # Product schemas
 
-## SQLite schema version 3
+## SQLite schema version 4
 
 `runs` stores the resolved configuration JSON and SHA256, a checksum of all
 LiMOSAT Python source, the checkpoint SHA256, status, UTC runtime boundaries,
@@ -27,6 +27,15 @@ stage runtimes, matcher calls, tile/phase diagnostics, ancillary SIC checksums,
 and error text. Normal execution never changes a
 row whose status is `complete`.
 
+`pair_match_archives` is optional and controlled by `retain_pair_matches`.
+For each completed image pair it stores all selected matches from the chosen
+routing hypothesis after validity, endpoint, and speed gates but before field
+consensus. Source/target EPSG:3413 coordinates and scores retain float64
+semantics; tile IDs retain int32 semantics. The fixed little-endian array
+payload is zlib-compressed and SHA256-checked. Empty completed pairs receive an
+empty archive, which makes archive coverage auditable. Normal resume cannot
+replace an archive belonging to a completed pair.
+
 `field_nodes` stores one EPSG:3413 source location per grid node:
 
 | Column | Type/unit |
@@ -52,9 +61,9 @@ trajectory identity or coordinates.
 `deformation_cells` stores primary-pair Delaunay triangle centroid and area,
 plus divergence, shear, total deformation, and vorticity in inverse seconds.
 
-## Manifest schema version 3
+## Manifest schema version 4
 
-`run-manifest-v3.json` records:
+`run-manifest-v4.json` records:
 
 - resolved config and config SHA256;
 - EfficientLoFTR checkpoint SHA256;
@@ -68,18 +77,38 @@ plus divergence, shear, total deformation, and vorticity in inverse seconds.
 - candidate planning exclusions, orbit metadata, open-water ancillary
   checksums, selected phase/same-centre routing hypothesis, actual matcher
   calls, and tile-gate counts;
-- trajectory, trajectory-point, and deformation-cell counts; and
+- trajectory, trajectory-point, and deformation-cell counts;
+- the match-retention stage, per-pair archive checksum/size, and aggregate
+  retained pair/match/byte counts; and
 - the explicit policy that sparse recovery fields are not deformation products.
 
 Product schema versions are listed independently so additive trajectory or
 deformation revisions do not silently change the pair-field contract.
+
+## Finalized trajectory catalogue version 1
+
+`limosat finalize CONFIG` requires a complete schema-v4 native run, verifies
+the recorded manifest checksum, checkpoints the SQLite WAL, and runs SQLite
+quick and foreign-key checks. It writes:
+
+- `global-trajectory-catalogue-v1.parquet`, ordered by global trajectory ID and
+  timezone-aware UTC time, with nullable float64 EPSG:3413 `x_m`/`y_m`, state,
+  position basis, source image pair, selected-match count, support radius, and
+  maximum residual; and
+- `assessment-summary-v1.json`, containing database/manifest/Parquet paths,
+  SHA256s, sizes, integrity results, scientific row counts, verified raw-match
+  archive counts, and raw-match totals.
+
+SQLite remains authoritative. The Parquet file is a compact analysis and
+transfer product, not resume state. PyArrow is loaded only by this optional
+command and is deliberately not a core dependency.
 
 ## Field-replay provenance version 1
 
 `field-replay-provenance-v1.json` is an analysis provenance record, not the
 native run manifest. It identifies the immutable production state/plan and
 ordered completed-field set, reports whether each field checksum was verified,
-records SQLite schema 3 and trajectory product schema 3, and compares the new
+records SQLite schema 4 and trajectory product schema 4, and compares the new
 global catalogue with the prior component-sharded summary. A separate
 `render-report-v1.json` records deterministic trajectory selection, frame
 timing, source checksums, and checksums for figures, MP4, and GIF outputs.

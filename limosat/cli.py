@@ -9,6 +9,7 @@ from typing import Sequence
 
 from .catalog import load_catalogue
 from .config import load_config
+from .finalize import finalize_products
 from .planning import build_candidate_plan, recovery_candidates, select_overlap_probe
 from .run import LiMOSATRun
 from .store import RunStore
@@ -33,6 +34,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="select a bounded overlap stratum; may be repeated",
     )
     plan.add_argument("--maximum-per-bin", type=int, default=5)
+    finalize = commands.add_parser(
+        "finalize", help="validate and package a completed native run"
+    )
+    finalize.add_argument("config", type=Path)
+    finalize.add_argument(
+        "--skip-parquet",
+        action="store_true",
+        help="write the assessment summary without the optional Parquet export",
+    )
+    finalize.add_argument("--batch-size", type=int, default=100_000)
     return parser
 
 
@@ -43,6 +54,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = LiMOSATRun(config).execute(["limosat", "run", str(arguments.config)])
     elif arguments.command == "status":
         result = RunStore(config).status()
+    elif arguments.command == "finalize":
+        result = finalize_products(
+            config,
+            export_parquet=not arguments.skip_parquet,
+            batch_size=arguments.batch_size,
+        )
     else:
         catalogue = load_catalogue(config.catalogue, config.analysis_epsg)
         candidate_plan = build_candidate_plan(

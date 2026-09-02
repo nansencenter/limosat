@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import zlib
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,12 +16,13 @@ import numpy as np
 from .catalog import ImageCatalogue, ImagePair
 from .config import RunConfig
 from .deformation import DeformationCell
-from .models import DisplacementField, PairResult
+from .models import DisplacementField, MotionMatches, PairResult
 from .planning import PlannedPair
 from .trajectory import ConvergenceEvent, TrajectoryPoint
 
 
-DATABASE_SCHEMA_VERSION = 3
+DATABASE_SCHEMA_VERSION = 4
+PAIR_MATCH_ENCODING = "zlib-le-v1"
 
 
 class RunStore:
@@ -251,6 +253,11 @@ class RunStore:
         """Atomically replace only incomplete state and mark completion last."""
         if pair.pair_id != result.field.pair_id:
             raise ValueError("pair identity and field identity differ")
+        match_archive = (
+            _encode_matches(result.matches)
+            if self.config.retain_pair_matches
+            else None
+        )
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -296,6 +303,30 @@ class RunStore:
                 """,
                 self._field_rows(result.field),
             )
+            connection.execute(
+                "DELETE FROM pair_match_archives WHERE run_id=? AND pair_id=?",
+                (self.config.run_id, pair.pair_id),
+            )
+            if match_archive is not None:
+                payload, payload_sha256, uncompressed_bytes = match_archive
+                connection.execute(
+                    """
+                    INSERT INTO pair_match_archives
+                    (run_id,pair_id,encoding,match_count,uncompressed_bytes,
+                     compressed_bytes,payload_sha256,payload)
+                    VALUES (?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        self.config.run_id,
+                        pair.pair_id,
+                        PAIR_MATCH_ENCODING,
+                        len(result.matches),
+                        uncompressed_bytes,
+                        len(payload),
+                        payload_sha256,
+                        payload,
+                    ),
+                )
             runtime = result.runtime_seconds
             connection.execute(
                 """
@@ -395,6 +426,33 @@ class RunStore:
             maximum_residual_m=np.asarray(
                 [np.nan if row["maximum_residual_m"] is None else row["maximum_residual_m"] for row in nodes]
             ),
+        )
+
+    def load_pair_matches(self, pair_id: str) -> MotionMatches | None:
+        """Load and verify retained post-gate, pre-consensus pair matches."""
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT archive.* FROM pair_match_archives archive
+                JOIN pairs USING(run_id,pair_id)
+                WHERE archive.run_id=? AND archive.pair_id=?
+                  AND pairs.status='complete'
+                """,
+                (self.config.run_id, pair_id),
+            ).fetchone()
+        if row is None:
+            return None
+        payload = bytes(row["payload"])
+        if hashlib.sha256(payload).hexdigest() != row["payload_sha256"]:
+            raise ValueError(f"retained pair matches failed checksum: {pair_id}")
+        if row["encoding"] != PAIR_MATCH_ENCODING:
+            raise ValueError(
+                f"unsupported retained pair-match encoding: {row['encoding']}"
+            )
+        return _decode_matches(
+            payload,
+            int(row["match_count"]),
+            int(row["uncompressed_bytes"]),
         )
 
     def replace_global_trajectories(
@@ -561,6 +619,26 @@ class RunStore:
                     (self.config.run_id,),
                 )
             ]
+            match_archives = {
+                row["pair_id"]: {
+                    key: row[key]
+                    for key in (
+                        "encoding",
+                        "match_count",
+                        "uncompressed_bytes",
+                        "compressed_bytes",
+                        "payload_sha256",
+                    )
+                }
+                for row in connection.execute(
+                    """
+                    SELECT pair_id,encoding,match_count,uncompressed_bytes,
+                           compressed_bytes,payload_sha256
+                    FROM pair_match_archives WHERE run_id=? ORDER BY pair_id
+                    """,
+                    (self.config.run_id,),
+                )
+            }
             for pair in pairs:
                 pair["diagnostics"] = json.loads(
                     pair.pop("diagnostics_json") or "{}"
@@ -568,6 +646,7 @@ class RunStore:
                 pair["ancillary_inputs"] = json.loads(
                     pair.pop("ancillary_inputs_json") or "{}"
                 )
+                pair["retained_matches"] = match_archives.get(pair["pair_id"])
             counts = dict(connection.execute(
                 """
                 SELECT
@@ -578,9 +657,15 @@ class RunStore:
                   (SELECT COUNT(*) FROM trajectory_points WHERE run_id=?) trajectory_points,
                   (SELECT COUNT(*) FROM trajectory_convergence_events
                      WHERE run_id=?) trajectory_convergence_events,
-                  (SELECT COUNT(*) FROM deformation_cells WHERE run_id=?) deformation_cells
+                  (SELECT COUNT(*) FROM deformation_cells WHERE run_id=?) deformation_cells,
+                  (SELECT COUNT(*) FROM pair_match_archives
+                     WHERE run_id=?) retained_pair_match_archives,
+                  (SELECT COALESCE(SUM(match_count),0) FROM pair_match_archives
+                     WHERE run_id=?) retained_pair_matches,
+                  (SELECT COALESCE(SUM(compressed_bytes),0) FROM pair_match_archives
+                     WHERE run_id=?) retained_pair_match_compressed_bytes
                 """,
-                (self.config.run_id,) * 6,
+                (self.config.run_id,) * 9,
             ).fetchone())
         return {
             "images": images,
@@ -621,7 +706,7 @@ class RunStore:
                 raise ValueError(
                     "unsupported LiMOSAT SQLite schema "
                     f"{version or 'legacy'}; global catalogue runs require a new "
-                    "schema-v3 database path and run_id"
+                    "schema-v4 database path and run_id"
                 )
             if not tables:
                 connection.executescript(_SCHEMA)
@@ -788,6 +873,15 @@ CREATE TABLE IF NOT EXISTS field_nodes (
   PRIMARY KEY(run_id,pair_id,node_index),
   FOREIGN KEY(run_id,pair_id) REFERENCES pairs(run_id,pair_id)
 );
+CREATE TABLE IF NOT EXISTS pair_match_archives (
+  run_id TEXT NOT NULL, pair_id TEXT NOT NULL,
+  encoding TEXT NOT NULL, match_count INTEGER NOT NULL CHECK(match_count>=0),
+  uncompressed_bytes INTEGER NOT NULL CHECK(uncompressed_bytes>=0),
+  compressed_bytes INTEGER NOT NULL CHECK(compressed_bytes>=0),
+  payload_sha256 TEXT NOT NULL, payload BLOB NOT NULL,
+  PRIMARY KEY(run_id,pair_id),
+  FOREIGN KEY(run_id,pair_id) REFERENCES pairs(run_id,pair_id)
+);
 CREATE TABLE IF NOT EXISTS trajectories (
   run_id TEXT NOT NULL, trajectory_id TEXT NOT NULL,
   seed_image_id TEXT NOT NULL, PRIMARY KEY(run_id,trajectory_id),
@@ -824,3 +918,42 @@ CREATE TABLE IF NOT EXISTS deformation_cells (
   FOREIGN KEY(run_id,pair_id) REFERENCES pairs(run_id,pair_id)
 );
 """
+
+
+def _encode_matches(matches: MotionMatches) -> tuple[bytes, str, int]:
+    arrays = (
+        np.asarray(matches.source_xy_m, dtype="<f8"),
+        np.asarray(matches.target_xy_m, dtype="<f8"),
+        np.asarray(matches.score, dtype="<f8"),
+        np.asarray(matches.source_tile, dtype="<i4"),
+        np.asarray(matches.target_tile, dtype="<i4"),
+    )
+    raw = b"".join(np.ascontiguousarray(array).tobytes() for array in arrays)
+    payload = zlib.compress(raw)
+    return payload, hashlib.sha256(payload).hexdigest(), len(raw)
+
+
+def _decode_matches(
+    payload: bytes, match_count: int, uncompressed_bytes: int
+) -> MotionMatches:
+    if match_count < 0:
+        raise ValueError("retained pair-match count cannot be negative")
+    raw = zlib.decompress(payload)
+    expected_bytes = match_count * (2 * 8 + 2 * 8 + 8 + 4 + 4)
+    if len(raw) != uncompressed_bytes or len(raw) != expected_bytes:
+        raise ValueError("retained pair-match archive has invalid length")
+    offset = 0
+
+    def take(dtype: str, count: int) -> np.ndarray:
+        nonlocal offset
+        width = np.dtype(dtype).itemsize * count
+        values = np.frombuffer(raw, dtype=dtype, count=count, offset=offset).copy()
+        offset += width
+        return values
+
+    source = take("<f8", match_count * 2).reshape(-1, 2)
+    target = take("<f8", match_count * 2).reshape(-1, 2)
+    score = take("<f8", match_count)
+    source_tile = take("<i4", match_count)
+    target_tile = take("<i4", match_count)
+    return MotionMatches(source, target, score, source_tile, target_tile)
