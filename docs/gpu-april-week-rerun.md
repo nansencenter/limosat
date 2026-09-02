@@ -69,16 +69,26 @@ rather than universal sea-ice constants.
 
 ## Full native rerun
 
-Create another new run ID/database/output path, clear `candidate_pair_ids`, set
-the selected overlap threshold, and keep `require_orbit_metadata: true` and SIC
-gating enabled. Inspect the no-GPU plan before inference:
+On Olivia, use the source-controlled preparation and submission scripts instead
+of an interactive Python heredoc. Preparation verifies the frozen source
+catalogue checksum, selects exactly 781 images, verifies every raster, stages
+only the nine required SIC files, and writes the reviewed JSON configuration.
+It refuses to replace an existing run database:
 
 ```bash
-limosat plan april-week-full.yaml > april-week-full-plan.json
-limosat run april-week-full.yaml
-limosat status april-week-full.yaml
-limosat finalize april-week-full.yaml
+cd /cluster/projects/nn9878k/seachu/limosat-efficientloftr
+python3 scripts/prepare_april_week_olivia.py --download-sic
+scripts/submit_april_week_olivia.sh
 ```
+
+The submit wrapper freezes the method revision, official EfficientLoFTR
+revision, and checkpoint checksum before submitting one GPU job. The job first
+loads a SIC field and validates the deterministic candidate plan, then runs,
+reports status, and finalizes the compact products. Re-running only the submit
+wrapper resumes immutable completed pair fields from the same schema-v4
+database. Site settings can be overridden with `GPU_ACCOUNT`, `WALL_TIME`,
+`MEMORY`, `RUN_ID`, and `RUN_ROOT`; `--dry-run` prints the exact `sbatch`
+command without submitting it.
 
 For this assessment rerun, retained matches allow later field-consensus and
 post-processing tests without repeating GPU inference. They are stored inside
