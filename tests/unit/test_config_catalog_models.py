@@ -88,6 +88,16 @@ def test_global_planning_defaults_are_explicit():
     with pytest.raises(ValueError, match="pair_workers"):
         RunConfig("run", "catalogue", "database", "output", pair_workers=0)
 
+    with pytest.raises(ValueError, match="CUDA runs require pair_workers=1"):
+        RunConfig(
+            "run",
+            "catalogue",
+            "database",
+            "output",
+            pair_workers=2,
+            matcher=MatcherConfig(device="cuda"),
+        )
+
 
 def test_catalogue_infers_sentinel_platform_and_absolute_orbit(tmp_path):
     image_name = (

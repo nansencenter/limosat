@@ -48,10 +48,11 @@ processes every selected pair. Use a separate run ID/database and clear the
 allowlist for a full run.
 
 Primary pair fields have no preceding-pair dependency and can be processed
-independently. `pair_workers` controls concurrency within one worker process;
-`limosat pairs --batch-index I --batch-count N` provides deterministic,
-non-overlapping work for multiple processes. Each worker writes an immutable
-pair product and does not write the global SQLite database.
+independently. `pair_workers` controls CPU concurrency within one process.
+CUDA configurations require `pair_workers: 1`; `limosat pairs --batch-index I
+--batch-count N` provides deterministic, non-overlapping work for one process
+per GPU. Each worker writes an immutable pair product and does not write the
+global SQLite database.
 
 ## Matching and recovery
 

@@ -190,6 +190,11 @@ class RunConfig:
             raise ValueError("LiMOSAT coordinates are fixed to EPSG:3413")
         if self.pair_workers < 1:
             raise ValueError("pair_workers must be at least one")
+        if self.matcher.device.startswith("cuda") and self.pair_workers != 1:
+            raise ValueError(
+                "CUDA runs require pair_workers=1; use deterministic "
+                "batch workers for multi-GPU execution"
+            )
         if not self.catalogue or not self.database or not self.output_directory:
             raise ValueError("catalogue, database, and output_directory are required")
 
