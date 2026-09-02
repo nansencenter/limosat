@@ -17,10 +17,10 @@ from .config import RunConfig
 from .deformation import DeformationCell
 from .models import DisplacementField, PairResult
 from .planning import PlannedPair
-from .trajectory import TrajectoryPoint
+from .trajectory import ConvergenceEvent, TrajectoryPoint
 
 
-DATABASE_SCHEMA_VERSION = 2
+DATABASE_SCHEMA_VERSION = 3
 
 
 class RunStore:
@@ -50,6 +50,8 @@ class RunStore:
                     self.config.run_id,
                     image.image_id,
                     image.component_id,
+                    image.platform,
+                    image.absolute_orbit,
                     str(image.path),
                     image.time_utc.isoformat(),
                     image.path.stat().st_size,
@@ -59,16 +61,22 @@ class RunStore:
         with closing(self._connect()) as connection, connection:
             for row in rows:
                 existing = connection.execute(
-                    "SELECT path, time_utc, sha256 FROM images WHERE run_id=? AND image_id=?",
+                    """
+                    SELECT platform,absolute_orbit,path,time_utc,sha256
+                    FROM images WHERE run_id=? AND image_id=?
+                    """,
                     row[:2],
                 ).fetchone()
-                if existing is not None and tuple(existing) != (row[3], row[4], row[6]):
+                if existing is not None and tuple(existing) != (
+                    row[3], row[4], row[5], row[6], row[8]
+                ):
                     raise ValueError(f"image identity changed during resume: {row[1]}")
                 connection.execute(
                     """
                     INSERT OR IGNORE INTO images
-                    (run_id,image_id,component_id,path,time_utc,size_bytes,sha256)
-                    VALUES (?,?,?,?,?,?,?)
+                    (run_id,image_id,component_id,platform,absolute_orbit,path,
+                     time_utc,size_bytes,sha256)
+                    VALUES (?,?,?,?,?,?,?,?,?)
                     """,
                     row,
                 )
@@ -102,6 +110,8 @@ class RunStore:
                 item.pair.target.time_utc.isoformat(),
                 item.pair.elapsed_seconds,
                 item.overlap_fraction,
+                item.overlap_area_m2,
+                item.skipped_images,
             )
             for item in values
         ]
@@ -113,7 +123,8 @@ class RunStore:
                     SELECT run_id,pair_id,ordinal,selection,planning_component_id,
                            source_component_id,target_component_id,source_image_id,
                            target_image_id,source_time_utc,target_time_utc,
-                           elapsed_seconds,overlap_fraction
+                           elapsed_seconds,overlap_fraction,overlap_area_m2,
+                           skipped_images
                     FROM candidate_pairs WHERE run_id=? ORDER BY ordinal
                     """,
                     (self.config.run_id,),
@@ -130,8 +141,37 @@ class RunStore:
                 (run_id,pair_id,ordinal,selection,planning_component_id,
                  source_component_id,target_component_id,source_image_id,
                  target_image_id,source_time_utc,target_time_utc,
-                 elapsed_seconds,overlap_fraction)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 elapsed_seconds,overlap_fraction,overlap_area_m2,skipped_images)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                rows,
+            )
+
+    def register_planning_counts(self, counts: dict[str, int]) -> None:
+        rows = [
+            (self.config.run_id, name, int(count))
+            for name, count in sorted(counts.items())
+        ]
+        with closing(self._connect()) as connection, connection:
+            existing = [
+                tuple(row)
+                for row in connection.execute(
+                    """
+                    SELECT run_id,reason,count FROM planning_counts
+                    WHERE run_id=? ORDER BY reason
+                    """,
+                    (self.config.run_id,),
+                )
+            ]
+            if existing and existing != rows:
+                raise ValueError(
+                    "candidate image-pair planning counts changed during resume; "
+                    "use a new database path and run_id"
+                )
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO planning_counts(run_id,reason,count)
+                VALUES (?,?,?)
                 """,
                 rows,
             )
@@ -223,6 +263,25 @@ class RunStore:
             if row is None:
                 connection.rollback()
                 raise ValueError("pair must be claimed before it is saved")
+            for path, checksum in sorted(result.ancillary_inputs.items()):
+                existing = connection.execute(
+                    """
+                    SELECT sha256 FROM ancillary_inputs WHERE run_id=? AND path=?
+                    """,
+                    (self.config.run_id, path),
+                ).fetchone()
+                if existing is not None and existing[0] != checksum:
+                    connection.rollback()
+                    raise ValueError(
+                        f"ancillary input changed during run: {path}"
+                    )
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO ancillary_inputs(run_id,path,sha256)
+                    VALUES (?,?,?)
+                    """,
+                    (self.config.run_id, path, checksum),
+                )
             connection.execute(
                 "DELETE FROM field_nodes WHERE run_id=? AND pair_id=?",
                 (self.config.run_id, pair.pair_id),
@@ -243,7 +302,8 @@ class RunStore:
                 UPDATE pairs SET status='complete', completed_utc=?, field_sha256=?,
                     match_count=?, node_count=?, available_node_count=?,
                     fold_rejected_count=?, matcher_calls=?, sampling_seconds=?,
-                    matching_seconds=?, field_seconds=?, total_seconds=?, error=NULL
+                    matching_seconds=?, field_seconds=?, total_seconds=?,
+                    diagnostics_json=?, ancillary_inputs_json=?, error=NULL
                 WHERE run_id=? AND pair_id=?
                 """,
                 (
@@ -258,6 +318,18 @@ class RunStore:
                     float(runtime.get("matching", 0.0)),
                     float(runtime.get("field", 0.0)),
                     float(runtime.get("total", 0.0)),
+                    json.dumps(
+                        result.diagnostics,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ),
+                    json.dumps(
+                        result.ancillary_inputs,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ),
                     self.config.run_id,
                     pair.pair_id,
                 ),
@@ -334,6 +406,10 @@ class RunStore:
         self, batches: Iterable[Iterable[TrajectoryPoint]]
     ) -> None:
         with closing(self._connect()) as connection, connection:
+            connection.execute(
+                "DELETE FROM trajectory_convergence_events WHERE run_id=?",
+                (self.config.run_id,),
+            )
             connection.execute(
                 "DELETE FROM trajectory_points WHERE run_id=?",
                 (self.config.run_id,),
@@ -419,6 +495,38 @@ class RunStore:
                 ],
             )
 
+    def replace_convergence_events(
+        self, events: Iterable[ConvergenceEvent]
+    ) -> None:
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                "DELETE FROM trajectory_convergence_events WHERE run_id=?",
+                (self.config.run_id,),
+            )
+            connection.executemany(
+                """
+                INSERT INTO trajectory_convergence_events
+                (run_id,image_id,time_utc,winner_trajectory_id,
+                 candidate_trajectory_id,separation_m,audit_radius_m,
+                 winner_observation_count,candidate_observation_count)
+                VALUES (?,?,?,?,?,?,?,?,?)
+                """,
+                [
+                    (
+                        self.config.run_id,
+                        event.image_id,
+                        event.time_utc.isoformat(),
+                        event.winner_trajectory_id,
+                        event.candidate_trajectory_id,
+                        event.separation_m,
+                        event.audit_radius_m,
+                        event.winner_observation_count,
+                        event.candidate_observation_count,
+                    )
+                    for event in events
+                ],
+            )
+
     def manifest_rows(self) -> dict[str, list[dict]]:
         with closing(self._connect()) as connection:
             images = [dict(row) for row in connection.execute(
@@ -433,6 +541,33 @@ class RunStore:
                 "SELECT * FROM candidate_pairs WHERE run_id=? ORDER BY ordinal",
                 (self.config.run_id,),
             )]
+            planning_counts = {
+                row[0]: row[1]
+                for row in connection.execute(
+                    """
+                    SELECT reason,count FROM planning_counts
+                    WHERE run_id=? ORDER BY reason
+                    """,
+                    (self.config.run_id,),
+                )
+            }
+            ancillary_inputs = [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT path,sha256 FROM ancillary_inputs
+                    WHERE run_id=? ORDER BY path
+                    """,
+                    (self.config.run_id,),
+                )
+            ]
+            for pair in pairs:
+                pair["diagnostics"] = json.loads(
+                    pair.pop("diagnostics_json") or "{}"
+                )
+                pair["ancillary_inputs"] = json.loads(
+                    pair.pop("ancillary_inputs_json") or "{}"
+                )
             counts = dict(connection.execute(
                 """
                 SELECT
@@ -441,14 +576,18 @@ class RunStore:
                      WHERE run_id=? AND selection='primary') primary_pairs,
                   (SELECT COUNT(*) FROM trajectories WHERE run_id=?) trajectories,
                   (SELECT COUNT(*) FROM trajectory_points WHERE run_id=?) trajectory_points,
+                  (SELECT COUNT(*) FROM trajectory_convergence_events
+                     WHERE run_id=?) trajectory_convergence_events,
                   (SELECT COUNT(*) FROM deformation_cells WHERE run_id=?) deformation_cells
                 """,
-                (self.config.run_id,) * 5,
+                (self.config.run_id,) * 6,
             ).fetchone())
         return {
             "images": images,
             "candidate_pairs": candidate_pairs,
             "pairs": pairs,
+            "planning_counts": planning_counts,
+            "ancillary_inputs": ancillary_inputs,
             "counts": counts,
         }
 
@@ -482,7 +621,7 @@ class RunStore:
                 raise ValueError(
                     "unsupported LiMOSAT SQLite schema "
                     f"{version or 'legacy'}; global catalogue runs require a new "
-                    "schema-v2 database path and run_id"
+                    "schema-v3 database path and run_id"
                 )
             if not tables:
                 connection.executescript(_SCHEMA)
@@ -601,8 +740,9 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE TABLE IF NOT EXISTS images (
   run_id TEXT NOT NULL, image_id TEXT NOT NULL, component_id TEXT NOT NULL,
-  path TEXT NOT NULL, time_utc TEXT NOT NULL, size_bytes INTEGER NOT NULL,
-  sha256 TEXT NOT NULL, PRIMARY KEY(run_id,image_id),
+  platform TEXT, absolute_orbit INTEGER, path TEXT NOT NULL,
+  time_utc TEXT NOT NULL, size_bytes INTEGER NOT NULL, sha256 TEXT NOT NULL,
+  PRIMARY KEY(run_id,image_id),
   FOREIGN KEY(run_id) REFERENCES runs(run_id)
 );
 CREATE TABLE IF NOT EXISTS pairs (
@@ -614,7 +754,8 @@ CREATE TABLE IF NOT EXISTS pairs (
   started_utc TEXT NOT NULL, completed_utc TEXT, field_sha256 TEXT,
   match_count INTEGER, node_count INTEGER, available_node_count INTEGER,
   fold_rejected_count INTEGER, matcher_calls INTEGER, sampling_seconds REAL,
-  matching_seconds REAL, field_seconds REAL, total_seconds REAL, error TEXT,
+  matching_seconds REAL, field_seconds REAL, total_seconds REAL,
+  diagnostics_json TEXT, ancillary_inputs_json TEXT, error TEXT,
   PRIMARY KEY(run_id,pair_id), FOREIGN KEY(run_id) REFERENCES runs(run_id)
 );
 CREATE INDEX IF NOT EXISTS pairs_run_status ON pairs(run_id,status);
@@ -625,9 +766,18 @@ CREATE TABLE IF NOT EXISTS candidate_pairs (
   source_component_id TEXT NOT NULL, target_component_id TEXT NOT NULL,
   source_image_id TEXT NOT NULL, target_image_id TEXT NOT NULL,
   source_time_utc TEXT NOT NULL, target_time_utc TEXT NOT NULL,
-  elapsed_seconds REAL NOT NULL, overlap_fraction REAL,
+  elapsed_seconds REAL NOT NULL, overlap_fraction REAL, overlap_area_m2 REAL,
+  skipped_images INTEGER NOT NULL,
   PRIMARY KEY(run_id,pair_id), UNIQUE(run_id,ordinal),
   FOREIGN KEY(run_id) REFERENCES runs(run_id)
+);
+CREATE TABLE IF NOT EXISTS planning_counts (
+  run_id TEXT NOT NULL, reason TEXT NOT NULL, count INTEGER NOT NULL,
+  PRIMARY KEY(run_id,reason), FOREIGN KEY(run_id) REFERENCES runs(run_id)
+);
+CREATE TABLE IF NOT EXISTS ancillary_inputs (
+  run_id TEXT NOT NULL, path TEXT NOT NULL, sha256 TEXT NOT NULL,
+  PRIMARY KEY(run_id,path), FOREIGN KEY(run_id) REFERENCES runs(run_id)
 );
 CREATE TABLE IF NOT EXISTS field_nodes (
   run_id TEXT NOT NULL, pair_id TEXT NOT NULL, node_index INTEGER NOT NULL,
@@ -651,6 +801,18 @@ CREATE TABLE IF NOT EXISTS trajectory_points (
   selected_matches REAL, support_radius_m REAL, maximum_residual_m REAL,
   PRIMARY KEY(run_id,trajectory_id,image_id),
   FOREIGN KEY(run_id,trajectory_id)
+    REFERENCES trajectories(run_id,trajectory_id)
+);
+CREATE TABLE IF NOT EXISTS trajectory_convergence_events (
+  run_id TEXT NOT NULL, image_id TEXT NOT NULL, time_utc TEXT NOT NULL,
+  winner_trajectory_id TEXT NOT NULL, candidate_trajectory_id TEXT NOT NULL,
+  separation_m REAL NOT NULL, audit_radius_m REAL NOT NULL,
+  winner_observation_count INTEGER NOT NULL,
+  candidate_observation_count INTEGER NOT NULL,
+  PRIMARY KEY(run_id,image_id,winner_trajectory_id,candidate_trajectory_id),
+  FOREIGN KEY(run_id,winner_trajectory_id)
+    REFERENCES trajectories(run_id,trajectory_id),
+  FOREIGN KEY(run_id,candidate_trajectory_id)
     REFERENCES trajectories(run_id,trajectory_id)
 );
 CREATE TABLE IF NOT EXISTS deformation_cells (

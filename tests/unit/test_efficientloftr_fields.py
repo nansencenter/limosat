@@ -11,6 +11,7 @@ from limosat import (
     ImagePair,
     ImageRecord,
     MatcherConfig,
+    OpenWaterConfig,
     RoutingConfig,
     RunConfig,
     TrajectoryConfig,
@@ -19,6 +20,7 @@ from limosat import (
 from limosat.efficientloftr import speed_limit_mask
 from limosat.imagery import north_up_patch, projected_coordinates
 from limosat.pairs import PairProcessor
+from limosat.routing import CoarseTranslation
 
 
 class TranslationMatcher:
@@ -38,6 +40,15 @@ class StationaryMatcher(TranslationMatcher):
     def match(self, source, target):
         source_px, _target_px, score = super().match(source, target)
         return source_px, source_px.copy(), score
+
+
+class CountingMatcher(StationaryMatcher):
+    def __init__(self):
+        self.calls = 0
+
+    def match(self, source, target):
+        self.calls += 1
+        return super().match(source, target)
 
 
 def _write_image(path):
@@ -125,6 +136,56 @@ def test_empty_matches_remain_missing_not_zero(tmp_path):
 
     assert not result.field.available.any()
     assert np.isnan(result.field.displacement_m).all()
+
+
+def test_low_overlap_phase_failure_falls_back_without_losing_pair(tmp_path):
+    config = _config(tmp_path)
+    config = RunConfig(
+        **{
+            **config.__dict__,
+            "routing": RoutingConfig(
+                initial="phase_correlation", residual_edge_recovery=False
+            ),
+        }
+    )
+
+    result = PairProcessor(config, TranslationMatcher()).process(_pair(tmp_path))
+
+    assert result.matcher_calls > 0
+    assert result.diagnostics["phase_correlation_status"] == "same_center_fallback"
+
+
+def test_low_response_phase_is_compared_with_same_center(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    config = RunConfig(
+        **{
+            **config.__dict__,
+            "routing": RoutingConfig(
+                initial="phase_correlation",
+                phase_correlation_minimum_response=0.05,
+                residual_edge_recovery=False,
+            ),
+        }
+    )
+    phase_calls = []
+
+    def low_response(*args, **kwargs):
+        phase_calls.append((args, kwargs))
+        return CoarseTranslation((1_000.0, 0.0), 0.01, 0.5)
+
+    monkeypatch.setattr("limosat.pairs.coarse_phase_translation", low_response)
+    matcher = CountingMatcher()
+
+    result = PairProcessor(config, matcher).process(_pair(tmp_path))
+
+    assert len(phase_calls) == 1
+    assert result.diagnostics["routing_hypotheses_evaluated"] == 2
+    assert result.diagnostics["selected_routing_hypothesis"] == "same_center"
+    assert result.diagnostics["phase_correlation_status"] == (
+        "low_response_same_center_selected"
+    )
+    assert result.matcher_calls == matcher.calls
+    assert result.matcher_calls > result.diagnostics["planned_tiles"]
 
 
 def test_speed_limit_uses_elapsed_seconds_and_metres_per_day():

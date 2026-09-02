@@ -15,9 +15,13 @@ from .efficientloftr import EfficientLoFTR
 from .manifest import write_manifest
 from .models import FieldEdge
 from .pairs import PairProcessor
-from .planning import plan_candidate_pairs, recovery_candidates
+from .planning import build_candidate_plan, recovery_candidates
 from .store import RunStore
-from .trajectory import build_trajectories, targeted_recovery_positions
+from .trajectory import (
+    audit_trajectory_convergence,
+    build_trajectories,
+    targeted_recovery_positions,
+)
 
 
 class LiMOSATRun:
@@ -41,9 +45,18 @@ class LiMOSATRun:
     def execute(self, command: Sequence[str] | None = None) -> dict:
         started_clock = time.perf_counter()
         started_utc = datetime.now(timezone.utc)
-        planned = plan_candidate_pairs(self.catalogue, self.config.routing)
+        candidate_plan = build_candidate_plan(
+            self.catalogue,
+            self.config.routing,
+            grid_spacing_m=self.config.field.grid_spacing_m,
+            maximum_speed_m_per_day=(
+                self.config.matcher.maximum_speed_m_per_day
+            ),
+        )
+        planned = candidate_plan.pairs
         self.store.register_catalogue(self.catalogue)
         self.store.register_candidate_pairs(planned)
+        self.store.register_planning_counts(candidate_plan.exclusion_counts)
         self.store.start_run()
         resumed_pairs = 0
         computed_pairs = 0
@@ -74,7 +87,10 @@ class LiMOSATRun:
             if self.config.routing.targeted_recovery:
                 recovery_work = []
                 for item in recovery_candidates(
-                    planned, self.config.routing.maximum_skip_images
+                    planned,
+                    maximum_elapsed_hours=(
+                        self.config.routing.maximum_recovery_elapsed_hours
+                    ),
                 ):
                     positions = targeted_recovery_positions(
                         trajectories,
@@ -90,14 +106,16 @@ class LiMOSATRun:
                     recovery_results = tuple(
                         pool.map(self._obtain_recovery, recovery_work)
                     )
-                for field, resumed in recovery_results:
+                for (item, _positions), (field, resumed) in zip(
+                    recovery_work, recovery_results, strict=True
+                ):
                     resumed_pairs += int(resumed)
                     computed_pairs += int(not resumed)
                     edges.append(
                         FieldEdge(
                             field,
                             pair_kind="recovery",
-                            skipped_images=1,
+                            skipped_images=item.skipped_images,
                         )
                     )
                 trajectories = build_trajectories(
@@ -107,6 +125,15 @@ class LiMOSATRun:
                     self.config.trajectories,
                 )
             self.store.replace_global_trajectories(trajectories)
+            convergence_events = (
+                audit_trajectory_convergence(
+                    trajectories,
+                    self.config.trajectories.convergence_audit_radius_m,
+                )
+                if self.config.trajectories.convergence_audit_radius_m is not None
+                else ()
+            )
+            self.store.replace_convergence_events(convergence_events)
             for field in primary_fields:
                 self.store.replace_deformation(
                     field.pair_id,

@@ -9,6 +9,8 @@ from limosat import (
     FieldEdge,
     ImageRecord,
     TrajectoryConfig,
+    TrajectoryPoint,
+    audit_trajectory_convergence,
     build_trajectories,
 )
 from limosat.deformation import deformation_from_field
@@ -244,3 +246,19 @@ def test_deformation_uses_inverse_seconds_and_known_affine_gradient():
     assert len(cells) == 2
     np.testing.assert_allclose([cell.divergence_s_1 for cell in cells], 0.03 / 86_400.0)
     np.testing.assert_allclose([cell.shear_s_1 for cell in cells], 0.01 / 86_400.0)
+
+
+def test_convergence_inherits_ranking_but_does_not_merge_trajectories():
+    points = (
+        TrajectoryPoint("long", "a", START, "created", "seed_grid", 0.0, 0.0, None),
+        TrajectoryPoint("long", "b", START + timedelta(days=1), "observed", "primary_pair_field", 100.0, 0.0, "a__b", selected_matches=8),
+        TrajectoryPoint("short", "b", START + timedelta(days=1), "created", "seed_grid", 150.0, 0.0, None),
+    )
+
+    events = audit_trajectory_convergence(points, 100.0)
+
+    assert len(events) == 1
+    assert events[0].winner_trajectory_id == "long"
+    assert events[0].candidate_trajectory_id == "short"
+    assert events[0].separation_m == 50.0
+    assert {point.trajectory_id for point in points} == {"long", "short"}

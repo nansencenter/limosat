@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +26,8 @@ class ImageRecord:
     time_utc: datetime
     component_id: str = "default"
     footprint: BaseGeometry | None = None
+    platform: str | None = None
+    absolute_orbit: int | None = None
 
     def __post_init__(self) -> None:
         if not self.image_id.strip():
@@ -35,6 +38,25 @@ class ImageRecord:
             raise ValueError("image chronology must be timezone-aware")
         object.__setattr__(self, "time_utc", self.time_utc.astimezone(timezone.utc))
         object.__setattr__(self, "path", Path(self.path).expanduser().resolve())
+        if self.platform is not None:
+            platform = str(self.platform).strip().upper()
+            if not platform:
+                raise ValueError("platform cannot be blank")
+            object.__setattr__(self, "platform", platform)
+        if self.absolute_orbit is not None:
+            orbit = int(self.absolute_orbit)
+            if orbit <= 0:
+                raise ValueError("absolute_orbit must be positive")
+            object.__setattr__(self, "absolute_orbit", orbit)
+
+    def same_acquisition_pass(self, other: "ImageRecord") -> bool:
+        """Return true only for an identified platform and absolute orbit."""
+        return (
+            self.platform is not None
+            and self.absolute_orbit is not None
+            and self.platform == other.platform
+            and self.absolute_orbit == other.absolute_orbit
+        )
 
 
 @dataclass(frozen=True)
@@ -94,6 +116,7 @@ def load_catalogue(path: str | Path, analysis_epsg: int = 3413) -> ImageCatalogu
         rows = []
         for feature in document.get("features", []):
             row = dict(feature.get("properties") or {})
+            row["feature_id"] = feature.get("id")
             geometry = feature.get("geometry")
             row["footprint"] = None if geometry is None else shape(geometry)
             rows.append(row)
@@ -115,8 +138,13 @@ def load_catalogue(path: str | Path, analysis_epsg: int = 3413) -> ImageCatalogu
     records = []
     for row in rows:
         row = dict(row)
+        row["image_id"] = (
+            row.get("scene_id") or row.get("image_id") or row.get("feature_id")
+        )
         row["path"] = row.get("path") or row.get("filepath")
-        row["time_utc"] = row.get("time_utc") or row.get("timestamp")
+        row["time_utc"] = (
+            row.get("time_utc") or row.get("timestamp") or row.get("datetime")
+        )
         missing = [
             name for name in ("image_id", "path", "time_utc") if not row.get(name)
         ]
@@ -135,6 +163,8 @@ def load_catalogue(path: str | Path, analysis_epsg: int = 3413) -> ImageCatalogu
                 time_utc=_parse_utc(str(row["time_utc"])),
                 component_id=str(row.get("component_id") or "default"),
                 footprint=footprint,
+                platform=_platform(row),
+                absolute_orbit=_absolute_orbit(row),
             )
         )
     return ImageCatalogue(records)
@@ -155,3 +185,38 @@ def _geojson_epsg(document: dict) -> int:
         return int(name.rsplit(":", 1)[-1])
     except ValueError as error:
         raise ValueError(f"unsupported GeoJSON CRS: {name}") from error
+
+
+_SENTINEL1_ID = re.compile(
+    r"^(S1[A-D])_.*_\d{8}T\d{6}_\d{8}T\d{6}_(\d{6})_"
+)
+
+
+def _scene_identity(row: dict) -> tuple[str | None, int | None]:
+    values = (
+        row.get("scene_id"),
+        row.get("filename"),
+        row.get("image_id"),
+        Path(str(row.get("path") or row.get("filepath") or "")).name,
+    )
+    for value in values:
+        match = _SENTINEL1_ID.match(str(value or ""))
+        if match is not None:
+            return match.group(1), int(match.group(2))
+    return None, None
+
+
+def _platform(row: dict) -> str | None:
+    explicit = row.get("platform") or row.get("satellite")
+    return str(explicit) if explicit else _scene_identity(row)[0]
+
+
+def _absolute_orbit(row: dict) -> int | None:
+    explicit = (
+        row.get("absolute_orbit")
+        or row.get("orbit_number")
+        or row.get("orbit_num")
+    )
+    if explicit not in (None, ""):
+        return int(explicit)
+    return _scene_identity(row)[1]

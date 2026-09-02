@@ -128,7 +128,7 @@ def main() -> int:
             "time": "timezone-aware UTC",
         },
         "product_schemas": {
-            "sqlite": 2,
+            "sqlite": 3,
             "lagrangian_trajectory": 3,
             "field_replay_provenance": 1,
         },
@@ -182,19 +182,25 @@ def _register_source_inventory(store, replay) -> None:
     run_id = store.config.run_id
     image_by_id = {image.image_id: image for image in replay.images}
     inventory = {row["scene_id"]: row for row in replay.scene_inventory}
+    image_index = {
+        image.image_id: index for index, image in enumerate(replay.images)
+    }
     with sqlite3.connect(store.path) as connection:
         connection.execute("PRAGMA foreign_keys=ON")
         connection.executemany(
             """
             INSERT INTO images
-            (run_id,image_id,component_id,path,time_utc,size_bytes,sha256)
-            VALUES (?,?,?,?,?,?,?)
+            (run_id,image_id,component_id,platform,absolute_orbit,path,time_utc,
+             size_bytes,sha256)
+            VALUES (?,?,?,?,?,?,?,?,?)
             """,
             [
                 (
                     run_id,
                     image.image_id,
                     image.component_id,
+                    image.platform,
+                    image.absolute_orbit,
                     inventory[image.image_id]["relative_path"],
                     image.time_utc.isoformat(),
                     inventory[image.image_id]["size_bytes"],
@@ -218,8 +224,8 @@ def _register_source_inventory(store, replay) -> None:
                 (run_id,pair_id,ordinal,selection,planning_component_id,
                  source_component_id,target_component_id,source_image_id,
                  target_image_id,source_time_utc,target_time_utc,
-                 elapsed_seconds,overlap_fraction)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 elapsed_seconds,overlap_fraction,overlap_area_m2,skipped_images)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     run_id,
@@ -235,6 +241,10 @@ def _register_source_inventory(store, replay) -> None:
                     field.target_time_utc.isoformat(),
                     elapsed,
                     source.overlap_fraction,
+                    None,
+                    image_index[field.target_image_id]
+                    - image_index[field.source_image_id]
+                    - 1,
                 ),
             )
             connection.execute(

@@ -79,17 +79,27 @@ class RoutingConfig:
         "sequential_local"
     )
     initial: Literal["same_center", "phase_correlation"] = "phase_correlation"
+    phase_correlation_failure: Literal["same_center", "error"] = "same_center"
+    phase_correlation_minimum_response: float = 0.05
     residual_edge_recovery: bool = True
     targeted_recovery: bool = True
-    maximum_skip_images: int = 1
+    maximum_recovery_elapsed_hours: float = 96.0
     targeted_selection_buffer_m: float = 6_400.0
     candidate_minimum_elapsed_hours: float = 1.0
     candidate_maximum_elapsed_hours: float = 96.0
-    candidate_minimum_overlap_fraction: float = 0.25
+    candidate_minimum_overlap_fraction: float = 0.05
+    candidate_minimum_overlap_area_m2: float = 1_024_000_000.0
+    exclude_same_acquisition_pass: bool = True
+    require_orbit_metadata: bool = False
+    candidate_pair_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if self.maximum_skip_images < 0:
-            raise ValueError("maximum_skip_images cannot be negative")
+        if not 0 <= self.phase_correlation_minimum_response <= 1:
+            raise ValueError(
+                "phase_correlation_minimum_response must be in [0, 1]"
+            )
+        if self.maximum_recovery_elapsed_hours <= 0:
+            raise ValueError("maximum_recovery_elapsed_hours must be positive")
         if self.targeted_selection_buffer_m <= 0:
             raise ValueError("targeted_selection_buffer_m must be positive")
         if self.candidate_minimum_elapsed_hours <= 0:
@@ -105,6 +115,34 @@ class RoutingConfig:
             raise ValueError(
                 "candidate_minimum_overlap_fraction must be in (0, 1]"
             )
+        if self.candidate_minimum_overlap_area_m2 < 0:
+            raise ValueError("candidate_minimum_overlap_area_m2 cannot be negative")
+        object.__setattr__(
+            self,
+            "candidate_pair_ids",
+            tuple(sorted(set(self.candidate_pair_ids))),
+        )
+
+
+@dataclass(frozen=True)
+class OpenWaterConfig:
+    """Conservative ancillary sea-ice-concentration compute gate."""
+
+    enabled: bool = False
+    sic_root: str = ""
+    threshold_percent: float = 15.0
+    maximum_age_days: int = 1
+    samples_per_axis: int = 5
+
+    def __post_init__(self) -> None:
+        if self.enabled and not self.sic_root:
+            raise ValueError("open_water.sic_root is required when enabled")
+        if not 0 <= self.threshold_percent <= 100:
+            raise ValueError("open-water threshold_percent must be in [0, 100]")
+        if self.maximum_age_days < 0:
+            raise ValueError("open-water maximum_age_days cannot be negative")
+        if self.samples_per_axis < 2:
+            raise ValueError("open-water samples_per_axis must be at least two")
 
 
 @dataclass(frozen=True)
@@ -113,10 +151,16 @@ class TrajectoryConfig:
 
     add_as_coverage_enters: bool = True
     new_point_exclusion_radius_m: float = 2_000.0
+    convergence_audit_radius_m: float | None = None
 
     def __post_init__(self) -> None:
         if self.new_point_exclusion_radius_m <= 0:
             raise ValueError("new_point_exclusion_radius_m must be positive")
+        if (
+            self.convergence_audit_radius_m is not None
+            and self.convergence_audit_radius_m <= 0
+        ):
+            raise ValueError("convergence_audit_radius_m must be positive")
 
 
 @dataclass(frozen=True)
@@ -132,6 +176,7 @@ class RunConfig:
     matcher: MatcherConfig = dataclass_field(default_factory=MatcherConfig)
     field: FieldConfig = dataclass_field(default_factory=FieldConfig)
     routing: RoutingConfig = dataclass_field(default_factory=RoutingConfig)
+    open_water: OpenWaterConfig = dataclass_field(default_factory=OpenWaterConfig)
     trajectories: TrajectoryConfig = dataclass_field(
         default_factory=TrajectoryConfig
     )
@@ -186,6 +231,12 @@ def load_config(path: str | Path) -> RunConfig:
     resolved["matcher"] = _construct(MatcherConfig, matcher_values)
     resolved["field"] = _construct(FieldConfig, resolved.get("field", {}))
     resolved["routing"] = _construct(RoutingConfig, resolved.get("routing", {}))
+    open_water_values = dict(resolved.get("open_water", {}))
+    if open_water_values.get("sic_root"):
+        open_water_values["sic_root"] = str(
+            _resolve_path(base, open_water_values["sic_root"])
+        )
+    resolved["open_water"] = _construct(OpenWaterConfig, open_water_values)
     resolved["trajectories"] = _construct(
         TrajectoryConfig, resolved.get("trajectories", {})
     )

@@ -141,12 +141,12 @@ def test_replay_script_creates_new_global_sqlite_product(tmp_path):
     assert "global-trajectories.sqlite" in completed.stdout
     report = json.loads((output / "field-replay-provenance-v1.json").read_text())
     assert report["label"].startswith("FIELD REPLAY")
-    assert report["product_schemas"]["sqlite"] == 2
+    assert report["product_schemas"]["sqlite"] == 3
     assert report["source"]["completed_primary_fields"] == 1
     assert report["global_statistics"]["trajectory_count"] == 3
     assert report["global_statistics"]["trajectory_point_count"] == 6
     with sqlite3.connect(output / "global-trajectories.sqlite") as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         assert connection.execute(
             "SELECT COUNT(*) FROM trajectory_points WHERE x_m IS NULL OR y_m IS NULL"
         ).fetchone()[0] == 0

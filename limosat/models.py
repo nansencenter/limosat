@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal
 
@@ -143,6 +143,8 @@ class PairResult:
     fold_rejected_indices: np.ndarray
     runtime_seconds: dict[str, float]
     matcher_calls: int
+    diagnostics: dict[str, int | float | str | None] = field(default_factory=dict)
+    ancillary_inputs: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

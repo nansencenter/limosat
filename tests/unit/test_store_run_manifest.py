@@ -90,6 +90,8 @@ def _result(pair, available=True):
         np.empty(0, dtype=int),
         {"sampling": 0.1, "matching": 0.2, "field": 0.01, "total": 0.31},
         1,
+        {"phase_correlation_status": "synthetic"},
+        {"/fixture.nc": "0" * 64},
     )
 
 
@@ -152,7 +154,7 @@ def test_sequence_recovers_measured_loss_and_resumes_with_versioned_manifest(tmp
     processor = SyntheticProcessor()
 
     first = LiMOSATRun(config, catalogue, processor).execute(["limosat", "run", "config.yaml"])
-    manifest = json.loads((tmp_path / "products" / "run-manifest-v2.json").read_text())
+    manifest = json.loads((tmp_path / "products" / "run-manifest-v3.json").read_text())
 
     assert first["computed_pairs"] == 3
     assert processor.calls == [
@@ -160,7 +162,7 @@ def test_sequence_recovers_measured_loss_and_resumes_with_versioned_manifest(tmp
         ("b__c", False, False),
         ("a__c", True, False),
     ]
-    assert manifest["manifest_schema_version"] == 2
+    assert manifest["manifest_schema_version"] == 3
     assert len(manifest["implementation_sha256"]) == 64
     assert manifest["product_schemas"]["lagrangian_trajectory"] == 3
     assert manifest["coordinates"]["crs"] == "EPSG:3413"
@@ -168,8 +170,16 @@ def test_sequence_recovers_measured_loss_and_resumes_with_versioned_manifest(tmp
     assert manifest["product_counts"]["candidate_pairs"] == 3
     assert manifest["product_counts"]["primary_pairs"] == 2
     assert len(manifest["candidate_pairs"]) == 3
+    assert manifest["candidate_pair_planning_counts"]["accepted_candidate_pairs"] == 3
     recovery = [pair for pair in manifest["pairs"] if pair["kind"] == "recovery"]
     assert len(recovery) == 1 and recovery[0]["targeted"] == 1
+    assert recovery[0]["diagnostics"]["phase_correlation_status"] == "synthetic"
+    assert recovery[0]["ancillary_inputs"] == {
+        "/fixture.nc": "0" * 64
+    }
+    assert manifest["ancillary_inputs"] == [
+        {"path": "/fixture.nc", "sha256": "0" * 64}
+    ]
 
     second = LiMOSATRun(config, catalogue, FailingProcessor()).execute()
 
@@ -243,10 +253,10 @@ def test_cli_status_imports_without_loading_model(tmp_path, capsys):
 
     assert main(["status", str(config_path)]) == 0
     output = json.loads(capsys.readouterr().out)
-    assert output["run"]["schema_version"] == 2
+    assert output["run"]["schema_version"] == 3
 
 
-def test_schema_v2_is_global_and_persists_null_dormant_coordinates(tmp_path):
+def test_schema_v3_is_global_and_persists_null_dormant_coordinates(tmp_path):
     config = _config(tmp_path)
     store = RunStore(config)
     points = (
@@ -284,7 +294,7 @@ def test_schema_v2_is_global_and_persists_null_dormant_coordinates(tmp_path):
 
     assert "component_id" not in trajectory_columns
     assert dormant == (None, None)
-    assert version == 2
+    assert version == 3
 
 
 def test_legacy_database_is_rejected_without_migration(tmp_path):
@@ -292,5 +302,5 @@ def test_legacy_database_is_rejected_without_migration(tmp_path):
     with sqlite3.connect(legacy) as connection:
         connection.execute("CREATE TABLE runs(run_id TEXT PRIMARY KEY)")
 
-    with pytest.raises(ValueError, match="new schema-v2 database path and run_id"):
+    with pytest.raises(ValueError, match="new schema-v3 database path and run_id"):
         RunStore(replace(_config(tmp_path), database=str(legacy)))

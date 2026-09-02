@@ -29,14 +29,28 @@ field:
 routing:
   mode: sequential_local
   initial: phase_correlation
+  phase_correlation_failure: same_center
+  phase_correlation_minimum_response: 0.05
   residual_edge_recovery: true
   targeted_recovery: true
-  maximum_skip_images: 1
+  maximum_recovery_elapsed_hours: 96.0
   targeted_selection_buffer_m: 6400.0
   candidate_minimum_elapsed_hours: 1.0
   candidate_maximum_elapsed_hours: 96.0
-  candidate_minimum_overlap_fraction: 0.25
+  candidate_minimum_overlap_fraction: 0.05
+  candidate_minimum_overlap_area_m2: 1024000000.0
+  exclude_same_acquisition_pass: true
+  require_orbit_metadata: false
+  candidate_pair_ids: []
+
+open_water:
+  enabled: false
+  sic_root: /path/to/osi-saf-sea-ice-concentration
+  threshold_percent: 15.0
+  maximum_age_days: 1
+  samples_per_axis: 5
 
 trajectories:
   add_as_coverage_enters: true
   new_point_exclusion_radius_m: 2000.0
+  convergence_audit_radius_m: null

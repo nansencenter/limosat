@@ -4,6 +4,7 @@ from .catalog import ImageCatalogue, ImagePair, ImageRecord, load_catalogue
 from .config import (
     FieldConfig,
     MatcherConfig,
+    OpenWaterConfig,
     RoutingConfig,
     RunConfig,
     TrajectoryConfig,
@@ -13,10 +14,18 @@ from .models import DisplacementField, FieldEdge, MotionMatches, PairResult
 from .deformation import DeformationCell, deformation_from_field
 from .efficientloftr import EfficientLoFTR
 from .pairs import PairProcessor
-from .planning import PlannedPair, plan_candidate_pairs
+from .planning import (
+    CandidatePlan,
+    PlannedPair,
+    build_candidate_plan,
+    plan_candidate_pairs,
+    select_overlap_probe,
+)
 from .replay import load_production_field_replay
 from .trajectory import (
+    ConvergenceEvent,
     TrajectoryPoint,
+    audit_trajectory_convergence,
     build_trajectories,
     compose_global_trajectories,
     iter_global_trajectory_points,
@@ -34,10 +43,13 @@ __all__ = [
     "ImagePair",
     "ImageRecord",
     "MatcherConfig",
+    "OpenWaterConfig",
     "LiMOSATRun",
     "MotionMatches",
     "PairResult",
     "PairProcessor",
+    "CandidatePlan",
+    "ConvergenceEvent",
     "PlannedPair",
     "RoutingConfig",
     "RunConfig",
@@ -45,6 +57,8 @@ __all__ = [
     "TrajectoryConfig",
     "TrajectoryPoint",
     "build_trajectories",
+    "build_candidate_plan",
+    "audit_trajectory_convergence",
     "compose_global_trajectories",
     "iter_global_trajectory_points",
     "deformation_from_field",
@@ -52,4 +66,5 @@ __all__ = [
     "load_config",
     "load_production_field_replay",
     "plan_candidate_pairs",
+    "select_overlap_probe",
 ]

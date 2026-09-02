@@ -50,6 +50,20 @@ class TrajectoryPoint:
 
 
 @dataclass(frozen=True)
+class ConvergenceEvent:
+    """Non-destructive evidence that two measured parcel positions converge."""
+
+    image_id: str
+    time_utc: datetime
+    winner_trajectory_id: str
+    candidate_trajectory_id: str
+    separation_m: float
+    audit_radius_m: float
+    winner_observation_count: int
+    candidate_observation_count: int
+
+
+@dataclass(frozen=True)
 class _Continuation:
     source_step: int
     edge: FieldEdge
@@ -223,6 +237,113 @@ def targeted_recovery_positions(
         return np.empty((0, 2), dtype=np.float64)
     return np.asarray(
         [[point.x_m, point.y_m] for point in selected], dtype=np.float64
+    )
+
+
+def audit_trajectory_convergence(
+    points: Sequence[TrajectoryPoint], radius_m: float
+) -> tuple[ConvergenceEvent, ...]:
+    """Apply production-style deterministic ranking without merging identities."""
+    if radius_m <= 0:
+        raise ValueError("convergence audit radius must be positive")
+    ordered = sorted(points, key=lambda point: (point.time_utc, point.image_id))
+    observation_count: dict[str, int] = {}
+    events: list[ConvergenceEvent] = []
+    start = 0
+    while start < len(ordered):
+        key = (ordered[start].time_utc, ordered[start].image_id)
+        end = start
+        while end < len(ordered) and (
+            ordered[end].time_utc, ordered[end].image_id
+        ) == key:
+            end += 1
+        frame = ordered[start:end]
+        measured = [point for point in frame if point.available]
+        for point in measured:
+            observation_count[point.trajectory_id] = (
+                observation_count.get(point.trajectory_id, 0) + 1
+            )
+        if len(measured) > 1:
+            coordinates = np.asarray(
+                [[point.x_m, point.y_m] for point in measured], dtype=np.float64
+            )
+            pairs = cKDTree(coordinates).query_pairs(radius_m, output_type="ndarray")
+            for cluster in _index_clusters(len(measured), pairs):
+                ranked = sorted(
+                    cluster,
+                    key=lambda index: _convergence_rank(
+                        measured[index], observation_count
+                    ),
+                )
+                winner = measured[ranked[0]]
+                winner_xy = coordinates[ranked[0]]
+                for index in ranked[1:]:
+                    candidate = measured[index]
+                    events.append(
+                        ConvergenceEvent(
+                            image_id=key[1],
+                            time_utc=key[0],
+                            winner_trajectory_id=winner.trajectory_id,
+                            candidate_trajectory_id=candidate.trajectory_id,
+                            separation_m=float(
+                                np.linalg.norm(coordinates[index] - winner_xy)
+                            ),
+                            audit_radius_m=float(radius_m),
+                            winner_observation_count=observation_count[
+                                winner.trajectory_id
+                            ],
+                            candidate_observation_count=observation_count[
+                                candidate.trajectory_id
+                            ],
+                        )
+                    )
+        start = end
+    return tuple(
+        sorted(
+            events,
+            key=lambda event: (
+                event.time_utc,
+                event.image_id,
+                event.winner_trajectory_id,
+                event.candidate_trajectory_id,
+            ),
+        )
+    )
+
+
+def _convergence_rank(
+    point: TrajectoryPoint, observation_count: dict[str, int]
+) -> tuple:
+    selected = point.selected_matches
+    residual = point.maximum_residual_m
+    return (
+        -observation_count[point.trajectory_id],
+        -(selected if selected is not None and np.isfinite(selected) else 0.0),
+        residual if residual is not None and np.isfinite(residual) else np.inf,
+        point.trajectory_id,
+    )
+
+
+def _index_clusters(count: int, pairs: np.ndarray) -> tuple[tuple[int, ...], ...]:
+    parents = list(range(count))
+
+    def root(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    for left, right in np.asarray(pairs, dtype=int).reshape(-1, 2):
+        left_root, right_root = root(int(left)), root(int(right))
+        if left_root != right_root:
+            parents[max(left_root, right_root)] = min(left_root, right_root)
+    grouped: dict[int, list[int]] = {}
+    for index in range(count):
+        grouped.setdefault(root(index), []).append(index)
+    return tuple(
+        tuple(indices)
+        for _label, indices in sorted(grouped.items())
+        if len(indices) > 1
     )
 
 

@@ -23,6 +23,10 @@ class CoarseTranslation:
     overlap_fraction: float
 
 
+class CoarseTranslationUnavailable(ValueError):
+    """The image pair has too little valid support for phase correlation."""
+
+
 def tile_shifts(
     centers_xy_m: np.ndarray,
     routing: RoutingConfig,
@@ -70,7 +74,7 @@ def coarse_phase_translation(
     elapsed_seconds: float,
 ) -> CoarseTranslation:
     if domain.is_empty:
-        raise ValueError("coarse translation domain cannot be empty")
+        raise CoarseTranslationUnavailable("coarse translation domain cannot be empty")
     minx, miny, maxx, maxy = domain.bounds
     maximum_displacement_m = matcher.maximum_displacement_m(elapsed_seconds)
     required_extent = max(maxx - minx, maxy - miny) + 2 * maximum_displacement_m
@@ -81,7 +85,9 @@ def coarse_phase_translation(
     target, target_valid = north_up_patch(target_path, center, pixels, pixel_size, transform_grid_spacing_px=matcher.transform_grid_spacing_px)
     overlap = source_valid & target_valid
     if overlap.sum() < 64:
-        raise ValueError("coarse translation has insufficient valid overlap")
+        raise CoarseTranslationUnavailable(
+            "coarse translation has insufficient valid overlap"
+        )
     normalized = []
     for image in (source, target):
         values = image[overlap].astype(np.float32)

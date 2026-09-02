@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import json
 
 import numpy as np
 import pytest
@@ -10,6 +11,7 @@ from limosat import (
     MatcherConfig,
     RoutingConfig,
     RunConfig,
+    load_catalogue,
 )
 
 
@@ -77,6 +79,63 @@ def test_global_planning_defaults_are_explicit():
     routing = RoutingConfig()
     assert routing.candidate_minimum_elapsed_hours == 1.0
     assert routing.candidate_maximum_elapsed_hours == 96.0
-    assert routing.candidate_minimum_overlap_fraction == 0.25
+    assert routing.candidate_minimum_overlap_fraction == 0.05
+    assert routing.candidate_minimum_overlap_area_m2 == 1_024_000_000.0
+    assert routing.maximum_recovery_elapsed_hours == 96.0
+    assert routing.phase_correlation_failure == "same_center"
+    assert routing.phase_correlation_minimum_response == 0.05
     with pytest.raises(ValueError, match="pair_workers"):
         RunConfig("run", "catalogue", "database", "output", pair_workers=0)
+
+
+def test_catalogue_infers_sentinel_platform_and_absolute_orbit(tmp_path):
+    image_name = (
+        "S1A_EW_GRDM_1SDH_20200401T010212_20200401T010317_031927_"
+        "03AFA9_98E7.tiff"
+    )
+    catalogue_path = tmp_path / "catalogue.csv"
+    catalogue_path.write_text(
+        "image_id,path,time_utc\n"
+        f"{image_name},{image_name},2020-04-01T01:02:12Z\n",
+        encoding="utf-8",
+    )
+
+    record = load_catalogue(catalogue_path).records[0]
+
+    assert record.platform == "S1A"
+    assert record.absolute_orbit == 31_927
+
+
+def test_catalogue_accepts_production_stac_properties(tmp_path):
+    name = (
+        "S1B_EW_GRDM_1SDH_20200402T023322_20200402T023422_020959_"
+        "027C1C_7BBA"
+    )
+    path = tmp_path / "catalogue.geojson"
+    path.write_text(
+        json.dumps(
+            {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "id": name,
+                        "geometry": None,
+                        "properties": {
+                            "scene_id": name,
+                            "filepath": "/data/" + name + ".tiff",
+                            "datetime": "2020-04-02T02:33:22Z",
+                            "orbit_num": 20959,
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    record = load_catalogue(path).records[0]
+
+    assert record.image_id == name
+    assert record.platform == "S1B"
+    assert record.absolute_orbit == 20_959

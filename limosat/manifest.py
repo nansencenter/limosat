@@ -13,7 +13,7 @@ from .config import RunConfig
 from .store import RunStore, file_sha256
 
 
-MANIFEST_SCHEMA_VERSION = 2
+MANIFEST_SCHEMA_VERSION = 3
 
 
 def write_manifest(
@@ -33,7 +33,7 @@ def write_manifest(
         "status": "complete",
         "method": "EfficientLoFTR",
         "product_schemas": {
-            "sqlite": 2,
+            "sqlite": 3,
             "pair_displacement_field": 1,
             "lagrangian_trajectory": 3,
             "deformation_cell": 1,
@@ -68,6 +68,8 @@ def write_manifest(
         },
         "images": rows["images"],
         "candidate_pairs": rows["candidate_pairs"],
+        "candidate_pair_planning_counts": rows["planning_counts"],
+        "ancillary_inputs": rows["ancillary_inputs"],
         "pairs": rows["pairs"],
         "product_counts": rows["counts"],
         "recovery_deformation_policy": (
@@ -77,8 +79,8 @@ def write_manifest(
     }
     output = Path(config.output_directory)
     output.mkdir(parents=True, exist_ok=True)
-    path = output / "run-manifest-v2.json"
-    temporary = output / ".run-manifest-v2.json.writing"
+    path = output / "run-manifest-v3.json"
+    temporary = output / ".run-manifest-v3.json.writing"
     temporary.write_text(
         json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n",
         encoding="utf-8",

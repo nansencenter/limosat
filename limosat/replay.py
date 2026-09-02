@@ -84,6 +84,8 @@ def load_production_field_replay(
             path=replay_root / row["relative_path"],
             time_utc=_utc(row["time_utc"]),
             component_id=scene_components.get(row["scene_id"], "unpaired"),
+            platform=str(row["scene_id"])[:3],
+            absolute_orbit=row["orbit_number"],
         )
         for row in scene_rows
     )
