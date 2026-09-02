@@ -8,7 +8,9 @@ set -euo pipefail
 : "${LIMOSAT_RUN_ID:?}"
 : "${LIMOSAT_RUN_ROOT:?}"
 : "${LIMOSAT_CONFIG:?}"
+: "${LIMOSAT_CONFIG_SHA256:?}"
 : "${LIMOSAT_CATALOGUE:?}"
+: "${LIMOSAT_CATALOGUE_SHA256:?}"
 : "${LIMOSAT_SIC_ROOT:?}"
 : "${LIMOSAT_SCENE_ROOT:?}"
 : "${LIMOSAT_OFFICIAL_REPOSITORY:?}"
@@ -51,18 +53,28 @@ check_revision "$LIMOSAT_OFFICIAL_REPOSITORY" "$LIMOSAT_OFFICIAL_REVISION" "Effi
   echo "official EfficientLoFTR checkout changed after submission" >&2
   exit 2
 }
-actual_checkpoint_sha256=$(sha256sum "$LIMOSAT_CHECKPOINT" | awk '{print $1}')
-[[ "$actual_checkpoint_sha256" == "$LIMOSAT_CHECKPOINT_SHA256" ]] || {
-  echo "checkpoint SHA256 changed after submission" >&2
-  exit 2
+check_sha256() {
+  local path="$1"
+  local expected="$2"
+  local label="$3"
+  local actual
+  actual=$(sha256sum "$path" | awk '{print $1}')
+  [[ "$actual" == "$expected" ]] || {
+    echo "$label SHA256 changed after submission" >&2
+    exit 2
+  }
 }
+
 for required in \
   "$LIMOSAT_CONFIG" "$LIMOSAT_CATALOGUE" "$LIMOSAT_SIC_ROOT" \
-  "$LIMOSAT_SCENE_ROOT" \
+  "$LIMOSAT_SCENE_ROOT" "$LIMOSAT_CHECKPOINT" \
   "$LIMOSAT_CONTAINER" "$LIMOSAT_OVERLAY" "$LIMOSAT_READY_MARKER" \
   "$LIMOSAT_CPU_AUDIT"; do
   [[ -e "$required" ]] || { echo "missing run prerequisite: $required" >&2; exit 2; }
 done
+check_sha256 "$LIMOSAT_CONFIG" "$LIMOSAT_CONFIG_SHA256" "configuration"
+check_sha256 "$LIMOSAT_CATALOGUE" "$LIMOSAT_CATALOGUE_SHA256" "catalogue"
+check_sha256 "$LIMOSAT_CHECKPOINT" "$LIMOSAT_CHECKPOINT_SHA256" "checkpoint"
 
 checkpoint_directory=$(dirname "$LIMOSAT_CHECKPOINT")
 run_in_container() {
@@ -148,16 +160,12 @@ PY
       --batch-count "$LIMOSAT_GPU_WORKERS"
     ;;
   primary-compose)
-    run_json "$LIMOSAT_RUN_ROOT/control/primary-ingest.json" \
-      python -m limosat ingest "$LIMOSAT_CONFIG" --kind primary
     run_json "$LIMOSAT_RUN_ROOT/control/primary-compose.json" \
       python -m limosat compose "$LIMOSAT_CONFIG" --phase primary
     run_json "$LIMOSAT_RUN_ROOT/control/primary-status.json" \
       python -m limosat status "$LIMOSAT_CONFIG"
     ;;
   final-compose)
-    run_json "$LIMOSAT_RUN_ROOT/control/recovery-ingest.json" \
-      python -m limosat ingest "$LIMOSAT_CONFIG" --kind recovery
     run_json "$LIMOSAT_RUN_ROOT/control/final-compose.json" \
       python -m limosat compose "$LIMOSAT_CONFIG" --phase final
     run_json "$LIMOSAT_RUN_ROOT/control/final-status.json" \

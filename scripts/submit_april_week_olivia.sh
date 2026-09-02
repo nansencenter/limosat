@@ -52,6 +52,8 @@ command -v apptainer >/dev/null || { echo "apptainer is unavailable" >&2; exit 2
 
 method_revision=$(git -C "$method_root" rev-parse HEAD)
 official_revision=$(git -C "$official_repository" rev-parse HEAD)
+config_sha256=$(sha256sum "$config" | awk '{print $1}')
+catalogue_sha256=$(sha256sum "$catalogue" | awk '{print $1}')
 checkpoint_sha256=$(sha256sum "$checkpoint" | awk '{print $1}')
 if [[ -n "$(git -C "$method_root" status --porcelain)" ]]; then
   echo "LiMOSAT EfficientLoFTR checkout is dirty" >&2
@@ -66,7 +68,7 @@ fi
 
 mkdir -p "$run_root/logs"
 job_script="$method_root/scripts/run_limosat_olivia.sbatch"
-common_export="ALL,LIMOSAT_METHOD_ROOT=$method_root,LIMOSAT_EXPECTED_REVISION=$method_revision,LIMOSAT_RUN_ID=$run_id,LIMOSAT_RUN_ROOT=$run_root,LIMOSAT_CONFIG=$config,LIMOSAT_CATALOGUE=$catalogue,LIMOSAT_SIC_ROOT=$sic_root,LIMOSAT_SCENE_ROOT=$scene_root,LIMOSAT_OFFICIAL_REPOSITORY=$official_repository,LIMOSAT_OFFICIAL_REVISION=$official_revision,LIMOSAT_CHECKPOINT=$checkpoint,LIMOSAT_CHECKPOINT_SHA256=$checkpoint_sha256,LIMOSAT_CONTAINER=$container,LIMOSAT_OVERLAY=$overlay,LIMOSAT_READY_MARKER=$ready_marker,LIMOSAT_CPU_AUDIT=$cpu_audit,LIMOSAT_EXPECTED_IMAGES=781,LIMOSAT_GPU_WORKERS=$gpu_workers"
+common_export="ALL,LIMOSAT_METHOD_ROOT=$method_root,LIMOSAT_EXPECTED_REVISION=$method_revision,LIMOSAT_RUN_ID=$run_id,LIMOSAT_RUN_ROOT=$run_root,LIMOSAT_CONFIG=$config,LIMOSAT_CONFIG_SHA256=$config_sha256,LIMOSAT_CATALOGUE=$catalogue,LIMOSAT_CATALOGUE_SHA256=$catalogue_sha256,LIMOSAT_SIC_ROOT=$sic_root,LIMOSAT_SCENE_ROOT=$scene_root,LIMOSAT_OFFICIAL_REPOSITORY=$official_repository,LIMOSAT_OFFICIAL_REVISION=$official_revision,LIMOSAT_CHECKPOINT=$checkpoint,LIMOSAT_CHECKPOINT_SHA256=$checkpoint_sha256,LIMOSAT_CONTAINER=$container,LIMOSAT_OVERLAY=$overlay,LIMOSAT_READY_MARKER=$ready_marker,LIMOSAT_CPU_AUDIT=$cpu_audit,LIMOSAT_EXPECTED_IMAGES=781,LIMOSAT_GPU_WORKERS=$gpu_workers"
 
 build_command() {
   local stage="$1"

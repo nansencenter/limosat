@@ -53,16 +53,14 @@ same explicit stages available to batch systems:
 ```bash
 limosat prepare config.yaml
 limosat pairs config.yaml --kind primary
-limosat ingest config.yaml --kind primary
 limosat compose config.yaml --phase primary
 limosat pairs config.yaml --kind recovery
-limosat ingest config.yaml --kind recovery
 limosat compose config.yaml --phase final
 ```
 
 Pair workers write immutable NPZ data plus JSON completion markers under
-`pair_product_directory`; they never write SQLite. The single CPU coordinator
-validates and imports those products and streams trajectory rows into the
+`pair_product_directory`; they never write SQLite. Each CPU composition stage
+validates and imports those products, then streams trajectory rows into the
 global database. `--batch-index I --batch-count N` partitions pair work
 deterministically for scheduler arrays. These files are resumable work
 products, not additional deliverables; the finalized SQLite and Parquet files

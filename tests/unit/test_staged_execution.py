@@ -19,6 +19,8 @@ from limosat import (
     RoutingConfig,
     RunConfig,
     RunStages,
+    RunStore,
+    TrajectoryPoint,
 )
 
 
@@ -138,11 +140,27 @@ def test_pair_product_round_trip_is_checked_and_immutable(tmp_path):
     )
     assert products.count("primary") == 1
 
+    resumed = products.save(pair, "primary", False, expected)
+    assert resumed.sha256 == saved.sha256
+    assert resumed.content_sha256 == saved.content_sha256
+
     marker = saved.path.with_suffix(".json")
+    marker.unlink()
+    recovered = products.save(pair, "primary", False, expected)
+    assert recovered.sha256 == saved.sha256
+
+    with pytest.raises(ValueError, match="already differs"):
+        products.save(
+            pair,
+            "primary",
+            False,
+            result(pair, available=False),
+        )
+
     metadata = json.loads(marker.read_text())
     metadata["field_sha256"] = "f" * 64
     marker.write_text(json.dumps(metadata))
-    with pytest.raises(ValueError, match="field failed checksum"):
+    with pytest.raises(ValueError, match="marker failed checksum"):
         products.load(pair, "primary", False)
 
 
@@ -172,12 +190,12 @@ def test_staged_workers_do_not_write_sqlite_and_batches_recompose_globally(tmp_p
     with sqlite3.connect(cfg.database) as connection:
         assert connection.execute("SELECT COUNT(*) FROM pairs").fetchone()[0] == 0
 
-    assert first["selected_pairs"] + second["selected_pairs"] == 2
+    assert first["assigned_pairs"] + second["assigned_pairs"] == 2
     assert first["computed_pairs"] + second["computed_pairs"] == 2
     assert prepared["primary_pairs"] == 2
 
-    stages.ingest_pair_products("primary")
     primary = stages.compose("primary")
+    assert primary["pair_product_import"]["imported_pair_products"] == 2
     with sqlite3.connect(cfg.database) as connection:
         dormant = connection.execute(
             "SELECT COUNT(*) FROM trajectory_points "
@@ -188,8 +206,8 @@ def test_staged_workers_do_not_write_sqlite_and_batches_recompose_globally(tmp_p
 
     recovery = stages.process_pairs("recovery")
     assert recovery["planned_pairs"] == 1
-    stages.ingest_pair_products("recovery")
     final = stages.compose("final", ["limosat", "compose", "config", "--phase", "final"])
+    assert final["pair_product_import"]["imported_pair_products"] == 1
 
     with sqlite3.connect(cfg.database) as connection:
         reappeared = connection.execute(
@@ -244,7 +262,7 @@ def test_field_only_worker_product_preserves_match_count_on_import(tmp_path):
     stages = RunStages(cfg, images, Processor())
     stages.prepare()
     stages.process_pairs("primary")
-    stages.ingest_pair_products("primary")
+    stages.compose("primary")
 
     with sqlite3.connect(cfg.database) as connection:
         counts = connection.execute(
@@ -261,3 +279,60 @@ def test_default_pair_product_path_is_database_specific(tmp_path):
     first = replace(config(tmp_path), pair_product_directory="")
     second = replace(first, database=str(tmp_path / "other.sqlite"))
     assert first.pair_products != second.pair_products
+
+
+def test_pair_stage_requires_a_registered_candidate_plan(tmp_path):
+    cfg = config(tmp_path)
+    RunStore(cfg)
+
+    with pytest.raises(RuntimeError, match="run prepare first"):
+        RunStages(cfg, catalogue(tmp_path), Processor()).process_pairs("primary")
+
+
+def test_pair_stage_rejects_changed_registered_catalogue_metadata(tmp_path):
+    cfg = config(tmp_path)
+    original = catalogue(tmp_path)
+    RunStages(cfg, original, Processor()).prepare()
+    changed = ImageCatalogue(
+        [replace(image, component_id="changed") for image in original.records]
+    )
+
+    with pytest.raises(ValueError, match="catalogue image metadata changed"):
+        RunStages(cfg, changed, Processor()).process_pairs("primary")
+
+
+def test_interrupted_streamed_composition_rolls_back_existing_rows(tmp_path):
+    cfg = config(tmp_path)
+    store = RunStore(cfg)
+    image = catalogue(tmp_path).chronological()[0]
+    original = (
+        TrajectoryPoint(
+            "parcel",
+            image.image_id,
+            image.time_utc,
+            "created",
+            "seed_grid",
+            0.0,
+            0.0,
+            None,
+        ),
+    )
+    store.replace_global_trajectories(original)
+
+    def interrupted():
+        yield original
+        raise RuntimeError("synthetic composition interruption")
+
+    with pytest.raises(RuntimeError, match="synthetic composition interruption"):
+        store.replace_global_trajectory_batches(interrupted())
+
+    with sqlite3.connect(cfg.database) as connection:
+        rows = connection.execute(
+            "SELECT trajectory_id,image_id,x_m,y_m FROM trajectory_points"
+        ).fetchall()
+        index = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' "
+            "AND name='trajectory_points_run_image_state'"
+        ).fetchone()
+    assert rows == [("parcel", "a", 0.0, 0.0)]
+    assert index == (1,)

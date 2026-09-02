@@ -18,7 +18,7 @@ from .deformation import deformation_from_field
 from .efficientloftr import EfficientLoFTR
 from .manifest import write_manifest
 from .models import FieldEdge
-from .pair_artifacts import PAIR_PRODUCT_SCHEMA_VERSION, PairProductStore
+from .pair_products import PAIR_PRODUCT_SCHEMA_VERSION, PairProductStore
 from .pairs import PairProcessor
 from .planning import PlannedPair, build_candidate_plan, recovery_candidates
 from .store import RunStore
@@ -47,7 +47,7 @@ class RunStages:
         self.config = config
         self._catalogue = catalogue
         self._processor = processor
-        self._products: PairProductStore | None = None
+        self._pair_products: PairProductStore | None = None
 
     @property
     def catalogue(self) -> ImageCatalogue:
@@ -66,10 +66,10 @@ class RunStages:
         return self._processor
 
     @property
-    def products(self) -> PairProductStore:
-        if self._products is None:
-            self._products = PairProductStore(self.config)
-        return self._products
+    def pair_products(self) -> PairProductStore:
+        if self._pair_products is None:
+            self._pair_products = PairProductStore(self.config)
+        return self._pair_products
 
     def prepare(self) -> dict:
         """Freeze the catalogue and candidate image-pair plan in SQLite."""
@@ -107,6 +107,7 @@ class RunStages:
         selected = self._work(
             store,
             kind,
+            candidates=candidates,
             batch_index=batch_index,
             batch_count=batch_count,
         )
@@ -115,21 +116,21 @@ class RunStages:
             pair = item.planned.pair
             if store.load_field(pair.pair_id) is not None:
                 return "sqlite"
-            completed = self.products.load(
+            completed = self.pair_products.load(
                 pair,
                 kind,
                 kind == "recovery",
                 item.targeted_positions_xy_m,
             )
             if completed is not None:
-                return "artifact"
+                return "pair_product"
             result = self.processor.process(
                 pair,
                 None,
                 None,
                 item.targeted_positions_xy_m,
             )
-            self.products.save(
+            self.pair_products.save(
                 pair,
                 kind,
                 kind == "recovery",
@@ -143,27 +144,29 @@ class RunStages:
             "kind": kind,
             "batch_index": batch_index,
             "batch_count": batch_count,
-            "candidate_pairs": len(candidates),
             "planned_pairs": len(candidates),
-            "selected_pairs": len(outcomes),
+            "assigned_pairs": len(outcomes),
             "computed_pairs": outcomes.count("computed"),
-            "resumed_pair_products": outcomes.count("artifact"),
+            "resumed_pair_products": outcomes.count("pair_product"),
             "resumed_sqlite_pairs": outcomes.count("sqlite"),
         }
 
-    def ingest_pair_products(self, kind: str) -> dict:
+    def _import_pair_products(
+        self,
+        store: RunStore,
+        kind: str,
+    ) -> tuple[dict, tuple[PlannedPair, ...]]:
         """Import verified worker outputs through the single SQLite writer."""
-        store = RunStore(self.config)
         imported = 0
         resumed = 0
-        planned_count = 0
+        planned = []
         missing = []
         for item in self._work(store, kind):
-            planned_count += 1
+            planned.append(item.planned)
             pair = item.planned.pair
             field = store.load_field(pair.pair_id)
             if field is None:
-                product = self.products.load(
+                product = self.pair_products.load(
                     pair,
                     kind,
                     kind == "recovery",
@@ -187,6 +190,7 @@ class RunStages:
                         **product.result.diagnostics,
                         "pair_product_schema_version": PAIR_PRODUCT_SCHEMA_VERSION,
                         "pair_product_sha256": product.sha256,
+                        "pair_product_content_sha256": product.content_sha256,
                     },
                 )
                 store.save_pair(
@@ -210,12 +214,15 @@ class RunStages:
             raise RuntimeError(
                 f"{len(missing)} {kind} pair products are incomplete; first: {sample}"
             )
-        return {
-            "kind": kind,
-            "planned_pairs": planned_count,
-            "imported_pairs": imported,
-            "resumed_pairs": resumed,
-        }
+        return (
+            {
+                "kind": kind,
+                "expected_pair_fields": len(planned),
+                "imported_pair_products": imported,
+                "resumed_pair_fields": resumed,
+            },
+            tuple(planned),
+        )
 
     def compose(
         self,
@@ -228,21 +235,31 @@ class RunStages:
         store = RunStore(self.config)
         planned = store.planned_pairs(self.catalogue)
         primary = tuple(item for item in planned if item.selection == "primary")
+        pair_import = {
+            "kind": "recovery" if phase == "final" else "primary",
+            "expected_pair_fields": 0,
+            "imported_pair_products": 0,
+            "resumed_pair_fields": 0,
+        }
+        if phase == "primary":
+            pair_import, _ = self._import_pair_products(store, "primary")
         self._require_complete(store, "primary", primary)
-        edges = [
-            FieldEdge(self._required_field(store, item.pair.pair_id))
-            for item in primary
-        ]
         recovery = ()
         if phase == "final" and self.config.routing.targeted_recovery:
-            recovery = tuple(
-                item.planned for item in self._work(store, "recovery")
+            pair_import, recovery = self._import_pair_products(
+                store, "recovery"
             )
             self._require_complete(
                 store,
                 "recovery",
                 recovery,
             )
+
+        edges = [
+            FieldEdge(self._required_field(store, item.pair.pair_id))
+            for item in primary
+        ]
+        if recovery:
             edges.extend(
                 FieldEdge(
                     self._required_field(store, item.pair.pair_id),
@@ -294,6 +311,7 @@ class RunStages:
             "trajectory_states": state_counts,
             "convergence_events": len(events),
             "composition_seconds": time.perf_counter() - clock,
+            "pair_product_import": pair_import,
         }
         if phase == "final":
             completed_utc = datetime.now(timezone.utc)
@@ -319,11 +337,9 @@ class RunStages:
 
     def run_all(self, command: Sequence[str] | None = None) -> dict:
         """Run the same stages sequentially on a single machine."""
-        store = RunStore(self.config)
         try:
             preparation = self.prepare()
             primary = self.process_pairs("primary")
-            self.ingest_pair_products("primary")
             primary_composition = self.compose("primary")
             recovery = {
                 "computed_pairs": 0,
@@ -332,7 +348,6 @@ class RunStages:
             }
             if self.config.routing.targeted_recovery:
                 recovery = self.process_pairs("recovery")
-                self.ingest_pair_products("recovery")
             final = self.compose("final", command)
             return {
                 **final,
@@ -351,7 +366,7 @@ class RunStages:
                 ],
             }
         except Exception as error:
-            store.fail_run(error)
+            RunStore(self.config).fail_run(error)
             raise
 
     def _pair_candidates(
@@ -374,10 +389,15 @@ class RunStages:
         store: RunStore,
         kind: str,
         *,
+        candidates: Sequence[PlannedPair] | None = None,
         batch_index: int = 0,
         batch_count: int = 1,
     ):
-        candidates = self._pair_candidates(store, kind)
+        candidates = (
+            self._pair_candidates(store, kind)
+            if candidates is None
+            else candidates
+        )
         assigned = tuple(
             item
             for index, item in enumerate(candidates)

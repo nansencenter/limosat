@@ -18,7 +18,7 @@ from .models import DisplacementField, MotionMatches, PairResult
 from .store import file_sha256, implementation_sha256
 
 
-PAIR_PRODUCT_SCHEMA_VERSION = 1
+PAIR_PRODUCT_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -29,6 +29,7 @@ class PairProduct:
     match_count: int
     path: Path
     sha256: str
+    content_sha256: str
 
 
 class PairProductStore:
@@ -53,16 +54,33 @@ class PairProductStore:
         result: PairResult,
         targeted_positions_xy_m: np.ndarray | None = None,
     ) -> PairProduct:
-        """Atomically publish an artifact without replacing an existing one."""
+        """Atomically publish a pair product without replacing an existing one."""
         self._validate_identity(pair, kind, targeted, result)
         positions_sha256 = _positions_sha256(targeted_positions_xy_m)
         if kind == "recovery" and (
             targeted_positions_xy_m is None or not len(targeted_positions_xy_m)
         ):
             raise ValueError("recovery pair products require measured source positions")
+        arrays = _arrays(result, include_matches=self.config.retain_pair_matches)
+        content_sha256 = _content_sha256(arrays)
+        existing = self.load(
+            pair,
+            kind,
+            targeted,
+            targeted_positions_xy_m=targeted_positions_xy_m,
+        )
+        if existing is not None:
+            if (
+                existing.content_sha256 != content_sha256
+                or existing.match_count != len(result.matches)
+            ):
+                raise ValueError(
+                    f"immutable pair product already differs: {pair.pair_id}"
+                )
+            return existing
+
         data_path, marker_path = self._paths(pair.pair_id, kind)
         data_path.parent.mkdir(parents=True, exist_ok=True)
-        arrays = _arrays(result, include_matches=self.config.retain_pair_matches)
         temporary = data_path.with_name(
             f".{data_path.name}.writing.{os.getpid()}.{uuid.uuid4().hex}"
         )
@@ -71,8 +89,9 @@ class PairProductStore:
                 np.savez_compressed(stream, **arrays)
                 stream.flush()
                 os.fsync(stream.fileno())
-            data_sha256 = file_sha256(temporary)
-            _publish_exclusive(temporary, data_path, data_sha256)
+            data_sha256 = _publish_data(
+                temporary, data_path, content_sha256
+            )
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -92,6 +111,7 @@ class PairProductStore:
             "elapsed_seconds": float(pair.elapsed_seconds),
             "targeted_positions_sha256": positions_sha256,
             "field_sha256": result.field.checksum,
+            "content_sha256": content_sha256,
             "match_count": len(result.matches),
             "matches_included": bool(self.config.retain_pair_matches),
             "fold_rejected_count": len(result.fold_rejected_indices),
@@ -103,6 +123,7 @@ class PairProductStore:
             "data_sha256": data_sha256,
             "data_size_bytes": data_path.stat().st_size,
         }
+        metadata["marker_content_sha256"] = _metadata_sha256(metadata)
         marker_bytes = (
             json.dumps(
                 metadata,
@@ -120,11 +141,7 @@ class PairProductStore:
                 stream.write(marker_bytes)
                 stream.flush()
                 os.fsync(stream.fileno())
-            _publish_exclusive(
-                marker_temporary,
-                marker_path,
-                hashlib.sha256(marker_bytes).hexdigest(),
-            )
+            _publish_marker(marker_temporary, marker_path)
         finally:
             marker_temporary.unlink(missing_ok=True)
         product = self.load(
@@ -135,6 +152,13 @@ class PairProductStore:
         )
         if product is None:  # pragma: no cover - guarded by publication above
             raise RuntimeError(f"pair product was not published: {pair.pair_id}")
+        if (
+            product.content_sha256 != content_sha256
+            or product.match_count != len(result.matches)
+        ):
+            raise ValueError(
+                f"immutable pair product already differs: {pair.pair_id}"
+            )
         return product
 
     def load(
@@ -144,7 +168,7 @@ class PairProductStore:
         targeted: bool,
         targeted_positions_xy_m: np.ndarray | None = None,
     ) -> PairProduct | None:
-        """Load a completed artifact, returning ``None`` when no marker exists."""
+        """Load a completed pair product, or ``None`` without a marker."""
         data_path, marker_path = self._paths(pair.pair_id, kind)
         if not marker_path.exists():
             return None
@@ -155,6 +179,16 @@ class PairProductStore:
         ):
             raise ValueError("recovery pair products require measured source positions")
         metadata = json.loads(marker_path.read_text(encoding="utf-8"))
+        if not isinstance(metadata, dict):
+            raise ValueError(f"pair product marker is not an object: {pair.pair_id}")
+        marker_content_sha256 = metadata.get("marker_content_sha256")
+        marker_content = {
+            name: value
+            for name, value in metadata.items()
+            if name != "marker_content_sha256"
+        }
+        if marker_content_sha256 != _metadata_sha256(marker_content):
+            raise ValueError(f"pair product marker failed checksum: {pair.pair_id}")
         expected = {
             "pair_product_schema_version": PAIR_PRODUCT_SCHEMA_VERSION,
             "run_id": self.config.run_id,
@@ -188,18 +222,33 @@ class PairProductStore:
         if data_path.stat().st_size != metadata.get("data_size_bytes"):
             raise ValueError(f"pair product size changed: {pair.pair_id}")
         with np.load(data_path, allow_pickle=False) as values:
-            result = _result_from_arrays(metadata, values)
+            arrays = {name: _array(values, name) for name in _ARRAY_NAMES}
+        content_sha256 = _content_sha256(arrays)
+        if content_sha256 != metadata.get("content_sha256"):
+            raise ValueError(f"pair product content failed checksum: {pair.pair_id}")
+        result = _result_from_arrays(metadata, arrays)
         self._validate_identity(pair, kind, targeted, result)
         if result.field.checksum != metadata.get("field_sha256"):
             raise ValueError(f"pair field failed checksum: {pair.pair_id}")
         match_count = int(metadata["match_count"])
-        if metadata.get("matches_included") and len(result.matches) != match_count:
+        if match_count < 0:
+            raise ValueError(f"pair match count is negative: {pair.pair_id}")
+        matches_included = metadata.get("matches_included")
+        if matches_included is not self.config.retain_pair_matches:
+            raise ValueError(f"pair match retention changed: {pair.pair_id}")
+        if matches_included and len(result.matches) != match_count:
             raise ValueError(f"pair match count changed: {pair.pair_id}")
-        if not metadata.get("matches_included") and len(result.matches):
+        if not matches_included and len(result.matches):
             raise ValueError(f"unexpected retained matches: {pair.pair_id}")
         if len(result.fold_rejected_indices) != metadata.get("fold_rejected_count"):
             raise ValueError(f"fold-rejected count changed: {pair.pair_id}")
-        return PairProduct(result, match_count, data_path, data_sha256)
+        return PairProduct(
+            result,
+            match_count,
+            data_path,
+            data_sha256,
+            content_sha256,
+        )
 
     def count(self, kind: str) -> int:
         if kind not in {"primary", "recovery"}:
@@ -259,44 +308,39 @@ def _arrays(result: PairResult, include_matches: bool) -> dict[str, np.ndarray]:
         "match_source_tile": np.asarray(matches.source_tile, dtype="<i4"),
         "match_target_tile": np.asarray(matches.target_tile, dtype="<i4"),
         "fold_rejected_indices": np.asarray(
-            result.fold_rejected_indices, dtype=np.int32
+            result.fold_rejected_indices, dtype="<i4"
         ),
     }
 
 
-def _result_from_arrays(metadata: dict, values) -> PairResult:
-    def array(name: str) -> np.ndarray:
-        if name not in values.files:
-            raise ValueError(f"pair product array is missing: {name}")
-        return np.asarray(values[name]).copy()
-
+def _result_from_arrays(metadata: dict, arrays: dict[str, np.ndarray]) -> PairResult:
     field = DisplacementField(
         pair_id=metadata["pair_id"],
         source_image_id=metadata["source_image_id"],
         target_image_id=metadata["target_image_id"],
         source_time_utc=datetime.fromisoformat(metadata["source_time_utc"]),
         target_time_utc=datetime.fromisoformat(metadata["target_time_utc"]),
-        grid_row=array("grid_row"),
-        grid_column=array("grid_column"),
-        source_xy_m=array("source_xy_m"),
-        displacement_m=array("displacement_m"),
-        available=array("available"),
-        selected_matches=array("selected_matches"),
-        candidate_matches=array("candidate_matches"),
-        support_radius_m=array("support_radius_m"),
-        maximum_residual_m=array("maximum_residual_m"),
+        grid_row=arrays["grid_row"],
+        grid_column=arrays["grid_column"],
+        source_xy_m=arrays["source_xy_m"],
+        displacement_m=arrays["displacement_m"],
+        available=arrays["available"],
+        selected_matches=arrays["selected_matches"],
+        candidate_matches=arrays["candidate_matches"],
+        support_radius_m=arrays["support_radius_m"],
+        maximum_residual_m=arrays["maximum_residual_m"],
     )
     matches = MotionMatches(
-        array("match_source_xy_m"),
-        array("match_target_xy_m"),
-        array("match_score"),
-        array("match_source_tile"),
-        array("match_target_tile"),
+        arrays["match_source_xy_m"],
+        arrays["match_target_xy_m"],
+        arrays["match_score"],
+        arrays["match_source_tile"],
+        arrays["match_target_tile"],
     )
     return PairResult(
         matches=matches,
         field=field,
-        fold_rejected_indices=array("fold_rejected_indices"),
+        fold_rejected_indices=arrays["fold_rejected_indices"],
         runtime_seconds=dict(metadata.get("runtime_seconds") or {}),
         matcher_calls=int(metadata["matcher_calls"]),
         diagnostics=dict(metadata.get("diagnostics") or {}),
@@ -316,9 +360,69 @@ def _positions_sha256(values: np.ndarray | None) -> str | None:
     return digest.hexdigest()
 
 
-def _publish_exclusive(temporary: Path, destination: Path, checksum: str) -> None:
+def _metadata_sha256(metadata: dict) -> str:
+    encoded = json.dumps(
+        metadata,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+_ARRAY_NAMES = (
+    "grid_row",
+    "grid_column",
+    "source_xy_m",
+    "displacement_m",
+    "available",
+    "selected_matches",
+    "candidate_matches",
+    "support_radius_m",
+    "maximum_residual_m",
+    "match_source_xy_m",
+    "match_target_xy_m",
+    "match_score",
+    "match_source_tile",
+    "match_target_tile",
+    "fold_rejected_indices",
+)
+
+
+def _array(values, name: str) -> np.ndarray:
+    if name not in values.files:
+        raise ValueError(f"pair product array is missing: {name}")
+    return np.asarray(values[name]).copy()
+
+
+def _content_sha256(arrays: dict[str, np.ndarray]) -> str:
+    digest = hashlib.sha256()
+    for name in _ARRAY_NAMES:
+        array = np.ascontiguousarray(arrays[name])
+        digest.update(name.encode("utf-8"))
+        digest.update(array.dtype.str.encode("ascii"))
+        digest.update(str(array.shape).encode("ascii"))
+        digest.update(array.tobytes())
+    return digest.hexdigest()
+
+
+def _publish_data(
+    temporary: Path,
+    destination: Path,
+    content_sha256: str,
+) -> str:
     try:
         os.link(temporary, destination)
     except FileExistsError:
-        if file_sha256(destination) != checksum:
+        with np.load(destination, allow_pickle=False) as values:
+            arrays = {name: _array(values, name) for name in _ARRAY_NAMES}
+        if _content_sha256(arrays) != content_sha256:
             raise ValueError(f"immutable pair product already differs: {destination}")
+    return file_sha256(destination)
+
+
+def _publish_marker(temporary: Path, destination: Path) -> None:
+    try:
+        os.link(temporary, destination)
+    except FileExistsError:
+        pass

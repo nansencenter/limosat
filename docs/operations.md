@@ -117,17 +117,18 @@ marker binds the product to the run, configuration, source implementation,
 checkpoint, image-pair identity, and—for recovery—the exact measured source
 positions. Existing completed products are verified and never overwritten.
 
-`limosat ingest` is the only pair-product SQLite writer. It checksum-verifies
-every expected worker product, imports the field and optional raw matches in
-one transaction, and derives deformation only for primary pair fields. The
-CPU composer streams per-image trajectory batches into one transaction; an
-interruption rolls back the incomplete composition. Recovery workers only run
-after the primary composition supplies genuine measured-loss positions.
+`limosat compose` is the only pair-product SQLite writer. It checksum-verifies
+and imports every expected worker product before streaming per-image
+trajectory batches into one transaction. An interruption rolls back the
+incomplete trajectory composition; already imported immutable pair fields
+remain valid. Primary composition derives deformation only from primary pair
+fields. Recovery workers run only after primary composition supplies genuine
+measured-loss positions.
 
 `limosat run CONFIG` executes all stages sequentially and is the recommended
 interface on a local or other single-GPU machine. Scheduler launchers may call
 the stages separately without changing their scientific behavior. SQLite is
-the authoritative scientific and finalized resume product after ingestion;
+the authoritative scientific and finalized resume product after composition;
 pair-product files are intermediate compute-resume state.
 
 The output directory contains `run-manifest-v4.json`. Scientific arrays and

@@ -85,14 +85,16 @@ plus divergence, shear, total deformation, and vorticity in inverse seconds.
 Product schema versions are listed independently so additive trajectory or
 deformation revisions do not silently change the pair-field contract.
 
-## Pair worker product version 1
+## Pair worker product version 2
 
 Independent pair workers publish one compressed NPZ data file and one JSON
-completion marker per measured image pair. The marker is written last and is
-the completion boundary. It records the run/configuration/source/checkpoint
+completion marker per measured image pair. The self-checksummed marker is
+written last and is the completion boundary. It records the
+run/configuration/source/checkpoint
 identity, image-pair times and kind, field checksum, data-file SHA256, counts,
-diagnostics, ancillary-input checksums, and a checksum of targeted recovery
-positions where applicable. Array dtypes preserve float64 EPSG:3413
+diagnostics, ancillary-input checksums, a deterministic array-content checksum,
+and a checksum of targeted recovery positions where applicable. Array dtypes
+preserve float64 EPSG:3413
 coordinates and displacements and int32 indices.
 
 These are intermediate compute products rather than catalogue deliverables.

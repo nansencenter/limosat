@@ -10,7 +10,7 @@ from typing import Sequence
 from .catalog import load_catalogue
 from .config import load_config
 from .finalize import finalize_products
-from .pair_artifacts import PairProductStore
+from .pair_products import PairProductStore
 from .planning import build_candidate_plan, recovery_candidates, select_overlap_probe
 from .run import LiMOSATRun
 from .stages import RunStages
@@ -20,10 +20,12 @@ from .store import RunStore
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="limosat")
     commands = parser.add_subparsers(dest="command", required=True)
-    run = commands.add_parser("run", help="process all catalogue components")
+    run = commands.add_parser(
+        "run", help="run the complete global catalogue workflow"
+    )
     run.add_argument("config", type=Path)
     prepare = commands.add_parser(
-        "prepare", help="freeze the catalogue and candidate image-pair plan"
+        "prepare", help="register the catalogue and candidate image-pair plan"
     )
     prepare.add_argument("config", type=Path)
     pairs = commands.add_parser(
@@ -33,13 +35,8 @@ def build_parser() -> argparse.ArgumentParser:
     pairs.add_argument("--kind", choices=("primary", "recovery"), required=True)
     pairs.add_argument("--batch-index", type=int, default=0)
     pairs.add_argument("--batch-count", type=int, default=1)
-    ingest = commands.add_parser(
-        "ingest", help="import completed pair products into SQLite"
-    )
-    ingest.add_argument("config", type=Path)
-    ingest.add_argument("--kind", choices=("primary", "recovery"), required=True)
     compose = commands.add_parser(
-        "compose", help="stream global trajectories from completed pair fields"
+        "compose", help="import completed pair products and compose trajectories"
     )
     compose.add_argument("config", type=Path)
     compose.add_argument("--phase", choices=("primary", "final"), required=True)
@@ -83,8 +80,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             batch_index=arguments.batch_index,
             batch_count=arguments.batch_count,
         )
-    elif arguments.command == "ingest":
-        result = RunStages(config).ingest_pair_products(arguments.kind)
     elif arguments.command == "compose":
         result = RunStages(config).compose(
             arguments.phase,
@@ -97,7 +92,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ],
         )
     elif arguments.command == "status":
-        result = RunStore(config).status()
+        result = RunStore(config, read_only=True).status()
         products = PairProductStore(config)
         result["pair_products"] = {
             kind: products.count(kind) for kind in ("primary", "recovery")

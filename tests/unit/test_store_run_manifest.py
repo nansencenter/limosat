@@ -20,6 +20,7 @@ from limosat import (
     PairResult,
     RoutingConfig,
     RunConfig,
+    RunStages,
     TrajectoryPoint,
 )
 from limosat.cli import main
@@ -150,6 +151,23 @@ def test_interrupted_pair_retries_but_complete_product_is_immutable(tmp_path):
     assert resumed_store.load_field(pair.pair_id).checksum == checksum
 
 
+def test_store_rejects_pair_field_identity_mismatch(tmp_path):
+    config = _config(tmp_path)
+    pair = _catalogue(tmp_path).adjacent_pairs("component")[0]
+    store = RunStore(config)
+    store.claim_pair(pair, "component", "primary", False)
+    valid = _result(pair)
+    mismatched = replace(
+        valid,
+        field=replace(valid.field, target_image_id="different-target"),
+    )
+
+    with pytest.raises(ValueError, match="pair identity"):
+        store.save_pair(pair, mismatched)
+
+    assert store.load_field(pair.pair_id) is None
+
+
 def test_sequence_recovers_measured_loss_and_resumes_with_versioned_manifest(tmp_path):
     config = _config(tmp_path)
     catalogue = _catalogue(tmp_path)
@@ -168,7 +186,7 @@ def test_sequence_recovers_measured_loss_and_resumes_with_versioned_manifest(tmp
     assert len(manifest["implementation_sha256"]) == 64
     assert manifest["product_schemas"]["lagrangian_trajectory"] == 4
     assert manifest["product_schemas"]["pair_match_archive"] == 1
-    assert manifest["product_schemas"]["pair_worker_product"] == 1
+    assert manifest["product_schemas"]["pair_worker_product"] == 2
     assert manifest["coordinates"]["crs"] == "EPSG:3413"
     assert manifest["product_counts"]["trajectories"] == 4
     assert manifest["product_counts"]["candidate_pairs"] == 3
@@ -184,6 +202,7 @@ def test_sequence_recovers_measured_loss_and_resumes_with_versioned_manifest(tmp
     assert len(recovery[0]["retained_matches"]["payload_sha256"]) == 64
     assert recovery[0]["diagnostics"]["phase_correlation_status"] == "synthetic"
     assert len(recovery[0]["diagnostics"]["pair_product_sha256"]) == 64
+    assert len(recovery[0]["diagnostics"]["pair_product_content_sha256"]) == 64
     assert manifest["execution_architecture"]["pair_workers_write_sqlite"] is False
     assert recovery[0]["ancillary_inputs"] == {
         "/fixture.nc": "0" * 64
@@ -259,12 +278,24 @@ def test_interrupted_resume_matches_clean_global_rows_and_manifest_counts(tmp_pa
 
 def test_cli_status_imports_without_loading_model(tmp_path, capsys):
     config = _config(tmp_path)
+    RunStages(config, _catalogue(tmp_path), SyntheticProcessor()).prepare()
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps(config.to_dict()))
 
     assert main(["status", str(config_path)]) == 0
     output = json.loads(capsys.readouterr().out)
     assert output["run"]["schema_version"] == 4
+
+
+def test_cli_status_does_not_create_missing_database(tmp_path):
+    config = _config(tmp_path)
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config.to_dict()))
+
+    with pytest.raises(FileNotFoundError, match="run prepare first"):
+        main(["status", str(config_path)])
+
+    assert not Path(config.database).exists()
 
 
 def test_schema_v4_is_global_and_persists_null_dormant_coordinates(tmp_path):

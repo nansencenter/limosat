@@ -81,13 +81,14 @@ python3 scripts/prepare_april_week_olivia.py --download-sic
 scripts/submit_april_week_olivia.sh
 ```
 
-The submit wrapper freezes the method revision, official EfficientLoFTR
-revision, and checkpoint checksum before submitting a dependency chain: CPU
-preparation, primary GPU pair processing, CPU primary composition, recovery
-GPU pair processing, and CPU final composition/finalization. CPU jobs run on
-the Olivia accelerator partition with zero GPUs so the GPU is released while
-millions of trajectory rows are written. Every stage uses the same container,
-configuration, and source revision.
+The submit wrapper records the method and official EfficientLoFTR revisions
+plus the configuration, catalogue, and checkpoint checksums before submitting
+a dependency chain: CPU preparation, primary GPU pair processing, CPU primary
+composition, recovery GPU pair processing, and CPU final
+composition/finalization. CPU jobs run on the Olivia accelerator partition
+with zero GPUs so the GPU is released while millions of trajectory rows are
+written. Every stage uses the same container, configuration, and source
+revision.
 
 `GPU_WORKERS=1` is the default. A later run can set `GPU_WORKERS=N` to create
 deterministic primary and recovery Slurm arrays without concurrent SQLite

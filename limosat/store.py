@@ -261,7 +261,14 @@ class RunStore:
         match_count: int | None = None,
     ) -> bool:
         """Atomically replace only incomplete state and mark completion last."""
-        if pair.pair_id != result.field.pair_id:
+        field = result.field
+        if (
+            pair.pair_id != field.pair_id
+            or pair.source.image_id != field.source_image_id
+            or pair.target.image_id != field.target_image_id
+            or pair.source.time_utc != field.source_time_utc
+            or pair.target.time_utc != field.target_time_utc
+        ):
             raise ValueError("pair identity and field identity differ")
         stored_match_count = (
             len(result.matches) if match_count is None else match_count
@@ -476,14 +483,60 @@ class RunStore:
         """Reconstruct the registered immutable plan without replanning imagery."""
         images = {image.image_id: image for image in catalogue.records}
         with closing(self._connect()) as connection:
+            registered_images = {
+                row["image_id"]: row
+                for row in connection.execute(
+                    """
+                    SELECT image_id,component_id,platform,absolute_orbit,path,
+                           time_utc,size_bytes
+                    FROM images WHERE run_id=? ORDER BY image_id
+                    """,
+                    (self.config.run_id,),
+                )
+            }
+            registered_count = connection.execute(
+                """
+                SELECT count FROM planning_counts
+                WHERE run_id=? AND reason='accepted_candidate_pairs'
+                """,
+                (self.config.run_id,),
+            ).fetchone()
+            if registered_count is None:
+                raise RuntimeError(
+                    "candidate image-pair plan is not registered; run prepare first"
+                )
             rows = connection.execute(
                 """
                 SELECT * FROM candidate_pairs WHERE run_id=? ORDER BY ordinal
                 """,
                 (self.config.run_id,),
             ).fetchall()
+        if registered_images.keys() != images.keys():
+            raise ValueError("registered catalogue image identities changed")
+        for image_id, image in images.items():
+            registered = registered_images[image_id]
+            if not image.path.is_file():
+                raise FileNotFoundError(image.path)
+            current = (
+                image.component_id,
+                image.platform,
+                image.absolute_orbit,
+                str(image.path),
+                image.time_utc.isoformat(),
+                image.path.stat().st_size,
+            )
+            if tuple(registered)[1:] != current:
+                raise ValueError(
+                    f"registered catalogue image metadata changed: {image_id}"
+                )
+        if int(registered_count[0]) != len(rows):
+            raise ValueError("registered candidate image-pair plan is incomplete")
         planned = []
         for row in rows:
+            if int(row["ordinal"]) != len(planned):
+                raise ValueError(
+                    "registered candidate image-pair ordinals are not contiguous"
+                )
             try:
                 pair = ImagePair(
                     images[row["source_image_id"]],
@@ -585,6 +638,7 @@ class RunStore:
         self, batches: Iterable[Iterable[TrajectoryPoint]]
     ) -> None:
         with closing(self._connect()) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 "DROP INDEX IF EXISTS trajectory_points_run_image_state"
             )

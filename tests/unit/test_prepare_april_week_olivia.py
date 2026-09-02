@@ -139,6 +139,10 @@ def test_olivia_submission_uses_gpu_workers_and_cpu_composition_barriers():
     assert "--dependency=\"afterok:$dependency\"" in submit
     assert "--gpus-per-node=0" in submit
     assert '--array="0-$((gpu_workers - 1))"' in submit
+    assert "LIMOSAT_CONFIG_SHA256" in submit
+    assert "LIMOSAT_CATALOGUE_SHA256" in submit
+    assert 'check_sha256 "$LIMOSAT_CATALOGUE"' in job
     assert "python -m limosat pairs" in job
     assert "python -m limosat compose" in job
+    assert "python -m limosat ingest" not in job
     assert "python -m limosat run" not in job

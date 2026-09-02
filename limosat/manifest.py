@@ -10,7 +10,7 @@ from typing import Sequence
 
 from .catalog import ImageCatalogue
 from .config import RunConfig
-from .pair_artifacts import PAIR_PRODUCT_SCHEMA_VERSION
+from .pair_products import PAIR_PRODUCT_SCHEMA_VERSION
 from .store import RunStore, file_sha256
 
 
