@@ -10,6 +10,7 @@ from typing import Sequence
 
 from .catalog import ImageCatalogue
 from .config import RunConfig
+from .pair_artifacts import PAIR_PRODUCT_SCHEMA_VERSION
 from .store import RunStore, file_sha256
 
 
@@ -36,6 +37,7 @@ def write_manifest(
             "sqlite": 4,
             "pair_displacement_field": 1,
             "pair_match_archive": 1,
+            "pair_worker_product": PAIR_PRODUCT_SCHEMA_VERSION,
             "lagrangian_trajectory": 4,
             "deformation_cell": 1,
         },
@@ -77,6 +79,11 @@ def write_manifest(
             "enabled": config.retain_pair_matches,
             "stage": "post-gate, pre-field-consensus selected hypothesis",
             "storage": "checksummed compressed SQLite BLOB per completed pair",
+        },
+        "execution_architecture": {
+            "pair_workers_write_sqlite": False,
+            "pair_products": "immutable atomic NPZ plus JSON completion marker",
+            "trajectory_composition": "single-writer streamed CPU composition",
         },
         "recovery_deformation_policy": (
             "non-consecutive recovery pair fields reconnect trajectories only; "

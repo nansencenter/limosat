@@ -47,6 +47,27 @@ planning cell. The union of those cell choices defines the target's primary
 image pairs without a per-target cap. Primary pair fields are independent and
 `pair_workers` controls local concurrency.
 
+`limosat run` is the portable single-machine interface. Internally it uses the
+same explicit stages available to batch systems:
+
+```bash
+limosat prepare config.yaml
+limosat pairs config.yaml --kind primary
+limosat ingest config.yaml --kind primary
+limosat compose config.yaml --phase primary
+limosat pairs config.yaml --kind recovery
+limosat ingest config.yaml --kind recovery
+limosat compose config.yaml --phase final
+```
+
+Pair workers write immutable NPZ data plus JSON completion markers under
+`pair_product_directory`; they never write SQLite. The single CPU coordinator
+validates and imports those products and streams trajectory rows into the
+global database. `--batch-index I --batch-count N` partitions pair work
+deterministically for scheduler arrays. These files are resumable work
+products, not additional deliverables; the finalized SQLite and Parquet files
+remain the products to transfer.
+
 Production catalogues should provide platform and absolute orbit metadata.
 Pairs from the same Sentinel-1 platform and absolute orbit are excluded. The
 matcher estimates coarse phase correlation for every independent production

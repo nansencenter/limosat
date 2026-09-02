@@ -28,9 +28,10 @@ PAIR_MATCH_ENCODING = "zlib-le-v1"
 class RunStore:
     """SQLite-backed state whose complete pair products are immutable."""
 
-    def __init__(self, config: RunConfig) -> None:
+    def __init__(self, config: RunConfig, *, read_only: bool = False) -> None:
         self.config = config
         self.path = Path(config.database)
+        self.read_only = read_only
         self.implementation_sha256 = implementation_sha256()
         self.model_sha256 = (
             file_sha256(config.matcher.checkpoint)
@@ -38,9 +39,12 @@ class RunStore:
             and Path(config.matcher.checkpoint).is_file()
             else None
         )
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._ensure_schema()
-        self._ensure_run()
+        if read_only:
+            self._validate_existing()
+        else:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._ensure_schema()
+            self._ensure_run()
 
     def register_catalogue(self, catalogue: ImageCatalogue) -> None:
         rows = []
@@ -249,10 +253,23 @@ class RunStore:
             connection.commit()
         return True
 
-    def save_pair(self, pair: ImagePair, result: PairResult) -> bool:
+    def save_pair(
+        self,
+        pair: ImagePair,
+        result: PairResult,
+        *,
+        match_count: int | None = None,
+    ) -> bool:
         """Atomically replace only incomplete state and mark completion last."""
         if pair.pair_id != result.field.pair_id:
             raise ValueError("pair identity and field identity differ")
+        stored_match_count = (
+            len(result.matches) if match_count is None else match_count
+        )
+        if stored_match_count < len(result.matches) or stored_match_count < 0:
+            raise ValueError("stored pair match count is inconsistent")
+        if self.config.retain_pair_matches and stored_match_count != len(result.matches):
+            raise ValueError("retained pair matches must include the complete match set")
         match_archive = (
             _encode_matches(result.matches)
             if self.config.retain_pair_matches
@@ -340,7 +357,7 @@ class RunStore:
                 (
                     _utc_now(),
                     result.field.checksum,
-                    len(result.matches),
+                    stored_match_count,
                     len(result.field),
                     int(result.field.available.sum()),
                     len(result.fold_rejected_indices),
@@ -455,6 +472,110 @@ class RunStore:
             int(row["uncompressed_bytes"]),
         )
 
+    def planned_pairs(self, catalogue: ImageCatalogue) -> tuple[PlannedPair, ...]:
+        """Reconstruct the registered immutable plan without replanning imagery."""
+        images = {image.image_id: image for image in catalogue.records}
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM candidate_pairs WHERE run_id=? ORDER BY ordinal
+                """,
+                (self.config.run_id,),
+            ).fetchall()
+        planned = []
+        for row in rows:
+            try:
+                pair = ImagePair(
+                    images[row["source_image_id"]],
+                    images[row["target_image_id"]],
+                )
+            except KeyError as error:
+                raise ValueError(
+                    f"registered image pair refers to an unknown image: {row['pair_id']}"
+                ) from error
+            if pair.pair_id != row["pair_id"]:
+                raise ValueError(f"registered image-pair identity changed: {row['pair_id']}")
+            planned.append(
+                PlannedPair(
+                    pair=pair,
+                    ordinal=int(row["ordinal"]),
+                    selection=row["selection"],
+                    overlap_fraction=row["overlap_fraction"],
+                    overlap_area_m2=row["overlap_area_m2"],
+                    skipped_images=int(row["skipped_images"]),
+                    planning_component_id=row["planning_component_id"],
+                )
+            )
+        return tuple(planned)
+
+    def completed_pair_ids(self, kind: str) -> frozenset[str]:
+        if kind not in {"primary", "recovery"}:
+            raise ValueError("pair kind must be primary or recovery")
+        with closing(self._connect()) as connection:
+            return frozenset(
+                row[0]
+                for row in connection.execute(
+                    """
+                    SELECT pair_id FROM pairs
+                    WHERE run_id=? AND kind=? AND status='complete'
+                    """,
+                    (self.config.run_id, kind),
+                )
+            )
+
+    def targeted_recovery_positions(
+        self, source_image_id: str, target_image_id: str
+    ) -> np.ndarray:
+        """Read measured source positions for parcels dormant at the target."""
+        with closing(self._connect()) as connection:
+            rows = self._targeted_recovery_rows(
+                connection, source_image_id, target_image_id
+            )
+        return np.asarray(rows, dtype=np.float64).reshape(-1, 2)
+
+    def iter_targeted_recovery_positions(
+        self, pairs: Iterable[ImagePair]
+    ):
+        """Yield measured-loss positions using one bounded read transaction."""
+        with closing(self._connect()) as connection:
+            for pair in pairs:
+                rows = self._targeted_recovery_rows(
+                    connection,
+                    pair.source.image_id,
+                    pair.target.image_id,
+                )
+                yield pair, np.asarray(rows, dtype=np.float64).reshape(-1, 2)
+
+    def _targeted_recovery_rows(
+        self,
+        connection: sqlite3.Connection,
+        source_image_id: str,
+        target_image_id: str,
+    ):
+        return connection.execute(
+            """
+            SELECT source.x_m,source.y_m
+            FROM trajectory_points target
+            JOIN trajectory_points source
+              ON source.run_id=target.run_id
+             AND source.trajectory_id=target.trajectory_id
+            WHERE target.run_id=?
+              AND target.image_id=? AND target.state='dormant'
+              AND source.image_id=? AND source.x_m IS NOT NULL
+            ORDER BY target.trajectory_id
+            """,
+            (self.config.run_id, target_image_id, source_image_id),
+        ).fetchall()
+
+    def run_record(self) -> dict:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM runs WHERE run_id=?", (self.config.run_id,)
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"run not found: {self.config.run_id}")
+        return dict(row)
+
     def replace_global_trajectories(
         self, points: Iterable[TrajectoryPoint]
     ) -> None:
@@ -464,6 +585,9 @@ class RunStore:
         self, batches: Iterable[Iterable[TrajectoryPoint]]
     ) -> None:
         with closing(self._connect()) as connection, connection:
+            connection.execute(
+                "DROP INDEX IF EXISTS trajectory_points_run_image_state"
+            )
             connection.execute(
                 "DELETE FROM trajectory_convergence_events WHERE run_id=?",
                 (self.config.run_id,),
@@ -519,6 +643,12 @@ class RunStore:
                         for point in values
                     ],
                 )
+            connection.execute(
+                """
+                CREATE INDEX trajectory_points_run_image_state
+                ON trajectory_points(run_id,image_id,state,trajectory_id)
+                """
+            )
 
     def replace_deformation(
         self, pair_id: str, cells: Iterable[DeformationCell]
@@ -688,12 +818,50 @@ class RunStore:
         return {"run": dict(run), "pairs": {row[0]: row[1] for row in pairs}}
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=60.0)
+        if self.read_only:
+            uri = self.path.resolve().as_uri() + "?mode=ro"
+            connection = sqlite3.connect(uri, timeout=60.0, uri=True)
+        else:
+            connection = sqlite3.connect(self.path, timeout=60.0)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA synchronous=FULL")
+        if self.read_only:
+            connection.execute("PRAGMA query_only=ON")
+        else:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA synchronous=FULL")
         return connection
+
+    def _validate_existing(self) -> None:
+        if not self.path.is_file():
+            raise FileNotFoundError(
+                f"run database does not exist; run prepare first: {self.path}"
+            )
+        with closing(self._connect()) as connection:
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version != DATABASE_SCHEMA_VERSION:
+                raise ValueError(
+                    f"unsupported LiMOSAT SQLite schema {version or 'legacy'}; "
+                    f"expected schema {DATABASE_SCHEMA_VERSION}"
+                )
+            row = connection.execute(
+                """
+                SELECT config_sha256,implementation_sha256,model_sha256
+                FROM runs WHERE run_id=?
+                """,
+                (self.config.run_id,),
+            ).fetchone()
+        expected = (
+            self.config.sha256,
+            self.implementation_sha256,
+            self.model_sha256,
+        )
+        if row is None:
+            raise ValueError(f"run not found: {self.config.run_id}")
+        if tuple(row) != expected:
+            raise ValueError(
+                f"run {self.config.run_id!r} uses different code, model, or config"
+            )
 
     def _ensure_schema(self) -> None:
         connection = sqlite3.connect(self.path, timeout=60.0)
@@ -897,6 +1065,8 @@ CREATE TABLE IF NOT EXISTS trajectory_points (
   FOREIGN KEY(run_id,trajectory_id)
     REFERENCES trajectories(run_id,trajectory_id)
 );
+CREATE INDEX IF NOT EXISTS trajectory_points_run_image_state
+  ON trajectory_points(run_id,image_id,state,trajectory_id);
 CREATE TABLE IF NOT EXISTS trajectory_convergence_events (
   run_id TEXT NOT NULL, image_id TEXT NOT NULL, time_utc TEXT NOT NULL,
   winner_trajectory_id TEXT NOT NULL, candidate_trajectory_id TEXT NOT NULL,

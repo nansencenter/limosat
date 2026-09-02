@@ -82,18 +82,27 @@ scripts/submit_april_week_olivia.sh
 ```
 
 The submit wrapper freezes the method revision, official EfficientLoFTR
-revision, and checkpoint checksum before submitting one GPU job. The job first
-loads a SIC field and validates the deterministic candidate plan, then runs,
-reports status, and finalizes the compact products. Re-running only the submit
-wrapper resumes immutable completed pair fields from the same schema-v4
-database. Site settings can be overridden with `GPU_ACCOUNT`, `WALL_TIME`,
-`MEMORY`, `RUN_ID`, and `RUN_ROOT`; `--dry-run` prints the exact `sbatch`
-command without submitting it.
+revision, and checkpoint checksum before submitting a dependency chain: CPU
+preparation, primary GPU pair processing, CPU primary composition, recovery
+GPU pair processing, and CPU final composition/finalization. CPU jobs run on
+the Olivia accelerator partition with zero GPUs so the GPU is released while
+millions of trajectory rows are written. Every stage uses the same container,
+configuration, and source revision.
+
+`GPU_WORKERS=1` is the default. A later run can set `GPU_WORKERS=N` to create
+deterministic primary and recovery Slurm arrays without concurrent SQLite
+writes. Re-running only the submit wrapper resumes verified pair products and
+already imported fields. Site settings can be overridden with `GPU_ACCOUNT`,
+`CPU_ACCOUNT`, `WALL_TIME`, `CPU_WALL_TIME`, `MEMORY`, `CPU_MEMORY`, `RUN_ID`,
+and `RUN_ROOT`; `--dry-run` prints all five `sbatch` commands without submitting
+them.
 
 For this assessment rerun, retained matches allow later field-consensus and
 post-processing tests without repeating GPU inference. They are stored inside
-the same authoritative SQLite database; no per-pair NPZ directories are
-written. Download `global-trajectory-catalogue-v1.parquet` and
+the authoritative SQLite database after coordinator import. Intermediate
+pair-product files remain under the run's `work/` directory for worker-level
+resume and do not need to be downloaded. Download
+`global-trajectory-catalogue-v1.parquet` and
 `assessment-summary-v1.json` first for routine analysis. Preserve or archive
 the SQLite database when raw matches, pair fields, deformation, and full audit
 state are required.

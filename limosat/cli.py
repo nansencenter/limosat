@@ -10,8 +10,10 @@ from typing import Sequence
 from .catalog import load_catalogue
 from .config import load_config
 from .finalize import finalize_products
+from .pair_artifacts import PairProductStore
 from .planning import build_candidate_plan, recovery_candidates, select_overlap_probe
 from .run import LiMOSATRun
+from .stages import RunStages
 from .store import RunStore
 
 
@@ -20,6 +22,27 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     run = commands.add_parser("run", help="process all catalogue components")
     run.add_argument("config", type=Path)
+    prepare = commands.add_parser(
+        "prepare", help="freeze the catalogue and candidate image-pair plan"
+    )
+    prepare.add_argument("config", type=Path)
+    pairs = commands.add_parser(
+        "pairs", help="measure one deterministic batch of image pairs"
+    )
+    pairs.add_argument("config", type=Path)
+    pairs.add_argument("--kind", choices=("primary", "recovery"), required=True)
+    pairs.add_argument("--batch-index", type=int, default=0)
+    pairs.add_argument("--batch-count", type=int, default=1)
+    ingest = commands.add_parser(
+        "ingest", help="import completed pair products into SQLite"
+    )
+    ingest.add_argument("config", type=Path)
+    ingest.add_argument("--kind", choices=("primary", "recovery"), required=True)
+    compose = commands.add_parser(
+        "compose", help="stream global trajectories from completed pair fields"
+    )
+    compose.add_argument("config", type=Path)
+    compose.add_argument("--phase", choices=("primary", "final"), required=True)
     status = commands.add_parser("status", help="show durable local run state")
     status.add_argument("config", type=Path)
     plan = commands.add_parser(
@@ -52,8 +75,33 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = load_config(arguments.config)
     if arguments.command == "run":
         result = LiMOSATRun(config).execute(["limosat", "run", str(arguments.config)])
+    elif arguments.command == "prepare":
+        result = RunStages(config).prepare()
+    elif arguments.command == "pairs":
+        result = RunStages(config).process_pairs(
+            arguments.kind,
+            batch_index=arguments.batch_index,
+            batch_count=arguments.batch_count,
+        )
+    elif arguments.command == "ingest":
+        result = RunStages(config).ingest_pair_products(arguments.kind)
+    elif arguments.command == "compose":
+        result = RunStages(config).compose(
+            arguments.phase,
+            [
+                "limosat",
+                "compose",
+                str(arguments.config),
+                "--phase",
+                arguments.phase,
+            ],
+        )
     elif arguments.command == "status":
         result = RunStore(config).status()
+        products = PairProductStore(config)
+        result["pair_products"] = {
+            kind: products.count(kind) for kind in ("primary", "recovery")
+        }
     elif arguments.command == "finalize":
         result = finalize_products(
             config,

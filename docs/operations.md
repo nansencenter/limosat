@@ -47,9 +47,11 @@ listed image pair is treated as primary so a small diagnostic run actually
 processes every selected pair. Use a separate run ID/database and clear the
 allowlist for a full run.
 
-Primary pair fields have no preceding-pair dependency and can be claimed and
-processed independently. `pair_workers` controls local concurrency. Complete
-fields are immutable and are loaded on resume.
+Primary pair fields have no preceding-pair dependency and can be processed
+independently. `pair_workers` controls concurrency within one worker process;
+`limosat pairs --batch-index I --batch-count N` provides deterministic,
+non-overlapping work for multiple processes. Each worker writes an immutable
+pair product and does not write the global SQLite database.
 
 ## Matching and recovery
 
@@ -108,10 +110,25 @@ numeric radius is not reused because its coordinate semantics were ambiguous.
 
 ## Resume and outputs
 
-SQLite is the source of run truth. A pair is marked `running` before inference;
-its field nodes and completion record are committed in one transaction. A
-stopped `running` or `failed` pair is safe to retry. A `complete` pair is loaded
-and never overwritten by normal resume.
+The run begins with `limosat prepare`, which freezes the catalogue and
+candidate image-pair plan in SQLite. Pair workers then write atomic NPZ data
+and JSON completion markers under `pair_product_directory`. A completion
+marker binds the product to the run, configuration, source implementation,
+checkpoint, image-pair identity, and—for recovery—the exact measured source
+positions. Existing completed products are verified and never overwritten.
+
+`limosat ingest` is the only pair-product SQLite writer. It checksum-verifies
+every expected worker product, imports the field and optional raw matches in
+one transaction, and derives deformation only for primary pair fields. The
+CPU composer streams per-image trajectory batches into one transaction; an
+interruption rolls back the incomplete composition. Recovery workers only run
+after the primary composition supplies genuine measured-loss positions.
+
+`limosat run CONFIG` executes all stages sequentially and is the recommended
+interface on a local or other single-GPU machine. Scheduler launchers may call
+the stages separately without changing their scientific behavior. SQLite is
+the authoritative scientific and finalized resume product after ingestion;
+pair-product files are intermediate compute-resume state.
 
 The output directory contains `run-manifest-v4.json`. Scientific arrays and
 tables live in SQLite; no result products belong in Git. `limosat status`
@@ -128,6 +145,12 @@ report is sufficient.
 For a controlled restart under a changed configuration, choose a new `run_id`
 and database/output path. Reusing a `run_id` with a different resolved config is
 rejected.
+
+After successful finalization and transfer of any required assessment
+products, the pair-product directory can be removed to reclaim duplicated work
+space. Keep it until the run and its raw-match retention policy have been
+verified; removing it prevents worker-level resume but does not alter the
+completed SQLite catalogue.
 
 ## Read-only production field replay
 

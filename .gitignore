@@ -46,6 +46,7 @@ dist/
 *.db
 *.npz
 *.npy
+*.pair-products/
 *.zarr/
 *.tif
 *.tiff

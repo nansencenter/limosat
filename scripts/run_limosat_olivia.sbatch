@@ -20,6 +20,8 @@ set -euo pipefail
 : "${LIMOSAT_READY_MARKER:?}"
 : "${LIMOSAT_CPU_AUDIT:?}"
 : "${LIMOSAT_EXPECTED_IMAGES:?}"
+: "${LIMOSAT_STAGE:?}"
+: "${LIMOSAT_GPU_WORKERS:?}"
 
 finish() {
   code=$?
@@ -28,9 +30,10 @@ finish() {
 trap finish EXIT
 
 check_revision() {
-  repository="$1"
-  expected="$2"
-  label="$3"
+  local repository="$1"
+  local expected="$2"
+  local label="$3"
+  local actual
   actual=$(git -C "$repository" rev-parse HEAD)
   [[ "$actual" == "$expected" ]] || {
     echo "$label revision mismatch: expected $expected, found $actual" >&2
@@ -63,9 +66,13 @@ done
 
 checkpoint_directory=$(dirname "$LIMOSAT_CHECKPOINT")
 run_in_container() {
+  local -a container_options=(exec --cleanenv --no-home)
+  if [[ "$LIMOSAT_STAGE" == "primary-pairs" || "$LIMOSAT_STAGE" == "recovery-pairs" ]]; then
+    container_options+=(--nv)
+  fi
   env -u APPTAINER_BIND -u APPTAINER_BINDPATH \
     -u SINGULARITY_BIND -u SINGULARITY_BINDPATH \
-    apptainer exec --cleanenv --no-home --nv \
+    apptainer "${container_options[@]}" \
     --overlay "$LIMOSAT_OVERLAY:ro" \
     --bind "$LIMOSAT_METHOD_ROOT:$LIMOSAT_METHOD_ROOT:ro" \
     --bind "$LIMOSAT_OFFICIAL_REPOSITORY:$LIMOSAT_OFFICIAL_REPOSITORY:ro" \
@@ -80,28 +87,33 @@ run_in_container() {
 }
 
 plan="$LIMOSAT_RUN_ROOT/control/april-week-full-plan.json"
-run_result="$LIMOSAT_RUN_ROOT/control/run-result.json"
-status_result="$LIMOSAT_RUN_ROOT/control/final-status.json"
-finalize_result="$LIMOSAT_RUN_ROOT/control/finalize-result.json"
-temporary_suffix=".tmp.${SLURM_JOB_ID}"
+array_index="${SLURM_ARRAY_TASK_ID:-0}"
+temporary_suffix=".tmp.${SLURM_JOB_ID}.${array_index}"
+
+run_json() {
+  local destination="$1"
+  shift
+  run_in_container "$@" > "${destination}${temporary_suffix}"
+  mv "${destination}${temporary_suffix}" "$destination"
+}
 
 echo "job_started_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "stage=$LIMOSAT_STAGE"
 echo "method_revision=$LIMOSAT_EXPECTED_REVISION"
 echo "official_revision=$LIMOSAT_OFFICIAL_REVISION"
-nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
 
-first_sic="$LIMOSAT_SIC_ROOT/ice_conc_nh_polstere-100_multi_202004011200.nc"
-run_in_container python - "$first_sic" <<'PY'
+case "$LIMOSAT_STAGE" in
+  prepare)
+    first_sic="$LIMOSAT_SIC_ROOT/ice_conc_nh_polstere-100_multi_202004011200.nc"
+    run_in_container python - "$first_sic" <<'PY'
 import sys
 from limosat.tile_gates import load_sic_field
 
 field = load_sic_field(sys.argv[1])
 print("sic_variable=%s sic_shape=%s" % (field.variable, field.values_percent.shape))
 PY
-
-run_in_container python -m limosat plan "$LIMOSAT_CONFIG" > "${plan}${temporary_suffix}"
-mv "${plan}${temporary_suffix}" "$plan"
-run_in_container python - "$plan" "$LIMOSAT_EXPECTED_IMAGES" <<'PY'
+    run_json "$plan" python -m limosat plan "$LIMOSAT_CONFIG"
+    run_in_container python - "$plan" "$LIMOSAT_EXPECTED_IMAGES" <<'PY'
 import json
 import sys
 
@@ -124,14 +136,38 @@ print(
     )
 )
 PY
-
-run_in_container python -m limosat run "$LIMOSAT_CONFIG" \
-  > "${run_result}${temporary_suffix}"
-mv "${run_result}${temporary_suffix}" "$run_result"
-run_in_container python -m limosat status "$LIMOSAT_CONFIG" \
-  > "${status_result}${temporary_suffix}"
-mv "${status_result}${temporary_suffix}" "$status_result"
-run_in_container python -m limosat finalize "$LIMOSAT_CONFIG" \
-  > "${finalize_result}${temporary_suffix}"
-mv "${finalize_result}${temporary_suffix}" "$finalize_result"
-echo "run_complete=$LIMOSAT_RUN_ID"
+    run_json "$LIMOSAT_RUN_ROOT/control/prepare-stage.json" \
+      python -m limosat prepare "$LIMOSAT_CONFIG"
+    ;;
+  primary-pairs|recovery-pairs)
+    nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
+    kind="${LIMOSAT_STAGE%-pairs}"
+    result="$LIMOSAT_RUN_ROOT/control/${kind}-pairs-${array_index}.json"
+    run_json "$result" python -m limosat pairs "$LIMOSAT_CONFIG" \
+      --kind "$kind" --batch-index "$array_index" \
+      --batch-count "$LIMOSAT_GPU_WORKERS"
+    ;;
+  primary-compose)
+    run_json "$LIMOSAT_RUN_ROOT/control/primary-ingest.json" \
+      python -m limosat ingest "$LIMOSAT_CONFIG" --kind primary
+    run_json "$LIMOSAT_RUN_ROOT/control/primary-compose.json" \
+      python -m limosat compose "$LIMOSAT_CONFIG" --phase primary
+    run_json "$LIMOSAT_RUN_ROOT/control/primary-status.json" \
+      python -m limosat status "$LIMOSAT_CONFIG"
+    ;;
+  final-compose)
+    run_json "$LIMOSAT_RUN_ROOT/control/recovery-ingest.json" \
+      python -m limosat ingest "$LIMOSAT_CONFIG" --kind recovery
+    run_json "$LIMOSAT_RUN_ROOT/control/final-compose.json" \
+      python -m limosat compose "$LIMOSAT_CONFIG" --phase final
+    run_json "$LIMOSAT_RUN_ROOT/control/final-status.json" \
+      python -m limosat status "$LIMOSAT_CONFIG"
+    run_json "$LIMOSAT_RUN_ROOT/control/finalize-result.json" \
+      python -m limosat finalize "$LIMOSAT_CONFIG"
+    echo "run_complete=$LIMOSAT_RUN_ID"
+    ;;
+  *)
+    echo "unknown LIMOSAT_STAGE: $LIMOSAT_STAGE" >&2
+    exit 2
+    ;;
+esac

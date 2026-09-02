@@ -14,6 +14,7 @@ from .models import DisplacementField, FieldEdge, MotionMatches, PairResult
 from .deformation import DeformationCell, deformation_from_field
 from .efficientloftr import EfficientLoFTR
 from .pairs import PairProcessor
+from .pair_artifacts import PairProduct, PairProductStore
 from .planning import (
     CandidatePlan,
     PlannedPair,
@@ -31,6 +32,7 @@ from .trajectory import (
     iter_global_trajectory_points,
 )
 from .run import LiMOSATRun
+from .stages import RunStages
 from .store import RunStore
 
 __all__ = [
@@ -48,11 +50,14 @@ __all__ = [
     "MotionMatches",
     "PairResult",
     "PairProcessor",
+    "PairProduct",
+    "PairProductStore",
     "CandidatePlan",
     "ConvergenceEvent",
     "PlannedPair",
     "RoutingConfig",
     "RunConfig",
+    "RunStages",
     "RunStore",
     "TrajectoryConfig",
     "TrajectoryPoint",

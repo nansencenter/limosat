@@ -2,6 +2,7 @@ run_id: limosat-efficientloftr-run
 catalogue: ./catalogue.csv
 database: ./outputs/limosat.sqlite
 output_directory: ./outputs
+pair_product_directory: ./outputs/pair-products
 analysis_epsg: 3413
 pair_workers: 1
 retain_pair_matches: false

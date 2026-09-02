@@ -171,6 +171,7 @@ class RunConfig:
     catalogue: str
     database: str
     output_directory: str
+    pair_product_directory: str = ""
     analysis_epsg: int = 3413
     pair_workers: int = 1
     matcher: MatcherConfig = dataclass_field(default_factory=MatcherConfig)
@@ -194,6 +195,14 @@ class RunConfig:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    @property
+    def pair_products(self) -> Path:
+        """Intermediate immutable pair products used by staged execution."""
+        if self.pair_product_directory:
+            return Path(self.pair_product_directory)
+        database = Path(self.database)
+        return database.with_name(database.name + ".pair-products")
 
     @property
     def sha256(self) -> str:
@@ -222,8 +231,13 @@ def load_config(path: str | Path) -> RunConfig:
         raise ValueError("configuration root must be a mapping")
     base = config_path.parent
     resolved = dict(values)
-    for name in ("catalogue", "database", "output_directory"):
-        if name in resolved:
+    for name in (
+        "catalogue",
+        "database",
+        "output_directory",
+        "pair_product_directory",
+    ):
+        if resolved.get(name):
             resolved[name] = str(_resolve_path(base, resolved[name]))
     matcher_values = dict(resolved.get("matcher", {}))
     for name in ("repository", "checkpoint"):

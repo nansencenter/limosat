@@ -213,6 +213,7 @@ def run_config(run_id, catalogue, run_root, official_repository, checkpoint, sic
         "catalogue": str(catalogue),
         "database": str(run_root / "control" / "state.sqlite"),
         "output_directory": str(run_root / "products"),
+        "pair_product_directory": str(run_root / "work" / "pair-products"),
         "analysis_epsg": 3413,
         "pair_workers": 1,
         "retain_pair_matches": True,
@@ -343,7 +344,7 @@ def main(argv=None):
     ):
         if not required.exists():
             raise SystemExit("missing required input: %s" % required)
-    for directory in ("control", "inputs", "logs", "products"):
+    for directory in ("control", "inputs", "logs", "products", "work"):
         (run_root / directory).mkdir(parents=True, exist_ok=True)
 
     sic_checksums = prepare_sic(sic_root, download=arguments.download_sic)

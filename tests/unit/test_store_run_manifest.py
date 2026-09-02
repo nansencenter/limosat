@@ -168,6 +168,7 @@ def test_sequence_recovers_measured_loss_and_resumes_with_versioned_manifest(tmp
     assert len(manifest["implementation_sha256"]) == 64
     assert manifest["product_schemas"]["lagrangian_trajectory"] == 4
     assert manifest["product_schemas"]["pair_match_archive"] == 1
+    assert manifest["product_schemas"]["pair_worker_product"] == 1
     assert manifest["coordinates"]["crs"] == "EPSG:3413"
     assert manifest["product_counts"]["trajectories"] == 4
     assert manifest["product_counts"]["candidate_pairs"] == 3
@@ -182,6 +183,8 @@ def test_sequence_recovers_measured_loss_and_resumes_with_versioned_manifest(tmp
     assert recovery[0]["retained_matches"]["encoding"] == "zlib-le-v1"
     assert len(recovery[0]["retained_matches"]["payload_sha256"]) == 64
     assert recovery[0]["diagnostics"]["phase_correlation_status"] == "synthetic"
+    assert len(recovery[0]["diagnostics"]["pair_product_sha256"]) == 64
+    assert manifest["execution_architecture"]["pair_workers_write_sqlite"] is False
     assert recovery[0]["ancillary_inputs"] == {
         "/fixture.nc": "0" * 64
     }

@@ -4,6 +4,8 @@ set -euo pipefail
 method_root="${METHOD_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 project_id="${PROJECT_ID:-nn9878k}"
 gpu_account="${GPU_ACCOUNT:-nn2993k}"
+cpu_account="${CPU_ACCOUNT:-$gpu_account}"
+cpu_partition="${CPU_PARTITION:-accel}"
 run_id="${RUN_ID:-april2020-week01-global-5pct-sic-v1}"
 work_root="${WORK_ROOT:-/cluster/work/projects/$project_id/$USER}"
 project_root="${PROJECT_ROOT:-/cluster/projects/$project_id/$USER}"
@@ -21,7 +23,12 @@ cpu_audit="${CPU_AUDIT:-$overlay.cpu-audit.json}"
 wall_time="${WALL_TIME:-24:00:00}"
 memory="${MEMORY:-32G}"
 cpus="${CPUS_PER_TASK:-4}"
+gpu_workers="${GPU_WORKERS:-1}"
+cpu_wall_time="${CPU_WALL_TIME:-06:00:00}"
+cpu_memory="${CPU_MEMORY:-64G}"
+cpu_cpus="${CPU_CPUS_PER_TASK:-8}"
 slurm_qos="${SLURM_QOS:-}"
+cpu_qos="${CPU_QOS:-}"
 dry_run=0
 
 if [[ "${1:-}" == "--dry-run" ]]; then
@@ -38,6 +45,10 @@ for required in \
   [[ -e "$required" ]] || { echo "missing run prerequisite: $required" >&2; exit 2; }
 done
 command -v apptainer >/dev/null || { echo "apptainer is unavailable" >&2; exit 2; }
+[[ "$gpu_workers" =~ ^[1-9][0-9]*$ ]] || {
+  echo "GPU_WORKERS must be a positive integer" >&2
+  exit 2
+}
 
 method_revision=$(git -C "$method_root" rev-parse HEAD)
 official_revision=$(git -C "$official_repository" rev-parse HEAD)
@@ -55,35 +66,74 @@ fi
 
 mkdir -p "$run_root/logs"
 job_script="$method_root/scripts/run_limosat_olivia.sbatch"
-common_export="ALL,LIMOSAT_METHOD_ROOT=$method_root,LIMOSAT_EXPECTED_REVISION=$method_revision,LIMOSAT_RUN_ID=$run_id,LIMOSAT_RUN_ROOT=$run_root,LIMOSAT_CONFIG=$config,LIMOSAT_CATALOGUE=$catalogue,LIMOSAT_SIC_ROOT=$sic_root,LIMOSAT_SCENE_ROOT=$scene_root,LIMOSAT_OFFICIAL_REPOSITORY=$official_repository,LIMOSAT_OFFICIAL_REVISION=$official_revision,LIMOSAT_CHECKPOINT=$checkpoint,LIMOSAT_CHECKPOINT_SHA256=$checkpoint_sha256,LIMOSAT_CONTAINER=$container,LIMOSAT_OVERLAY=$overlay,LIMOSAT_READY_MARKER=$ready_marker,LIMOSAT_CPU_AUDIT=$cpu_audit,LIMOSAT_EXPECTED_IMAGES=781"
+common_export="ALL,LIMOSAT_METHOD_ROOT=$method_root,LIMOSAT_EXPECTED_REVISION=$method_revision,LIMOSAT_RUN_ID=$run_id,LIMOSAT_RUN_ROOT=$run_root,LIMOSAT_CONFIG=$config,LIMOSAT_CATALOGUE=$catalogue,LIMOSAT_SIC_ROOT=$sic_root,LIMOSAT_SCENE_ROOT=$scene_root,LIMOSAT_OFFICIAL_REPOSITORY=$official_repository,LIMOSAT_OFFICIAL_REVISION=$official_revision,LIMOSAT_CHECKPOINT=$checkpoint,LIMOSAT_CHECKPOINT_SHA256=$checkpoint_sha256,LIMOSAT_CONTAINER=$container,LIMOSAT_OVERLAY=$overlay,LIMOSAT_READY_MARKER=$ready_marker,LIMOSAT_CPU_AUDIT=$cpu_audit,LIMOSAT_EXPECTED_IMAGES=781,LIMOSAT_GPU_WORKERS=$gpu_workers"
 
-command=(
-  sbatch --parsable
-  --job-name="eloftr-apr20"
-  --account="$gpu_account"
-  --partition=accel
-  --gpus=1
-  --nodes=1
-  --cpus-per-task="$cpus"
-  --mem="$memory"
-  --time="$wall_time"
-  --output="$run_root/logs/%x-%j.out"
-  --error="$run_root/logs/%x-%j.err"
-  --export="$common_export"
-)
-if [[ -n "$slurm_qos" ]]; then
-  command+=(--qos="$slurm_qos")
-fi
-command+=("$job_script")
+build_command() {
+  local stage="$1"
+  local resource="$2"
+  local dependency="$3"
+  command=(sbatch --parsable --nodes=1 --ntasks=1 --job-name="eloftr-${stage}")
+  if [[ "$resource" == "gpu" ]]; then
+    command+=(
+      --account="$gpu_account" --partition=accel --gpus=1
+      --array="0-$((gpu_workers - 1))"
+      --cpus-per-task="$cpus" --mem="$memory" --time="$wall_time"
+      --output="$run_root/logs/%x-%A_%a.out"
+      --error="$run_root/logs/%x-%A_%a.err"
+    )
+    [[ -z "$slurm_qos" ]] || command+=(--qos="$slurm_qos")
+  else
+    command+=(
+      --account="$cpu_account"
+      --cpus-per-task="$cpu_cpus" --mem="$cpu_memory" --time="$cpu_wall_time"
+      --output="$run_root/logs/%x-%j.out"
+      --error="$run_root/logs/%x-%j.err"
+    )
+    [[ -z "$cpu_partition" ]] || command+=(--partition="$cpu_partition")
+    [[ "$cpu_partition" != "accel" ]] || command+=(--gpus-per-node=0)
+    [[ -z "$cpu_qos" ]] || command+=(--qos="$cpu_qos")
+  fi
+  [[ -z "$dependency" ]] || command+=(--dependency="afterok:$dependency")
+  command+=(--export="$common_export,LIMOSAT_STAGE=$stage" "$job_script")
+}
+
+submit_stage() {
+  local submitted
+  build_command "$@"
+  submitted=$("${command[@]}")
+  echo "${submitted%%;*}"
+}
 
 if [[ "$dry_run" == "1" ]]; then
-  printf '%q ' "${command[@]}"
-  printf '\nDRY RUN: no job submitted\n'
+  previous=""
+  for specification in \
+    "prepare cpu" \
+    "primary-pairs gpu" \
+    "primary-compose cpu" \
+    "recovery-pairs gpu" \
+    "final-compose cpu"; do
+    read -r stage resource <<< "$specification"
+    dependency="$previous"
+    build_command "$stage" "$resource" "$dependency"
+    printf '%q ' "${command[@]}"
+    printf '\n'
+    previous="<${stage}-job-id>"
+  done
+  printf 'DRY RUN: no jobs submitted\n'
   exit 0
 fi
 
-job_id=$("${command[@]}")
-echo "submitted_job=$job_id"
+prepare_job=$(submit_stage prepare cpu "")
+primary_job=$(submit_stage primary-pairs gpu "$prepare_job")
+primary_compose_job=$(submit_stage primary-compose cpu "$primary_job")
+recovery_job=$(submit_stage recovery-pairs gpu "$primary_compose_job")
+final_job=$(submit_stage final-compose cpu "$recovery_job")
+
+echo "prepare_job=$prepare_job"
+echo "primary_pair_job=$primary_job"
+echo "primary_compose_job=$primary_compose_job"
+echo "recovery_pair_job=$recovery_job"
+echo "final_compose_job=$final_job"
 echo "run_root=$run_root"
-echo "log=$run_root/logs/eloftr-apr20-$job_id.out"
-squeue -j "$job_id"
+echo "final_log=$run_root/logs/eloftr-final-compose-$final_job.out"
+squeue -j "$prepare_job,$primary_job,$primary_compose_job,$recovery_job,$final_job"

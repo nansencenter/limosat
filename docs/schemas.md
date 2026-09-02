@@ -85,6 +85,21 @@ plus divergence, shear, total deformation, and vorticity in inverse seconds.
 Product schema versions are listed independently so additive trajectory or
 deformation revisions do not silently change the pair-field contract.
 
+## Pair worker product version 1
+
+Independent pair workers publish one compressed NPZ data file and one JSON
+completion marker per measured image pair. The marker is written last and is
+the completion boundary. It records the run/configuration/source/checkpoint
+identity, image-pair times and kind, field checksum, data-file SHA256, counts,
+diagnostics, ancillary-input checksums, and a checksum of targeted recovery
+positions where applicable. Array dtypes preserve float64 EPSG:3413
+coordinates and displacements and int32 indices.
+
+These are intermediate compute products rather than catalogue deliverables.
+Only the coordinator imports them into SQLite, and their checksums are retained
+in pair diagnostics in the native manifest. A worker cannot replace a marked
+product with different content.
+
 ## Finalized trajectory catalogue version 1
 
 `limosat finalize CONFIG` requires a complete schema-v4 native run, verifies

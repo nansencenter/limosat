@@ -158,6 +158,14 @@ builder before a production rebuild.
 - [x] **Resource and failure audit.** Preserve deterministic pair claiming,
   immutable completion, checksums, and retryable failures while adding counts
   for validity, motion, orbit, open-water, and insufficient-support rejection.
+- [x] **Portable staged execution.** Keep `limosat run` as the local and
+  single-GPU interface while exposing deterministic primary/recovery pair
+  batches for Slurm or another launcher. Workers publish immutable pair
+  products and never write the global SQLite database.
+- [x] **Streaming CPU composition.** Import completed pair products through one
+  coordinator and stream per-image global trajectory rows into SQLite. Query
+  primary rows for measured-loss recovery instead of retaining the complete
+  trajectory catalogue as Python objects.
 
 ## Experiment sequence
 

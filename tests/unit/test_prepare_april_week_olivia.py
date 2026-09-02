@@ -8,6 +8,8 @@ from limosat.config import load_config
 
 
 SCRIPT = Path(__file__).parents[2] / "scripts" / "prepare_april_week_olivia.py"
+SUBMIT_SCRIPT = Path(__file__).parents[2] / "scripts" / "submit_april_week_olivia.sh"
+JOB_SCRIPT = Path(__file__).parents[2] / "scripts" / "run_limosat_olivia.sbatch"
 SPEC = importlib.util.spec_from_file_location("prepare_april_week_olivia", SCRIPT)
 PREPARE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PREPARE)
@@ -103,6 +105,9 @@ def test_generated_configuration_enables_reviewed_gpu_policy(tmp_path):
 
     assert config["analysis_epsg"] == 3413
     assert config["retain_pair_matches"] is True
+    assert config["pair_product_directory"] == str(
+        tmp_path / "run" / "work" / "pair-products"
+    )
     assert config["routing"]["candidate_minimum_overlap_fraction"] == 0.05
     assert config["routing"]["candidate_minimum_overlap_area_m2"] == 1_024_000_000.0
     assert config["routing"]["require_orbit_metadata"] is True
@@ -115,3 +120,25 @@ def test_generated_configuration_enables_reviewed_gpu_policy(tmp_path):
     assert loaded.analysis_epsg == 3413
     assert loaded.routing.require_orbit_metadata is True
     assert loaded.open_water.enabled is True
+
+
+def test_olivia_submission_uses_gpu_workers_and_cpu_composition_barriers():
+    submit = SUBMIT_SCRIPT.read_text(encoding="utf-8")
+    job = JOB_SCRIPT.read_text(encoding="utf-8")
+
+    ordered_stages = (
+        "prepare cpu",
+        "primary-pairs gpu",
+        "primary-compose cpu",
+        "recovery-pairs gpu",
+        "final-compose cpu",
+    )
+    assert [submit.index(stage) for stage in ordered_stages] == sorted(
+        submit.index(stage) for stage in ordered_stages
+    )
+    assert "--dependency=\"afterok:$dependency\"" in submit
+    assert "--gpus-per-node=0" in submit
+    assert '--array="0-$((gpu_workers - 1))"' in submit
+    assert "python -m limosat pairs" in job
+    assert "python -m limosat compose" in job
+    assert "python -m limosat run" not in job
