@@ -116,13 +116,45 @@ echo "official_revision=$LIMOSAT_OFFICIAL_REVISION"
 
 case "$LIMOSAT_STAGE" in
   prepare)
-    first_sic="$LIMOSAT_SIC_ROOT/ice_conc_nh_polstere-100_multi_202004011200.nc"
-    run_in_container python - "$first_sic" <<'PY'
+    run_in_container python - "$LIMOSAT_SIC_ROOT" <<'PY'
 import sys
+from pathlib import Path
+
 from limosat.tile_gates import load_sic_field
 
-field = load_sic_field(sys.argv[1])
-print("sic_variable=%s sic_shape=%s" % (field.variable, field.values_percent.shape))
+root = Path(sys.argv[1])
+days = (
+    "20200331", "20200401", "20200402", "20200403", "20200404",
+    "20200405", "20200406", "20200407", "20200408",
+)
+fields = []
+for day in days:
+    path = root / ("ice_conc_nh_polstere-100_multi_%s1200.nc" % day)
+    fields.append(load_sic_field(path))
+print(
+    "sic_files=%d sic_variables=%s sic_shapes=%s"
+    % (
+        len(fields),
+        sorted(set(field.variable for field in fields)),
+        sorted(set(field.values_percent.shape for field in fields)),
+    )
+)
+PY
+    run_in_container python - "$LIMOSAT_CONFIG" <<'PY'
+import sys
+from dataclasses import replace
+
+import pyarrow
+
+from limosat.config import load_config
+from limosat.efficientloftr import EfficientLoFTR
+
+config = load_config(sys.argv[1])
+matcher = EfficientLoFTR(replace(config.matcher, device="cpu"))
+print(
+    "matcher_model=%s matcher_device=%s pyarrow=%s"
+    % (matcher.config.model_name, matcher.device, pyarrow.__version__)
+)
 PY
     run_json "$plan" python -m limosat plan "$LIMOSAT_CONFIG"
     run_in_container python - "$plan" "$LIMOSAT_EXPECTED_IMAGES" <<'PY'

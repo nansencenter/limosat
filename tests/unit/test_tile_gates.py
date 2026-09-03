@@ -11,6 +11,7 @@ from limosat.tile_gates import (
     OpenWaterEvidence,
     SicField,
     SicFileIndex,
+    load_sic_field,
     tile_open_water_evidence,
     valid_tile_overlap_gate,
 )
@@ -32,6 +33,33 @@ def _write_sic(path: Path, value: float) -> None:
         transform=from_origin(-20_000.0, 20_000.0, 1_000.0, 1_000.0),
     ) as dataset:
         dataset.write(values, 1)
+
+
+def test_load_sic_field_preserves_masked_integer_nodata_as_nan(tmp_path):
+    path = tmp_path / "ice_conc_nh_polstere-100_multi_202001011200.tif"
+    nodata = -32767
+    values = np.full((4, 5), 730, dtype=np.int16)
+    values[1, 2] = nodata
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        width=values.shape[1],
+        height=values.shape[0],
+        count=1,
+        dtype="int16",
+        nodata=nodata,
+        crs="EPSG:3413",
+        transform=from_origin(-2_500.0, 2_000.0, 1_000.0, 1_000.0),
+    ) as dataset:
+        dataset.write(values, 1)
+        dataset.scales = (0.1,)
+
+    field = load_sic_field(path)
+
+    assert field.values_percent.dtype == np.float64
+    np.testing.assert_allclose(field.values_percent[0, 0], 73.0)
+    assert np.isnan(field.values_percent[1, 2])
 
 
 def test_open_water_requires_complete_below_threshold_evidence():

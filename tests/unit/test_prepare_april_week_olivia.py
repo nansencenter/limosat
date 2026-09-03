@@ -142,6 +142,10 @@ def test_olivia_submission_uses_gpu_workers_and_cpu_composition_barriers():
     assert "LIMOSAT_CONFIG_SHA256" in submit
     assert "LIMOSAT_CATALOGUE_SHA256" in submit
     assert 'check_sha256 "$LIMOSAT_CATALOGUE"' in job
+    assert 'for day in days:' in job
+    assert 'fields.append(load_sic_field(path))' in job
+    assert 'import pyarrow' in job
+    assert 'replace(config.matcher, device="cpu")' in job
     assert "python -m limosat pairs" in job
     assert "python -m limosat compose" in job
     assert "python -m limosat ingest" not in job

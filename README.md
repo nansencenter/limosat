@@ -73,6 +73,7 @@ matcher estimates coarse phase correlation for every independent production
 pair. A response below 0.05 runs both phase-shifted and same-centre hypotheses;
 the normal field and fold gates select the better truth-free result. Too little
 common raster support falls back to same-centre rather than dropping the pair.
+Non-finite phase-correlation output also falls back to same-centre.
 Optional OSI SAF filtering skips a tile only when complete SIC samples on both
 dates are below 15%.
 

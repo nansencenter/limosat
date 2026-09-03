@@ -188,6 +188,29 @@ def test_low_response_phase_is_compared_with_same_center(tmp_path, monkeypatch):
     assert result.matcher_calls > result.diagnostics["planned_tiles"]
 
 
+def test_nonfinite_phase_correlation_falls_back_to_same_center(
+    tmp_path, monkeypatch
+):
+    config = _config(tmp_path)
+    config = RunConfig(
+        **{
+            **config.__dict__,
+            "routing": RoutingConfig(
+                initial="phase_correlation", residual_edge_recovery=False
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "limosat.routing.cv2.phaseCorrelate",
+        lambda *_args, **_kwargs: ((np.nan, np.nan), np.nan),
+    )
+
+    result = PairProcessor(config, StationaryMatcher()).process(_pair(tmp_path))
+
+    assert result.matcher_calls > 0
+    assert result.diagnostics["phase_correlation_status"] == "same_center_fallback"
+
+
 def test_speed_limit_uses_elapsed_seconds_and_metres_per_day():
     keep = speed_limit_mask(
         np.array([[0.0, 0.0], [0.0, 0.0]]),

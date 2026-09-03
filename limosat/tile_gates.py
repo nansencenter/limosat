@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import warnings
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from functools import lru_cache
@@ -13,7 +14,7 @@ import numpy as np
 import rasterio
 from pyproj import Transformer
 from rasterio import Affine
-from rasterio.errors import RasterioIOError
+from rasterio.errors import NotGeoreferencedWarning, RasterioIOError
 from rasterio.transform import rowcol
 
 
@@ -97,8 +98,10 @@ def _load_sic_field_cached(
 ) -> SicField:
     source_path = Path(path)
     try:
-        with rasterio.open(source_path) as root:
-            subdatasets = tuple(root.subdatasets)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", NotGeoreferencedWarning)
+            with rasterio.open(source_path) as root:
+                subdatasets = tuple(root.subdatasets)
         preferred = next(
             (
                 item
@@ -117,7 +120,7 @@ def _load_sic_field_cached(
             else "ice_conc" if fallback is not None else source_path.stem
         )
         with rasterio.open(dataset_name) as dataset:
-            values = dataset.read(1, masked=True).filled(np.nan).astype(np.float64)
+            values = _masked_float64(dataset.read(1, masked=True))
             scale = float(dataset.scales[0]) if dataset.scales else 1.0
             offset = float(dataset.offsets[0]) if dataset.offsets else 0.0
             if scale != 1.0 or offset != 0.0:
@@ -154,8 +157,7 @@ def _load_sic_netcdf4(source_path: Path) -> SicField:
         if variable not in dataset.variables:
             raise ValueError(f"SIC variable not found in {source_path}")
         raw = dataset.variables[variable]
-        values = np.ma.asarray(raw[0] if raw.ndim == 3 else raw[:])
-        values = values.filled(np.nan).astype(np.float64)
+        values = _masked_float64(raw[0] if raw.ndim == 3 else raw[:])
         x_variable = dataset.variables["xc"]
         y_variable = dataset.variables["yc"]
         x = np.asarray(x_variable[:], dtype=np.float64)
@@ -178,6 +180,11 @@ def _load_sic_netcdf4(source_path: Path) -> SicField:
         dx, dy
     )
     return SicField(values, transform, crs, source_path, variable)
+
+
+def _masked_float64(values: np.ndarray) -> np.ndarray:
+    """Preserve missing integer samples while converting SIC to float64."""
+    return np.ma.asarray(values).astype(np.float64).filled(np.nan)
 
 
 def sic_file_sha256(path: str | Path) -> str:

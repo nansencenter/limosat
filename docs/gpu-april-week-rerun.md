@@ -88,7 +88,18 @@ composition, recovery GPU pair processing, and CPU final
 composition/finalization. CPU jobs run on the Olivia accelerator partition
 with zero GPUs so the GPU is released while millions of trajectory rows are
 written. Every stage uses the same container, configuration, and source
-revision.
+revision. Before GPU work becomes eligible, CPU preparation parses all nine SIC
+files, loads the EfficientLoFTR checkpoint on CPU, verifies PyArrow for final
+packaging, and validates the complete candidate image-pair plan.
+
+To reuse an existing complete SIC directory, keep the same `SIC_ROOT` for both
+commands and omit `--download-sic`:
+
+```bash
+export SIC_ROOT=/path/to/existing/osisaf-sic
+python3 scripts/prepare_april_week_olivia.py --sic-root "$SIC_ROOT"
+SIC_ROOT="$SIC_ROOT" scripts/submit_april_week_olivia.sh
+```
 
 `GPU_WORKERS=1` is the default. A later run can set `GPU_WORKERS=N` to create
 deterministic primary and recovery Slurm arrays without concurrent SQLite

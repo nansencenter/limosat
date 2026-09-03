@@ -97,6 +97,10 @@ def coarse_phase_translation(
     shift, response = cv2.phaseCorrelate(
         normalized[0], normalized[1], cv2.createHanningWindow((pixels, pixels), cv2.CV_32F)
     )
+    if not np.isfinite(response) or not np.isfinite(shift).all():
+        raise CoarseTranslationUnavailable(
+            "coarse translation returned non-finite phase correlation"
+        )
     displacement = np.array([shift[0] * pixel_size, -shift[1] * pixel_size])
     magnitude = np.linalg.norm(displacement)
     if magnitude > maximum_displacement_m:
