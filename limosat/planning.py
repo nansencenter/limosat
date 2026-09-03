@@ -149,6 +149,9 @@ def build_candidate_plan(
                 exclusions["below_minimum_overlap"] += 1
 
     primary_ids: set[str] = set()
+    primary_pairs_before_target_maximum = 0
+    primary_pairs_excluded_by_target_maximum = 0
+    targets_affected_by_primary_pair_maximum = 0
     by_target: dict[
         str,
         list[
@@ -165,9 +168,18 @@ def build_candidate_plan(
         by_target.setdefault(candidate[0].target.image_id, []).append(candidate)
     if config.candidate_pair_ids:
         primary_ids.update(pair.pair_id for pair, *_rest in candidates)
+        primary_pairs_before_target_maximum = len(primary_ids)
     else:
         for target_candidates in by_target.values():
-            primary_ids.update(_coverage_primary_ids(target_candidates))
+            selected, unrestricted_count = _coverage_primary_selection(
+                target_candidates,
+                config.primary_maximum_pairs_per_target,
+            )
+            primary_ids.update(selected)
+            primary_pairs_before_target_maximum += unrestricted_count
+            excluded = unrestricted_count - len(selected)
+            primary_pairs_excluded_by_target_maximum += excluded
+            targets_affected_by_primary_pair_maximum += int(excluded > 0)
 
     ordered = sorted(
         candidates,
@@ -215,6 +227,15 @@ def build_candidate_plan(
         **exclusions,
         "accepted_candidate_pairs": len(pairs),
         "primary_pairs_selected_for_cell_coverage": len(primary_ids),
+        "primary_pairs_before_target_maximum": (
+            primary_pairs_before_target_maximum
+        ),
+        "primary_pairs_excluded_by_target_maximum": (
+            primary_pairs_excluded_by_target_maximum
+        ),
+        "targets_affected_by_primary_pair_maximum": (
+            targets_affected_by_primary_pair_maximum
+        ),
         "candidate_planning_cell_assignments": sum(
             len(cells) for *_prefix, cells in candidates if cells is not None
         ),
@@ -367,26 +388,72 @@ def _planning_cells(
     )
 
 
-def _coverage_primary_ids(target_candidates) -> set[str]:
+def _coverage_primary_selection(
+    target_candidates, maximum_pairs: int | None = None
+) -> tuple[set[str], int]:
     """Keep each pair that is the most recent option for at least one cell."""
     known = [item for item in target_candidates if item[4] is not None]
     if not known:
         most_recent = max(item[0].source.time_utc for item in target_candidates)
-        return {
-            item[0].pair_id
-            for item in target_candidates
-            if item[0].source.time_utc == most_recent
-        }
+        ranked = sorted(
+            (
+                item
+                for item in target_candidates
+                if item[0].source.time_utc == most_recent
+            ),
+            key=lambda item: (
+                -(item[2] or 0.0),
+                item[0].pair_id,
+            ),
+        )
+        unrestricted_count = len(ranked)
+        selected = ranked if maximum_pairs is None else ranked[:maximum_pairs]
+        return {item[0].pair_id for item in selected}, unrestricted_count
     latest_by_cell: dict[tuple[int, int], object] = {}
-    primary_ids: set[str] = set()
     for pair, _overlap, _area, _skipped, cells in known:
         assert cells is not None
         for cell in cells:
             previous = latest_by_cell.get(cell)
             if previous is None or pair.source.time_utc > previous:
                 latest_by_cell[cell] = pair.source.time_utc
-    for pair, _overlap, _area, _skipped, cells in known:
-        assert cells is not None
-        if any(latest_by_cell[cell] == pair.source.time_utc for cell in cells):
-            primary_ids.add(pair.pair_id)
-    return primary_ids
+    contributions = [
+        (
+            item,
+            frozenset(
+                cell
+                for cell in item[4]
+                if latest_by_cell[cell] == item[0].source.time_utc
+            ),
+        )
+        for item in known
+    ]
+    contributions = [item for item in contributions if item[1]]
+    if maximum_pairs is None:
+        return (
+            {item[0][0].pair_id for item in contributions},
+            len(contributions),
+        )
+
+    selected: set[str] = set()
+    covered: set[tuple[int, int]] = set()
+    remaining = contributions
+    while remaining and len(selected) < maximum_pairs:
+        ranked = sorted(
+            remaining,
+            key=lambda value: (
+                -len(value[1] - covered),
+                -len(value[1]),
+                -value[0][0].source.time_utc.timestamp(),
+                -(value[0][2] or 0.0),
+                value[0][0].pair_id,
+            ),
+        )
+        item, cells = ranked[0]
+        selected.add(item[0].pair_id)
+        covered.update(cells)
+        remaining = [
+            value
+            for value in remaining
+            if value[0][0].pair_id not in selected
+        ]
+    return selected, len(contributions)

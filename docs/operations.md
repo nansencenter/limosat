@@ -47,6 +47,12 @@ listed image pair is treated as primary so a small diagnostic run actually
 processes every selected pair. Use a separate run ID/database and clear the
 allowlist for a full run.
 
+`primary_maximum_pairs_per_target` is a separate diagnostic compute bound. It
+first applies the normal newest-source-per-cell rule, then greedily retains the
+pairs contributing the most complementary selected cells. Source recency,
+direct overlap area, and stable image-pair identity break ties. It cannot be
+combined with `candidate_pair_ids`, and its production default is `null`.
+
 Primary pair fields have no preceding-pair dependency and can be processed
 independently. `pair_workers` controls CPU concurrency within one process.
 CUDA configurations require `pair_workers: 1`; `limosat pairs --batch-index I
@@ -125,6 +131,8 @@ incomplete trajectory composition; already imported immutable pair fields
 remain valid. Primary composition derives deformation only from primary pair
 fields. Recovery workers run only after primary composition supplies genuine
 measured-loss positions.
+When `targeted_recovery` is false, no recovery pair work is selected; the
+Olivia launcher also omits the recovery GPU stage entirely.
 
 `limosat run CONFIG` executes all stages sequentially and is the recommended
 interface on a local or other single-GPU machine. Scheduler launchers may call

@@ -47,6 +47,9 @@ planning cell. The union of those cell choices defines the target's primary
 image pairs without a per-target cap. Primary pair fields are independent and
 `pair_workers` controls local CPU concurrency. CUDA runs use one process per
 GPU and keep `pair_workers: 1` so a model is never shared between threads.
+For a bounded diagnostic only, `primary_maximum_pairs_per_target` greedily
+keeps the strongest complementary contributors from that same coverage set;
+its default is `null`, so production planning remains uncapped.
 
 `limosat run` is the portable single-machine interface. Internally it uses the
 same explicit stages available to batch systems:

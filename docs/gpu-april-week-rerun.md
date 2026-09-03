@@ -67,6 +67,36 @@ gate, not a declaration that parcel motion is known or missing. The 30 km/day
 speed bound and field-consensus tolerances remain explicit experiment settings
 rather than universal sea-ice constants.
 
+## Bounded full-week diagnostic
+
+Before the larger coverage run, use a complete seven-day diagnostic with at
+most two spatially complementary primary image pairs per target image and no
+non-consecutive recovery. This preserves the full 781-image chronology,
+5%/1,024 km2 candidate criteria, orbit exclusion, phase correlation, raw
+matches, deformation, and global composition while bounding primary inference
+at 1,560 image pairs. The actual deterministic count is printed by the CPU
+prepare stage. The limit is an assessment budget, not a proposed production
+policy.
+
+```bash
+export RUN_ID=april2020-week01-global-coverage2-no-recovery-v1
+export SIC_ROOT=/path/to/existing/osisaf-sic
+
+python3 scripts/prepare_april_week_olivia.py \
+  --run-id "$RUN_ID" \
+  --sic-root "$SIC_ROOT" \
+  --primary-maximum-pairs-per-target 2 \
+  --disable-recovery
+
+RUN_ID="$RUN_ID" SIC_ROOT="$SIC_ROOT" GPU_WORKERS=2 \
+  scripts/submit_april_week_olivia.sh
+```
+
+The final composition follows primary composition directly and the submission
+summary reports `recovery_pair_job=disabled`. Use a new run ID with the
+diagnostic maximum removed and recovery enabled for a later production-scale
+assessment.
+
 ## Full native rerun
 
 On Olivia, use the source-controlled preparation and submission scripts instead

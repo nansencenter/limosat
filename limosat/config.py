@@ -91,6 +91,7 @@ class RoutingConfig:
     candidate_minimum_overlap_area_m2: float = 1_024_000_000.0
     exclude_same_acquisition_pass: bool = True
     require_orbit_metadata: bool = False
+    primary_maximum_pairs_per_target: int | None = None
     candidate_pair_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -117,6 +118,19 @@ class RoutingConfig:
             )
         if self.candidate_minimum_overlap_area_m2 < 0:
             raise ValueError("candidate_minimum_overlap_area_m2 cannot be negative")
+        if (
+            self.primary_maximum_pairs_per_target is not None
+            and self.primary_maximum_pairs_per_target < 1
+        ):
+            raise ValueError("primary_maximum_pairs_per_target must be positive")
+        if (
+            self.primary_maximum_pairs_per_target is not None
+            and self.candidate_pair_ids
+        ):
+            raise ValueError(
+                "primary_maximum_pairs_per_target cannot be combined with "
+                "candidate_pair_ids"
+            )
         object.__setattr__(
             self,
             "candidate_pair_ids",

@@ -206,7 +206,16 @@ def prepare_sic(root, download=False, base_url=SIC_BASE_URL):
     return checksums
 
 
-def run_config(run_id, catalogue, run_root, official_repository, checkpoint, sic_root):
+def run_config(
+    run_id,
+    catalogue,
+    run_root,
+    official_repository,
+    checkpoint,
+    sic_root,
+    primary_maximum_pairs_per_target=None,
+    targeted_recovery=True,
+):
     run_root = Path(run_root)
     return {
         "run_id": run_id,
@@ -244,7 +253,7 @@ def run_config(run_id, catalogue, run_root, official_repository, checkpoint, sic
             "phase_correlation_failure": "same_center",
             "phase_correlation_minimum_response": 0.05,
             "residual_edge_recovery": True,
-            "targeted_recovery": True,
+            "targeted_recovery": targeted_recovery,
             "maximum_recovery_elapsed_hours": 96.0,
             "targeted_selection_buffer_m": 6400.0,
             "candidate_minimum_elapsed_hours": 1.0,
@@ -253,6 +262,9 @@ def run_config(run_id, catalogue, run_root, official_repository, checkpoint, sic
             "candidate_minimum_overlap_area_m2": 1024000000.0,
             "exclude_same_acquisition_pass": True,
             "require_orbit_metadata": True,
+            "primary_maximum_pairs_per_target": (
+                primary_maximum_pairs_per_target
+            ),
             "candidate_pair_ids": [],
         },
         "open_water": {
@@ -307,6 +319,19 @@ def parser():
     )
     result.add_argument("--sic-root", type=Path)
     result.add_argument("--download-sic", action="store_true")
+    result.add_argument(
+        "--primary-maximum-pairs-per-target",
+        type=int,
+        help=(
+            "diagnostic compute bound; keep the strongest spatial-coverage "
+            "contributors for each target image"
+        ),
+    )
+    result.add_argument(
+        "--disable-recovery",
+        action="store_true",
+        help="skip non-consecutive recovery work for a bounded diagnostic run",
+    )
     result.add_argument("--expected-images", type=int, default=EXPECTED_IMAGES)
     result.add_argument(
         "--expected-source-sha256", default=SOURCE_CATALOGUE_SHA256
@@ -364,6 +389,10 @@ def main(argv=None):
         arguments.official_repository,
         arguments.checkpoint,
         sic_root,
+        primary_maximum_pairs_per_target=(
+            arguments.primary_maximum_pairs_per_target
+        ),
+        targeted_recovery=not arguments.disable_recovery,
     )
     write_json_atomic(config_path, config)
     report = {
@@ -374,6 +403,12 @@ def main(argv=None):
         "config": str(config_path),
         "config_sha256": file_sha256(config_path),
         "sic_checksums": sic_checksums,
+        "diagnostic_pair_selection": {
+            "primary_maximum_pairs_per_target": (
+                arguments.primary_maximum_pairs_per_target
+            ),
+            "targeted_recovery": not arguments.disable_recovery,
+        },
     }
     report.update(catalogue_summary)
     write_json_atomic(run_root / "control" / "preparation-report.json", report)

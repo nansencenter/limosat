@@ -379,6 +379,8 @@ class RunStages:
             )
         if kind != "recovery":
             raise ValueError("pair kind must be primary or recovery")
+        if not self.config.routing.targeted_recovery:
+            return ()
         return recovery_candidates(
             planned,
             self.config.routing.maximum_recovery_elapsed_hours,

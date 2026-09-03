@@ -55,6 +55,15 @@ official_revision=$(git -C "$official_repository" rev-parse HEAD)
 config_sha256=$(sha256sum "$config" | awk '{print $1}')
 catalogue_sha256=$(sha256sum "$catalogue" | awk '{print $1}')
 checkpoint_sha256=$(sha256sum "$checkpoint" | awk '{print $1}')
+recovery_enabled=$(
+  python3 -c \
+    'import json,sys; value=(json.load(open(sys.argv[1])).get("routing") or {}).get("targeted_recovery", True); print("1" if value is True else "0" if value is False else "invalid")' \
+    "$config"
+)
+[[ "$recovery_enabled" == "0" || "$recovery_enabled" == "1" ]] || {
+  echo "routing.targeted_recovery must be a JSON boolean" >&2
+  exit 2
+}
 if [[ -n "$(git -C "$method_root" status --porcelain)" ]]; then
   echo "LiMOSAT EfficientLoFTR checkout is dirty" >&2
   git -C "$method_root" status --short >&2
@@ -108,12 +117,12 @@ submit_stage() {
 
 if [[ "$dry_run" == "1" ]]; then
   previous=""
-  for specification in \
-    "prepare cpu" \
-    "primary-pairs gpu" \
-    "primary-compose cpu" \
-    "recovery-pairs gpu" \
-    "final-compose cpu"; do
+  stages=("prepare cpu" "primary-pairs gpu" "primary-compose cpu")
+  if [[ "$recovery_enabled" == "1" ]]; then
+    stages+=("recovery-pairs gpu")
+  fi
+  stages+=("final-compose cpu")
+  for specification in "${stages[@]}"; do
     read -r stage resource <<< "$specification"
     dependency="$previous"
     build_command "$stage" "$resource" "$dependency"
@@ -128,8 +137,14 @@ fi
 prepare_job=$(submit_stage prepare cpu "")
 primary_job=$(submit_stage primary-pairs gpu "$prepare_job")
 primary_compose_job=$(submit_stage primary-compose cpu "$primary_job")
-recovery_job=$(submit_stage recovery-pairs gpu "$primary_compose_job")
-final_job=$(submit_stage final-compose cpu "$recovery_job")
+if [[ "$recovery_enabled" == "1" ]]; then
+  recovery_job=$(submit_stage recovery-pairs gpu "$primary_compose_job")
+  final_dependency="$recovery_job"
+else
+  recovery_job="disabled"
+  final_dependency="$primary_compose_job"
+fi
+final_job=$(submit_stage final-compose cpu "$final_dependency")
 
 echo "prepare_job=$prepare_job"
 echo "primary_pair_job=$primary_job"
@@ -138,4 +153,8 @@ echo "recovery_pair_job=$recovery_job"
 echo "final_compose_job=$final_job"
 echo "run_root=$run_root"
 echo "final_log=$run_root/logs/eloftr-final-compose-$final_job.out"
-squeue -j "$prepare_job,$primary_job,$primary_compose_job,$recovery_job,$final_job"
+job_ids="$prepare_job,$primary_job,$primary_compose_job"
+if [[ "$recovery_enabled" == "1" ]]; then
+  job_ids="$job_ids,$recovery_job"
+fi
+squeue -j "$job_ids,$final_job"

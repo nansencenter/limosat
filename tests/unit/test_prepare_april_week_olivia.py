@@ -1,6 +1,8 @@
 import importlib.util
 import json
+import os
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -122,6 +124,28 @@ def test_generated_configuration_enables_reviewed_gpu_policy(tmp_path):
     assert loaded.open_water.enabled is True
 
 
+def test_generated_diagnostic_configuration_bounds_primary_and_disables_recovery(
+    tmp_path,
+):
+    config = PREPARE.run_config(
+        "diagnostic",
+        tmp_path / "catalogue.json",
+        tmp_path / "run",
+        tmp_path / "EfficientLoFTR",
+        tmp_path / "checkpoint.ckpt",
+        tmp_path / "sic",
+        primary_maximum_pairs_per_target=2,
+        targeted_recovery=False,
+    )
+    config_path = tmp_path / "config.json"
+    PREPARE.write_json_atomic(config_path, config)
+
+    loaded = load_config(config_path)
+
+    assert loaded.routing.primary_maximum_pairs_per_target == 2
+    assert loaded.routing.targeted_recovery is False
+
+
 def test_olivia_submission_uses_gpu_workers_and_cpu_composition_barriers():
     submit = SUBMIT_SCRIPT.read_text(encoding="utf-8")
     job = JOB_SCRIPT.read_text(encoding="utf-8")
@@ -150,3 +174,89 @@ def test_olivia_submission_uses_gpu_workers_and_cpu_composition_barriers():
     assert "python -m limosat compose" in job
     assert "python -m limosat ingest" not in job
     assert "python -m limosat run" not in job
+    assert 'if [[ "$recovery_enabled" == "1" ]]' in submit
+
+
+def test_olivia_submission_omits_disabled_recovery_stage(tmp_path):
+    method_root = tmp_path / "method"
+    official_repository = tmp_path / "official"
+    for repository in (method_root, official_repository):
+        repository.mkdir()
+        subprocess.run(["git", "init", "-q", str(repository)], check=True)
+        marker = repository / "marker"
+        marker.write_text("fixture\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repository), "add", "marker"], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "-c",
+                "user.name=LiMOSAT test",
+                "-c",
+                "user.email=limosat-test@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "fixture",
+            ],
+            check=True,
+        )
+
+    run_root = tmp_path / "run"
+    control = run_root / "control"
+    control.mkdir(parents=True)
+    config = control / "config.json"
+    config.write_text(
+        json.dumps({"routing": {"targeted_recovery": False}}), encoding="utf-8"
+    )
+    catalogue = control / "catalogue.json"
+    catalogue.write_text("{}\n", encoding="utf-8")
+    scene_root = tmp_path / "scenes"
+    sic_root = tmp_path / "sic"
+    scene_root.mkdir()
+    sic_root.mkdir()
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    apptainer = fake_bin / "apptainer"
+    apptainer.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    apptainer.chmod(0o755)
+
+    resources = {
+        "CHECKPOINT": tmp_path / "checkpoint.ckpt",
+        "CONTAINER": tmp_path / "container.sif",
+        "OVERLAY": tmp_path / "overlay.img",
+        "READY_MARKER": tmp_path / "overlay.ready",
+        "CPU_AUDIT": tmp_path / "cpu-audit.json",
+    }
+    for path in resources.values():
+        path.write_bytes(b"fixture\n")
+
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": str(fake_bin) + os.pathsep + environment["PATH"],
+            "METHOD_ROOT": str(method_root),
+            "ELOFTR_REPO": str(official_repository),
+            "RUN_ID": "diagnostic",
+            "RUN_ROOT": str(run_root),
+            "CONFIG": str(config),
+            "CATALOGUE": str(catalogue),
+            "SCENE_ROOT": str(scene_root),
+            "SIC_ROOT": str(sic_root),
+            **{name: str(path) for name, path in resources.items()},
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(SUBMIT_SCRIPT), "--dry-run"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert "eloftr-primary-pairs" in result.stdout
+    assert "eloftr-final-compose" in result.stdout
+    assert "eloftr-recovery-pairs" not in result.stdout
+    assert sum(line.startswith("sbatch ") for line in result.stdout.splitlines()) == 4

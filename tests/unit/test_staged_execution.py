@@ -275,6 +275,37 @@ def test_field_only_worker_product_preserves_match_count_on_import(tmp_path):
     assert archives == 0
 
 
+def test_disabled_recovery_schedules_no_pair_work(tmp_path):
+    cfg = replace(
+        config(tmp_path),
+        routing=RoutingConfig(initial="same_center", targeted_recovery=False),
+    )
+    images = catalogue(tmp_path)
+    processor = Processor()
+    stages = RunStages(cfg, images, processor)
+    stages.prepare()
+    stages.process_pairs("primary")
+    stages.compose("primary")
+
+    recovery = stages.process_pairs("recovery")
+    final = stages.compose(
+        "final", ["limosat", "compose", "config", "--phase", "final"]
+    )
+
+    assert recovery == {
+        "kind": "recovery",
+        "batch_index": 0,
+        "batch_count": 1,
+        "planned_pairs": 0,
+        "assigned_pairs": 0,
+        "computed_pairs": 0,
+        "resumed_pair_products": 0,
+        "resumed_sqlite_pairs": 0,
+    }
+    assert not any(targeted for _pair_id, targeted in processor.calls)
+    assert final["recovery_pairs"] == 0
+
+
 def test_default_pair_product_path_is_database_specific(tmp_path):
     first = replace(config(tmp_path), pair_product_directory="")
     second = replace(first, database=str(tmp_path / "other.sqlite"))

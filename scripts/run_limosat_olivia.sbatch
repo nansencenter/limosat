@@ -157,13 +157,16 @@ print(
 )
 PY
     run_json "$plan" python -m limosat plan "$LIMOSAT_CONFIG"
-    run_in_container python - "$plan" "$LIMOSAT_EXPECTED_IMAGES" <<'PY'
+    run_in_container python - \
+      "$plan" "$LIMOSAT_EXPECTED_IMAGES" "$LIMOSAT_CONFIG" <<'PY'
 import json
 import sys
 
 with open(sys.argv[1], "r", encoding="utf-8") as stream:
     plan = json.load(stream)
 expected = int(sys.argv[2])
+with open(sys.argv[3], "r", encoding="utf-8") as stream:
+    config = json.load(stream)
 if plan["catalogue_images"] != expected:
     raise SystemExit(
         "expected %d catalogue images, found %d"
@@ -171,12 +174,22 @@ if plan["catalogue_images"] != expected:
     )
 if plan["candidate_pairs"] < 1 or plan["primary_pairs"] < 1:
     raise SystemExit("candidate plan contains no usable primary image pairs")
+maximum = (config.get("routing") or {}).get(
+    "primary_maximum_pairs_per_target"
+)
+if maximum is not None and plan["maximum_primary_pairs_per_target"] > maximum:
+    raise SystemExit(
+        "diagnostic primary pair maximum was not enforced: %d > %d"
+        % (plan["maximum_primary_pairs_per_target"], maximum)
+    )
 print(
-    "catalogue_images=%d candidate_pairs=%d primary_pairs=%d"
+    "catalogue_images=%d candidate_pairs=%d primary_pairs=%d "
+    "maximum_primary_pairs_per_target=%d"
     % (
         plan["catalogue_images"],
         plan["candidate_pairs"],
         plan["primary_pairs"],
+        plan["maximum_primary_pairs_per_target"],
     )
 )
 PY

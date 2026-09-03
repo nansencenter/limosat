@@ -150,6 +150,39 @@ def test_primary_plan_keeps_most_recent_source_for_each_spatial_cell():
     assert target_primary_ids(second) == target_primary_ids(first)
 
 
+def test_diagnostic_primary_maximum_keeps_largest_spatial_contributors():
+    old_full = _image("old-full", 0, "old", box(0, 0, 100_000, 100_000))
+    recent_left = _image(
+        "recent-left", 1, "left", box(0, 0, 60_000, 100_000)
+    )
+    newest_left = _image(
+        "newest-left", 2, "newest", box(0, 0, 30_000, 100_000)
+    )
+    target = _image("target", 3, "target", box(0, 0, 100_000, 100_000))
+    records = [old_full, recent_left, newest_left, target]
+    routing = RoutingConfig(primary_maximum_pairs_per_target=2)
+
+    first = build_candidate_plan(ImageCatalogue(records), routing)
+    second = build_candidate_plan(ImageCatalogue(tuple(reversed(records))), routing)
+
+    def target_primary_ids(plan):
+        return {
+            item.pair.pair_id
+            for item in plan.pairs
+            if item.pair.target.image_id == "target"
+            and item.selection == "primary"
+        }
+
+    assert target_primary_ids(first) == {
+        "old-full__target",
+        "newest-left__target",
+    }
+    assert target_primary_ids(second) == target_primary_ids(first)
+    assert first.exclusion_counts["primary_pairs_before_target_maximum"] == 6
+    assert first.exclusion_counts["primary_pairs_excluded_by_target_maximum"] == 1
+    assert first.exclusion_counts["targets_affected_by_primary_pair_maximum"] == 1
+
+
 def test_candidate_plan_requires_fractional_and_absolute_overlap():
     source = _image("source", 0, "a", box(0, 0, 100_000, 100_000))
     small_overlap = _image(
