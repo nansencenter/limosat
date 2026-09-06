@@ -73,6 +73,11 @@ def test_matcher_defaults_retain_selected_scientific_values():
     assert config.pixel_size_m == 80.0
     assert config.maximum_speed_m_per_day == 30_000.0
     assert config.tile_size_px == 512
+    assert config.tile_batch_size == 4
+    assert config.prefix_cuda_graph is True
+    assert config.cuda_graph_warmup_batches == 3
+    with pytest.raises(ValueError, match="tile_batch_size"):
+        MatcherConfig(tile_batch_size=0)
 
 
 def test_global_planning_defaults_are_explicit():

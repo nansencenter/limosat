@@ -238,6 +238,9 @@ def run_config(
             "transform_grid_spacing_px": 32,
             "tile_grid_origin_m": 0.0,
             "maximum_speed_m_per_day": 30000.0,
+            "tile_batch_size": 4,
+            "prefix_cuda_graph": True,
+            "cuda_graph_warmup_batches": 3,
         },
         "field": {
             "grid_spacing_m": 4000.0,

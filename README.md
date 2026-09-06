@@ -62,13 +62,15 @@ limosat pairs config.yaml --kind recovery
 limosat compose config.yaml --phase final
 ```
 
-Pair workers write immutable NPZ data plus JSON completion markers under
+Pair workers write immutable output NPZ data plus JSON completion markers under
 `pair_product_directory`; they never write SQLite. Each CPU composition stage
 validates and imports those products, then streams trajectory rows into the
 global database. `--batch-index I --batch-count N` partitions pair work
 deterministically for scheduler arrays. These files are resumable work
-products, not additional deliverables; the finalized SQLite and Parquet files
-remain the products to transfer.
+products, not cached input tiles or additional deliverables; the finalized
+SQLite and Parquet files remain the products to transfer. See the
+[GPU tile-flow description](docs/operations.md#tile-data-and-gpu-execution) for
+the distinction between COG inputs, RAM tiles, and output NPZ files.
 
 Production catalogues should provide platform and absolute orbit metadata.
 Pairs from the same Sentinel-1 platform and absolute orbit are excluded. The

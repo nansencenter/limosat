@@ -39,7 +39,9 @@ from .tile_gates import (
 
 
 class TileMatcher(Protocol):
-    def match(self, source: np.ndarray, target: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]: ...
+    def match(
+        self, source: np.ndarray, target: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]: ...
 
 
 @dataclass(frozen=True)
@@ -52,6 +54,16 @@ class TileRegion:
 
 
 @dataclass(frozen=True)
+class _PreparedTile:
+    region: TileRegion
+    shift: np.ndarray
+    source: np.ndarray
+    target: np.ndarray
+    source_valid: np.ndarray
+    target_valid: np.ndarray
+
+
+@dataclass(frozen=True)
 class _HypothesisResult:
     matches: MotionMatches
     field: DisplacementField
@@ -60,6 +72,7 @@ class _HypothesisResult:
     matching_seconds: float
     field_seconds: float
     matcher_calls: int
+    matcher_tiles: int
     gate_counts: dict[str, int]
 
 
@@ -193,6 +206,19 @@ class PairProcessor:
         )
         diagnostics["routing_hypotheses_evaluated"] = len(evaluated)
         diagnostics["selected_routing_hypothesis"] = selected_name
+        diagnostics["matcher_tile_batch_size"] = self.config.matcher.tile_batch_size
+        diagnostics["matcher_tile_evaluations"] = sum(
+            item.matcher_tiles for _name, item in evaluated
+        )
+        diagnostics["matcher_execution"] = getattr(
+            self.matcher,
+            "execution_mode",
+            (
+                "batch"
+                if callable(getattr(self.matcher, "match_batch", None))
+                else "eager"
+            ),
+        )
         for key, value in selected.gate_counts.items():
             diagnostics[key] = value
             if len(evaluated) > 1:
@@ -247,7 +273,9 @@ class PairProcessor:
         sampling_seconds = 0.0
         matching_seconds = 0.0
         matcher_calls = 0
-        batches: list[MotionMatches] = []
+        matcher_tiles = 0
+        pending_tiles: list[_PreparedTile] = []
+        matched_tiles = []
         gate_counts = {
             "skipped_open_water_both_dates": 0,
             "skipped_no_source_core_support": 0,
@@ -267,13 +295,31 @@ class PairProcessor:
             if prepared is None:
                 gate_counts[f"skipped_{skip_reason}"] += 1
                 continue
-            source, target, source_valid, target_valid = prepared
-            matched_at = time.perf_counter()
-            batch, target_px = self._match_tile(
-                pair, region, shift, source, target, source_valid, target_valid
+            pending_tiles.append(_PreparedTile(region, shift, *prepared))
+            if len(pending_tiles) == self.config.matcher.tile_batch_size:
+                results, elapsed, calls = self._match_prepared_tiles(
+                    pair, pending_tiles
+                )
+                matched_tiles.extend(
+                    (item.region, item.shift, result)
+                    for item, result in zip(pending_tiles, results, strict=True)
+                )
+                matching_seconds += elapsed
+                matcher_calls += calls
+                matcher_tiles += len(pending_tiles)
+                pending_tiles = []
+        if pending_tiles:
+            results, elapsed, calls = self._match_prepared_tiles(pair, pending_tiles)
+            matched_tiles.extend(
+                (item.region, item.shift, result)
+                for item, result in zip(pending_tiles, results, strict=True)
             )
-            matching_seconds += time.perf_counter() - matched_at
-            matcher_calls += 1
+            matching_seconds += elapsed
+            matcher_calls += calls
+            matcher_tiles += len(pending_tiles)
+
+        recovery_tiles: list[tuple[int, _PreparedTile]] = []
+        for index, (region, shift, (batch, target_px)) in enumerate(matched_tiles):
             if (
                 self.config.routing.residual_edge_recovery
                 and len(batch)
@@ -292,16 +338,32 @@ class PairProcessor:
                 )
                 sampling_seconds += time.perf_counter() - sampled_at
                 if recovered is not None:
-                    matched_at = time.perf_counter()
-                    candidate, _ = self._match_tile(
-                        pair, region, corrected_shift, *recovered
+                    recovery_tiles.append(
+                        (
+                            index,
+                            _PreparedTile(region, corrected_shift, *recovered),
+                        )
                     )
-                    matching_seconds += time.perf_counter() - matched_at
-                    matcher_calls += 1
-                    if len(candidate) > len(batch):
-                        batch = candidate
-            if len(batch):
-                batches.append(batch)
+                    if len(recovery_tiles) == self.config.matcher.tile_batch_size:
+                        elapsed, calls = self._apply_recovery_batch(
+                            pair, matched_tiles, recovery_tiles
+                        )
+                        matching_seconds += elapsed
+                        matcher_calls += calls
+                        matcher_tiles += len(recovery_tiles)
+                        recovery_tiles = []
+        if recovery_tiles:
+            elapsed, calls = self._apply_recovery_batch(
+                pair, matched_tiles, recovery_tiles
+            )
+            matching_seconds += elapsed
+            matcher_calls += calls
+            matcher_tiles += len(recovery_tiles)
+        batches = [
+            batch
+            for _region, _shift, (batch, _target_px) in matched_tiles
+            if len(batch)
+        ]
         matches = _combine(batches)
         field_at = time.perf_counter()
         field = estimate_field(matches, pair, domain, self.config.field)
@@ -315,6 +377,7 @@ class PairProcessor:
             matching_seconds,
             field_seconds,
             matcher_calls,
+            matcher_tiles,
             gate_counts,
         )
 
@@ -410,18 +473,71 @@ class PairProcessor:
             return None, gate.reason
         return (source, target, source_valid, target_valid), None
 
-    def _match_tile(self, pair, region, shift, source, target, source_valid, target_valid):
+    def _match_prepared_tiles(self, pair, prepared_tiles):
+        if not prepared_tiles:
+            return [], 0.0, 0
+        batch_size = self.config.matcher.tile_batch_size
+        match_batch = getattr(self.matcher, "match_batch", None)
+        results = []
+        matcher_calls = 0
+        started = time.perf_counter()
+        for offset in range(0, len(prepared_tiles), batch_size):
+            tiles = prepared_tiles[offset : offset + batch_size]
+            if callable(match_batch):
+                raw_matches = match_batch(
+                    tuple(item.source for item in tiles),
+                    tuple(item.target for item in tiles),
+                )
+                matcher_calls += 1
+            else:
+                raw_matches = [
+                    self.matcher.match(item.source, item.target) for item in tiles
+                ]
+                matcher_calls += len(tiles)
+            if len(raw_matches) != len(tiles):
+                raise ValueError("matcher returned a different number of tile results")
+            results.extend(
+                self._filter_tile_matches(pair, tile, raw)
+                for tile, raw in zip(tiles, raw_matches, strict=True)
+            )
+        return results, time.perf_counter() - started, matcher_calls
+
+    def _apply_recovery_batch(self, pair, matched_tiles, recovery_tiles):
+        recovered_results, elapsed, calls = self._match_prepared_tiles(
+            pair, [item for _index, item in recovery_tiles]
+        )
+        for (index, _prepared), candidate in zip(
+            recovery_tiles, recovered_results, strict=True
+        ):
+            region, shift, existing = matched_tiles[index]
+            if len(candidate[0]) > len(existing[0]):
+                matched_tiles[index] = (region, shift, candidate)
+        return elapsed, calls
+
+    def _filter_tile_matches(self, pair, tile, raw_matches):
         settings = self.config.matcher
-        source_px, target_px, score = self.matcher.match(source, target)
+        source_px, target_px, score = raw_matches
         keep = (
             source_core_mask(source_px, settings.tile_size_px, settings.tile_margin_px)
-            & valid_endpoints(source_px, source_valid)
-            & valid_endpoints(target_px, target_valid)
+            & valid_endpoints(source_px, tile.source_valid)
+            & valid_endpoints(target_px, tile.target_valid)
         )
         source_px, target_px, score = source_px[keep], target_px[keep], score[keep]
-        target_center = tuple(np.asarray(region.center_xy_m) + np.asarray(shift))
-        source_xy = projected_coordinates(source_px, region.center_xy_m, settings.tile_size_px, settings.pixel_size_m)
-        target_xy = projected_coordinates(target_px, target_center, settings.tile_size_px, settings.pixel_size_m)
+        target_center = tuple(
+            np.asarray(tile.region.center_xy_m) + np.asarray(tile.shift)
+        )
+        source_xy = projected_coordinates(
+            source_px,
+            tile.region.center_xy_m,
+            settings.tile_size_px,
+            settings.pixel_size_m,
+        )
+        target_xy = projected_coordinates(
+            target_px,
+            target_center,
+            settings.tile_size_px,
+            settings.pixel_size_m,
+        )
         keep = speed_limit_mask(
             source_xy,
             target_xy,
@@ -432,8 +548,8 @@ class PairProcessor:
             source_xy[keep],
             target_xy[keep],
             score[keep],
-            np.full(keep.sum(), region.tile_id),
-            np.full(keep.sum(), region.tile_id),
+            np.full(keep.sum(), tile.region.tile_id),
+            np.full(keep.sum(), tile.region.tile_id),
         )
         return batch, target_px[keep]
 

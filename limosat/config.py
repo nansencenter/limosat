@@ -24,6 +24,9 @@ class MatcherConfig:
     transform_grid_spacing_px: int = 32
     tile_grid_origin_m: float = 0.0
     maximum_speed_m_per_day: float = 30_000.0
+    tile_batch_size: int = 4
+    prefix_cuda_graph: bool = True
+    cuda_graph_warmup_batches: int = 3
 
     def __post_init__(self) -> None:
         _require_positive(
@@ -32,6 +35,8 @@ class MatcherConfig:
                 "tile_size_px": self.tile_size_px,
                 "transform_grid_spacing_px": self.transform_grid_spacing_px,
                 "maximum_speed_m_per_day": self.maximum_speed_m_per_day,
+                "tile_batch_size": self.tile_batch_size,
+                "cuda_graph_warmup_batches": self.cuda_graph_warmup_batches,
             }
         )
         if self.tile_margin_px < 0 or self.tile_margin_px * 2 >= self.tile_size_px:

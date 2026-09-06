@@ -115,6 +115,8 @@ def test_generated_configuration_enables_reviewed_gpu_policy(tmp_path):
     assert config["routing"]["require_orbit_metadata"] is True
     assert config["routing"]["maximum_recovery_elapsed_hours"] == 96.0
     assert config["open_water"]["enabled"] is True
+    assert config["matcher"]["tile_batch_size"] == 4
+    assert config["matcher"]["prefix_cuda_graph"] is True
 
     config_path = tmp_path / "config.json"
     PREPARE.write_json_atomic(config_path, config)

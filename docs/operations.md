@@ -67,6 +67,56 @@ correlation. EfficientLoFTR runs on north-up tiles whose non-overlapping source
 cores prevent duplicate ownership. Endpoint validity, elapsed-time speed,
 local vector consensus, and fold gates are applied in EPSG:3413 metres.
 
+### Tile data and GPU execution
+
+Production does not read input tiles from NPZ files. The frozen tile NPZs used
+in performance experiments were temporary, immutable test fixtures. For a
+native run, Rasterio reads each source COG scene into the four-scene RAM cache
+on first use. North-up 512x512 tiles are then resampled from those in-memory
+arrays and passed directly to the GPU:
+
+```text
+source COGs
+    |
+    v
+whole scenes in the RAM cache
+    |
+    v
+north-up 512x512 tile pairs in memory
+    |
+    v
+fixed batches of four on the GPU
+    |
+    +--> recorded CNN + coarse-attention prefix (CUDA Graph replay)
+    |
+    +--> variable coarse-match selection + fine refinement (normal PyTorch)
+    |
+    v
+existing metre-space filters, fields, and trajectories
+    |
+    v
+output/resume NPZ pair products
+```
+
+Batching does not join tiles scientifically: EfficientLoFTR processes four
+independent tile pairs in one GPU invocation, and the results are separated by
+tile before the existing filters run. The final short batch is padded to four
+internally and padded results are discarded.
+
+A CUDA Graph is a recorded sequence of GPU operations. Replaying the fixed
+prefix avoids asking Python to launch the same CNN and coarse-attention
+operations for every batch. Match selection cannot be included because each
+SAR tile produces a different number of matches; this dynamic suffix therefore
+continues to run normally. No matches or attention tokens are padded to a fixed
+capacity.
+
+The production CUDA defaults are `tile_batch_size: 4`,
+`prefix_cuda_graph: true`, and three warm-up batches. The one-time graph setup
+is amortized over a long-lived pair worker. Outer FP32 inference with
+matrix-multiply TF32 disabled, the reparameterized optimized checkpoint, SDPA,
+skip-softmax, and the existing scientific filters remain unchanged. Batch 4
+used 4.10 GB of reserved A100 memory in the frozen benchmark.
+
 The phase-correlation domain is the direct overlap. Its coarse resolution is at
 least 1 km/pixel and the translation is clipped by the configured maximum ice
 speed. A phase response below `phase_correlation_minimum_response` evaluates
