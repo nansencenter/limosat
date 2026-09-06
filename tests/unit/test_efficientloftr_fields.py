@@ -18,7 +18,7 @@ from limosat import (
     build_trajectories,
 )
 from limosat.efficientloftr import speed_limit_mask
-from limosat.imagery import north_up_patch, projected_coordinates
+from limosat.imagery import _interpolate_grid, north_up_patch, projected_coordinates
 from limosat.pairs import PairProcessor
 from limosat.routing import CoarseTranslation
 
@@ -114,6 +114,24 @@ def test_rasterio_north_up_coordinates_are_float64_metres(tmp_path):
     assert valid.all()
     assert coordinates.dtype == np.float64
     np.testing.assert_allclose(coordinates, [[0.0, 0.0]])
+
+
+def test_vectorized_transform_grid_is_bit_exact_to_interpolation_reference():
+    coarse = np.random.default_rng(20260906).normal(size=(17, 17))
+    pixels = 512
+    positions = np.linspace(0.0, pixels - 1.0, coarse.shape[0])
+    full_positions = np.arange(pixels, dtype=float)
+    horizontal = np.vstack(
+        [np.interp(full_positions, positions, row) for row in coarse]
+    )
+    expected = np.column_stack(
+        [
+            np.interp(full_positions, positions, horizontal[:, column])
+            for column in range(pixels)
+        ]
+    ).astype(np.float32)
+
+    np.testing.assert_array_equal(_interpolate_grid(coarse, pixels), expected)
 
 
 def test_tiled_pair_builds_fold_free_float64_field(tmp_path):

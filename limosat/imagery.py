@@ -188,14 +188,19 @@ def _border_pixels(size: int, points: int = 10) -> list[int]:
 
 
 def _interpolate_grid(coarse: np.ndarray, pixels: int) -> np.ndarray:
-    positions = np.linspace(0.0, pixels - 1.0, coarse.shape[0])
-    full_positions = np.arange(pixels, dtype=float)
-    horizontal = np.vstack(
-        [np.interp(full_positions, positions, row) for row in coarse]
+    """Bilinearly expand a regular endpoint-aligned transform grid."""
+    coordinate = np.arange(pixels, dtype=np.float64) * (
+        (coarse.shape[0] - 1) / (pixels - 1)
     )
-    return np.column_stack(
-        [
-            np.interp(full_positions, positions, horizontal[:, column])
-            for column in range(pixels)
-        ]
-    ).astype(np.float32)
+    lower = np.floor(coordinate).astype(np.int64)
+    upper = np.minimum(lower + 1, coarse.shape[0] - 1)
+    weight = coordinate - lower
+    horizontal = (
+        coarse[:, lower] * (1.0 - weight)[None, :]
+        + coarse[:, upper] * weight[None, :]
+    )
+    full = (
+        horizontal[lower] * (1.0 - weight)[:, None]
+        + horizontal[upper] * weight[:, None]
+    )
+    return full.astype(np.float32)
