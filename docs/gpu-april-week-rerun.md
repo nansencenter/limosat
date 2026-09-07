@@ -17,7 +17,7 @@ window, so this safeguard is not expected to remove a pair in this week.
 - the EfficientLoFTR repository revision and checkpoint used for the rerun;
 - daily OSI SAF northern-hemisphere concentration files covering 2020-03-31
   through 2020-04-08, preferably with `ice_conc_unfiltered`; and
-- a new schema-v4 database, output directory, and run ID.
+- a new schema-v5 database, output directory, and run ID.
 
 Do not reuse the completed field-replay database or an old native database.
 First verify that the catalogue carries `platform` and `absolute_orbit` (or a
@@ -144,8 +144,8 @@ post-processing tests without repeating GPU inference. They are stored inside
 the authoritative SQLite database after coordinator import. Intermediate
 pair-product files remain under the run's `work/` directory for worker-level
 resume and do not need to be downloaded. Download
-`global-trajectory-catalogue-v1.parquet` and
-`assessment-summary-v1.json` first for routine analysis. Preserve or archive
+`global-trajectory-catalogue-v2.parquet` and
+`assessment-summary-v2.json` first for routine analysis. Preserve or archive
 the SQLite database when raw matches, pair fields, deformation, and full audit
 state are required.
 

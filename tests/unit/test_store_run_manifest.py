@@ -24,6 +24,7 @@ from limosat import (
     TrajectoryPoint,
 )
 from limosat.cli import main
+from limosat.finalize import finalize_products
 from limosat.store import RunStore
 
 
@@ -174,7 +175,7 @@ def test_sequence_recovers_measured_loss_and_resumes_with_versioned_manifest(tmp
     processor = SyntheticProcessor()
 
     first = LiMOSATRun(config, catalogue, processor).execute(["limosat", "run", "config.yaml"])
-    manifest = json.loads((tmp_path / "products" / "run-manifest-v4.json").read_text())
+    manifest = json.loads((tmp_path / "products" / "run-manifest-v5.json").read_text())
 
     assert first["computed_pairs"] == 3
     assert processor.calls == [
@@ -182,15 +183,18 @@ def test_sequence_recovers_measured_loss_and_resumes_with_versioned_manifest(tmp
         ("b__c", False, False),
         ("a__c", True, False),
     ]
-    assert manifest["manifest_schema_version"] == 4
+    assert manifest["manifest_schema_version"] == 5
     assert len(manifest["implementation_sha256"]) == 64
-    assert manifest["product_schemas"]["lagrangian_trajectory"] == 4
+    assert manifest["product_schemas"]["lagrangian_trajectory"] == 5
     assert manifest["product_schemas"]["pair_match_archive"] == 1
     assert manifest["product_schemas"]["pair_worker_product"] == 2
     assert manifest["coordinates"]["crs"] == "EPSG:3413"
     assert manifest["product_counts"]["trajectories"] == 4
     assert manifest["product_counts"]["candidate_pairs"] == 3
     assert manifest["product_counts"]["primary_pairs"] == 2
+    assert manifest["product_counts"]["trajectory_augmentations"] == 4
+    assert manifest["product_counts"]["direct_reappearances"] == 4
+    assert manifest["product_counts"]["post_reappearance_primary_points"] == 0
     assert manifest["product_counts"]["retained_pair_match_archives"] == 3
     assert manifest["product_counts"]["retained_pair_matches"] == 0
     assert manifest["pair_match_retention"]["enabled"] is True
@@ -204,6 +208,21 @@ def test_sequence_recovers_measured_loss_and_resumes_with_versioned_manifest(tmp
     assert len(recovery[0]["diagnostics"]["pair_product_sha256"]) == 64
     assert len(recovery[0]["diagnostics"]["pair_product_content_sha256"]) == 64
     assert manifest["execution_architecture"]["pair_workers_write_sqlite"] is False
+    assert (
+        manifest["execution_architecture"][
+            "primary_identity_frozen_before_reappearance"
+        ]
+        is True
+    )
+    assert manifest["measured_reappearance_policy"] == {
+        "primary_entries_and_trajectory_ids_frozen": True,
+        "direct_source_positions": "frozen primary measurements only",
+        "eligible_targets": "frozen primary dormant entries only",
+        "later_primary_continuation": (
+            "allowed only from a previously measured reappearance"
+        ),
+        "intervening_dormant_coordinates": "NULL",
+    }
     assert recovery[0]["ancillary_inputs"] == {
         "/fixture.nc": "0" * 64
     }
@@ -284,7 +303,7 @@ def test_cli_status_imports_without_loading_model(tmp_path, capsys):
 
     assert main(["status", str(config_path)]) == 0
     output = json.loads(capsys.readouterr().out)
-    assert output["run"]["schema_version"] == 4
+    assert output["run"]["schema_version"] == 5
 
 
 def test_cli_status_does_not_create_missing_database(tmp_path):
@@ -298,7 +317,7 @@ def test_cli_status_does_not_create_missing_database(tmp_path):
     assert not Path(config.database).exists()
 
 
-def test_schema_v4_is_global_and_persists_null_dormant_coordinates(tmp_path):
+def test_schema_v5_is_global_and_persists_null_dormant_coordinates(tmp_path):
     config = _config(tmp_path)
     store = RunStore(config)
     points = (
@@ -336,7 +355,60 @@ def test_schema_v4_is_global_and_persists_null_dormant_coordinates(tmp_path):
 
     assert "component_id" not in trajectory_columns
     assert dormant == (None, None)
-    assert version == 4
+    assert version == 5
+
+
+def test_targeted_reappearance_never_uses_an_augmentation_source(tmp_path):
+    config = _config(tmp_path)
+    store = RunStore(config)
+    store.replace_global_trajectories(
+        (
+            TrajectoryPoint(
+                "parcel", "a", START, "created", "seed_grid", 1.0, 2.0, None
+            ),
+            TrajectoryPoint(
+                "parcel",
+                "b",
+                START + timedelta(days=1),
+                "dormant",
+                "missing",
+                None,
+                None,
+                None,
+            ),
+            TrajectoryPoint(
+                "parcel",
+                "c",
+                START + timedelta(days=2),
+                "dormant",
+                "missing",
+                None,
+                None,
+                None,
+            ),
+        )
+    )
+    store.replace_trajectory_augmentation_batches(
+        (
+            (
+                TrajectoryPoint(
+                    "parcel",
+                    "b",
+                    START + timedelta(days=1),
+                    "reappeared",
+                    "recovery_pair_field",
+                    11.0,
+                    2.0,
+                    "a__b",
+                ),
+            ),
+        )
+    )
+
+    np.testing.assert_array_equal(
+        store.targeted_recovery_positions("a", "b"), np.array([[1.0, 2.0]])
+    )
+    assert store.targeted_recovery_positions("b", "c").shape == (0, 2)
 
 
 def test_legacy_database_is_rejected_without_migration(tmp_path):
@@ -344,7 +416,7 @@ def test_legacy_database_is_rejected_without_migration(tmp_path):
     with sqlite3.connect(legacy) as connection:
         connection.execute("CREATE TABLE runs(run_id TEXT PRIMARY KEY)")
 
-    with pytest.raises(ValueError, match="new schema-v4 database path and run_id"):
+    with pytest.raises(ValueError, match="new schema-v5 database path and run_id"):
         RunStore(replace(_config(tmp_path), database=str(legacy)))
 
 
@@ -417,12 +489,44 @@ def test_finalize_validates_complete_run_and_writes_summary_without_parquet(
 
     assert output["trajectory_parquet"] is None
     assert len(output["assessment_summary_sha256"]) == 64
-    assert report["sqlite_schema_version"] == 4
+    assert report["sqlite_schema_version"] == 5
     assert report["integrity"]["quick_check"] == "ok"
     assert report["integrity"]["verified_pair_match_archives"] == 3
     assert report["counts"]["retained_pair_match_archives"] == 3
+    assert report["counts"]["trajectory_augmentations"] == 4
+    assert report["counts"]["direct_reappearances"] == 4
     assert report["raw_match_retention"]["enabled"] is True
     assert report["products"]["trajectory_parquet"] is None
+
+
+def test_finalize_rejects_primary_continuation_without_augmentation_source(tmp_path):
+    config = _config(tmp_path)
+    LiMOSATRun(config, _catalogue(tmp_path), SyntheticProcessor()).execute()
+
+    with sqlite3.connect(config.database) as connection:
+        connection.execute(
+            """
+            UPDATE trajectory_points
+               SET state='observed',
+                   position_basis='post_reappearance_primary_field',
+                   source_pair_id='a__b'
+             WHERE run_id=? AND image_id='c'
+            """,
+            (config.run_id,),
+        )
+        connection.execute(
+            """
+            UPDATE trajectory_augmentations
+               SET augmentation_kind='post_reappearance_primary'
+             WHERE run_id=? AND image_id='c'
+            """,
+            (config.run_id,),
+        )
+
+    with pytest.raises(
+        ValueError, match="noncausal_trajectory_augmentation_errors=4"
+    ):
+        finalize_products(config, export_parquet=False)
 
 
 @pytest.mark.skipif(
@@ -439,7 +543,7 @@ def test_finalize_writes_nullable_utc_trajectory_parquet(tmp_path):
     LiMOSATRun(config, _catalogue(tmp_path), SyntheticProcessor()).execute()
 
     assert main(["finalize", str(config_path), "--batch-size", "3"]) == 0
-    path = tmp_path / "products" / "global-trajectory-catalogue-v1.parquet"
+    path = tmp_path / "products" / "global-trajectory-catalogue-v2.parquet"
     table = pq.read_table(path)
 
     assert table.num_rows > 0

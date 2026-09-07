@@ -6,7 +6,7 @@ import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from collections.abc import Iterator
-from typing import Sequence
+from typing import Iterable, Sequence
 
 import numpy as np
 from scipy.spatial import cKDTree
@@ -43,6 +43,8 @@ class TrajectoryPoint:
             raise ValueError("dormant trajectory coordinates must be NULL")
         if self.state != "dormant" and not self.available:
             raise ValueError("measured trajectory states require coordinates")
+        if self.available and not np.isfinite([self.x_m, self.y_m]).all():
+            raise ValueError("measured trajectory coordinates must be finite")
 
     @property
     def available(self) -> bool:
@@ -240,6 +242,162 @@ def targeted_recovery_positions(
     )
 
 
+def iter_frozen_primary_augmentations(
+    primary_points_by_image: Iterable[Sequence[TrajectoryPoint]],
+    edges: Sequence[FieldEdge],
+    images: Sequence[ImageRecord],
+    field_config: FieldConfig,
+) -> Iterator[tuple[TrajectoryPoint, ...]]:
+    """Yield measured additions without changing the primary row universe.
+
+    A direct reappearance samples only a frozen primary coordinate.  A later
+    primary field can continue only that reappearance-derived coordinate into
+    an existing dormant entry.  Recovery fields never consume an augmentation.
+    """
+    ordered_images = tuple(
+        sorted(images, key=lambda image: (image.time_utc, image.image_id))
+    )
+    if not ordered_images:
+        raise ValueError("trajectory augmentation requires catalogue images")
+    image_keys = [image.image_id for image in ordered_images]
+    if len(image_keys) != len(set(image_keys)):
+        raise ValueError("trajectory image identity must be globally unique")
+    image_index = {image_id: index for index, image_id in enumerate(image_keys)}
+
+    primary_by_target: dict[int, list[tuple[int, int, FieldEdge]]] = {}
+    recovery_by_target: dict[int, list[tuple[int, int, FieldEdge]]] = {}
+    primary_last_use: dict[int, int] = {}
+    recovery_last_use: dict[int, int] = {}
+    for edge in edges:
+        source = image_index.get(edge.source_image_id)
+        target = image_index.get(edge.target_image_id)
+        if source is None or target is None or source >= target:
+            raise ValueError("every pair field must point forward between listed images")
+        item = (source, target, edge)
+        if edge.pair_kind == "primary":
+            primary_by_target.setdefault(target, []).append(item)
+            primary_last_use[source] = max(primary_last_use.get(source, target), target)
+        elif edge.pair_kind == "recovery":
+            recovery_by_target.setdefault(target, []).append(item)
+            recovery_last_use[source] = max(
+                recovery_last_use.get(source, target), target
+            )
+        else:
+            raise ValueError(f"unknown pair field kind: {edge.pair_kind}")
+    for incoming in (*primary_by_target.values(), *recovery_by_target.values()):
+        incoming.sort(key=lambda item: (item[0], item[2].field.pair_id))
+
+    frozen_positions: list[dict[str, np.ndarray]] = [
+        {} for _ in ordered_images
+    ]
+    augmented_positions: list[dict[str, np.ndarray]] = [
+        {} for _ in ordered_images
+    ]
+    primary_batches = iter(primary_points_by_image)
+
+    for step, image in enumerate(ordered_images):
+        try:
+            primary_points = tuple(next(primary_batches))
+        except StopIteration as error:
+            raise ValueError(
+                "primary trajectory batches ended before the image chronology"
+            ) from error
+        if any(point.image_id != image.image_id for point in primary_points):
+            raise ValueError("primary trajectory batch does not match image chronology")
+        primary_by_identity = {
+            point.trajectory_id: point for point in primary_points
+        }
+        if len(primary_by_identity) != len(primary_points):
+            raise ValueError("primary trajectory batch contains duplicate identities")
+        if any(
+            point.position_basis in {
+                "recovery_pair_field",
+                "post_reappearance_primary_field",
+            }
+            for point in primary_points
+        ):
+            raise ValueError("trajectory augmentation requires a primary-only catalogue")
+
+        frozen_positions[step] = {
+            identity: np.asarray([point.x_m, point.y_m], dtype=np.float64)
+            for identity, point in primary_by_identity.items()
+            if point.available
+        }
+        dormant = sorted(
+            identity
+            for identity, point in primary_by_identity.items()
+            if point.state == "dormant"
+        )
+        updates: dict[str, TrajectoryPoint] = {}
+
+        primary = _supported_continuations(
+            primary_by_target.get(step, ()),
+            augmented_positions,
+            dormant,
+            field_config,
+        )
+        for identity, continuation in primary.items():
+            xy = (
+                augmented_positions[continuation.source_step][identity]
+                + continuation.displacement_m
+            )
+            augmented_positions[step][identity] = xy
+            updates[identity] = _point(
+                identity,
+                image,
+                "observed",
+                "post_reappearance_primary_field",
+                xy,
+                continuation.edge.field.pair_id,
+                continuation.selected_matches,
+                continuation.support_radius_m,
+                continuation.maximum_residual_m,
+            )
+
+        recovery = _supported_continuations(
+            recovery_by_target.get(step, ()),
+            frozen_positions,
+            [identity for identity in dormant if identity not in updates],
+            field_config,
+        )
+        for identity, continuation in recovery.items():
+            xy = (
+                frozen_positions[continuation.source_step][identity]
+                + continuation.displacement_m
+            )
+            augmented_positions[step][identity] = xy
+            updates[identity] = _point(
+                identity,
+                image,
+                "reappeared",
+                "recovery_pair_field",
+                xy,
+                continuation.edge.field.pair_id,
+                continuation.selected_matches,
+                continuation.support_radius_m,
+                continuation.maximum_residual_m,
+            )
+
+        yield tuple(updates[identity] for identity in sorted(updates))
+
+        for source_step, target_step in tuple(primary_last_use.items()):
+            if target_step == step:
+                augmented_positions[source_step].clear()
+        for source_step, target_step in tuple(recovery_last_use.items()):
+            if target_step == step:
+                frozen_positions[source_step].clear()
+        if step not in primary_last_use:
+            augmented_positions[step].clear()
+        if step not in recovery_last_use:
+            frozen_positions[step].clear()
+
+    try:
+        next(primary_batches)
+    except StopIteration:
+        return
+    raise ValueError("primary trajectory batches exceed the image chronology")
+
+
 def audit_trajectory_convergence(
     points: Sequence[TrajectoryPoint], radius_m: float
 ) -> tuple[ConvergenceEvent, ...]:
@@ -383,10 +541,9 @@ def _supported_continuations(
     field_config: FieldConfig,
 ) -> dict[str, _Continuation]:
     chosen: dict[str, _Continuation] = {}
+    identity_set = set(identities)
     for source_step, _target_step, edge in incoming:
-        eligible = [
-            identity for identity in identities if identity in positions[source_step]
-        ]
+        eligible = sorted(identity_set.intersection(positions[source_step]))
         if not eligible:
             continue
         queries = np.vstack([positions[source_step][identity] for identity in eligible])

@@ -25,6 +25,7 @@ from .store import RunStore
 from .trajectory import (
     TrajectoryPoint,
     audit_trajectory_convergence,
+    iter_frozen_primary_augmentations,
     iter_global_trajectory_points,
 )
 
@@ -255,12 +256,13 @@ class RunStages:
                 recovery,
             )
 
-        edges = [
+        primary_edges = [
             FieldEdge(self._required_field(store, item.pair.pair_id))
             for item in primary
         ]
+        recovery_edges = []
         if recovery:
-            edges.extend(
+            recovery_edges.extend(
                 FieldEdge(
                     self._required_field(store, item.pair.pair_id),
                     pair_kind="recovery",
@@ -269,31 +271,49 @@ class RunStages:
                 for item in recovery
             )
 
-        state_counts: dict[str, int] = {}
-        point_count = 0
-        retained_points: list[TrajectoryPoint] | None = (
-            []
-            if self.config.trajectories.convergence_audit_radius_m is not None
-            else None
-        )
-
-        def batches():
-            nonlocal point_count
-            for batch in iter_global_trajectory_points(
-                edges,
-                self.catalogue.chronological(),
-                self.config.field,
-                self.config.trajectories,
-            ):
-                point_count += len(batch)
-                for point in batch:
-                    state_counts[point.state] = state_counts.get(point.state, 0) + 1
-                if retained_points is not None:
-                    retained_points.extend(batch)
-                yield batch
-
         clock = time.perf_counter()
-        store.replace_global_trajectory_batches(batches())
+        retained_points: list[TrajectoryPoint] | None = None
+        restored_augmentations = 0
+        augmentation_counts = {
+            "reappearance": 0,
+            "post_reappearance_primary": 0,
+        }
+        images = self.catalogue.chronological()
+        if phase == "primary":
+            retained_points = (
+                []
+                if self.config.trajectories.convergence_audit_radius_m is not None
+                else None
+            )
+
+            def primary_batches():
+                for batch in iter_global_trajectory_points(
+                    primary_edges,
+                    images,
+                    self.config.field,
+                    self.config.trajectories,
+                ):
+                    if retained_points is not None:
+                        retained_points.extend(batch)
+                    yield batch
+
+            store.replace_global_trajectory_batches(primary_batches())
+        else:
+            restored_augmentations = store.restore_primary_trajectories()
+            augmentation_counts = store.replace_trajectory_augmentation_batches(
+                iter_frozen_primary_augmentations(
+                    store.iter_global_trajectory_point_batches(images),
+                    (*primary_edges, *recovery_edges),
+                    images,
+                    self.config.field,
+                )
+            )
+            if self.config.trajectories.convergence_audit_radius_m is not None:
+                retained_points = [
+                    point
+                    for batch in store.iter_global_trajectory_point_batches(images)
+                    for point in batch
+                ]
         events = (
             audit_trajectory_convergence(
                 retained_points,
@@ -303,12 +323,19 @@ class RunStages:
             else ()
         )
         store.replace_convergence_events(events)
+        trajectory_counts = store.trajectory_counts()
         result = {
             "phase": phase,
             "primary_pairs": len(primary),
             "recovery_pairs": len(recovery),
-            "trajectory_points": point_count,
-            "trajectory_states": state_counts,
+            "trajectories": trajectory_counts["trajectories"],
+            "trajectory_points": trajectory_counts["trajectory_points"],
+            "trajectory_states": trajectory_counts["trajectory_states"],
+            "trajectory_augmentations": trajectory_counts[
+                "trajectory_augmentations"
+            ],
+            "restored_augmentations": restored_augmentations,
+            "applied_augmentations": augmentation_counts,
             "convergence_events": len(events),
             "composition_seconds": time.perf_counter() - clock,
             "pair_product_import": pair_import,

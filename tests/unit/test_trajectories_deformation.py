@@ -12,6 +12,7 @@ from limosat import (
     TrajectoryPoint,
     audit_trajectory_convergence,
     build_trajectories,
+    iter_frozen_primary_augmentations,
 )
 from limosat.deformation import deformation_from_field
 from limosat.trajectory import targeted_recovery_positions
@@ -21,7 +22,15 @@ START = datetime(2020, 1, 1, tzinfo=timezone.utc)
 GRID = np.array([[0.0, 0.0], [1_000.0, 0.0], [0.0, 1_000.0], [1_000.0, 1_000.0]])
 
 
-def _field(source, target, step, displacement, available=None, points=GRID):
+def _field(
+    source,
+    target,
+    step,
+    displacement,
+    available=None,
+    points=GRID,
+    target_step=None,
+):
     available = np.ones(len(points), dtype=bool) if available is None else np.asarray(available)
     values = np.tile(displacement, (len(points), 1)).astype(float)
     values[~available] = np.nan
@@ -30,7 +39,8 @@ def _field(source, target, step, displacement, available=None, points=GRID):
         source_image_id=source,
         target_image_id=target,
         source_time_utc=START + timedelta(days=step),
-        target_time_utc=START + timedelta(days=step + 1),
+        target_time_utc=START
+        + timedelta(days=step + 1 if target_step is None else target_step),
         grid_row=np.arange(len(points)),
         grid_column=np.zeros(len(points)),
         source_xy_m=points,
@@ -101,6 +111,142 @@ def test_targeted_recovery_selects_last_measured_source_positions():
     selected = targeted_recovery_positions(points, "a", "c")
 
     assert selected.shape == (4, 2)
+
+
+def test_frozen_augmentation_changes_only_dormant_entries_and_propagates_causally():
+    images = _images(("a", "b", "c", "d"))
+    primary_edges = [
+        FieldEdge(_field("a", "b", 0, [100.0, 0.0])),
+        FieldEdge(
+            _field(
+                "b",
+                "c",
+                1,
+                [0.0, 0.0],
+                available=[False] * 4,
+                points=GRID + [100.0, 0.0],
+            )
+        ),
+        FieldEdge(
+            _field(
+                "b",
+                "d",
+                1,
+                [0.0, 0.0],
+                available=[False] * 4,
+                points=GRID + [100.0, 0.0],
+                target_step=3,
+            )
+        ),
+        FieldEdge(
+            _field(
+                "c", "d", 2, [100.0, 0.0], points=GRID + [200.0, 0.0]
+            )
+        ),
+    ]
+    recovery = FieldEdge(
+        _field("a", "c", 0, [200.0, 0.0], target_step=2),
+        pair_kind="recovery",
+        skipped_images=1,
+    )
+    primary = build_trajectories(
+        primary_edges, images, _settings(), TrajectoryConfig()
+    )
+    batches = tuple(
+        tuple(point for point in primary if point.image_id == image.image_id)
+        for image in images
+    )
+
+    additions = tuple(
+        point
+        for batch in iter_frozen_primary_augmentations(
+            batches, (*primary_edges, recovery), images, _settings()
+        )
+        for point in batch
+    )
+
+    assert len(additions) == 8
+    assert {
+        point.position_basis for point in additions if point.image_id == "c"
+    } == {"recovery_pair_field"}
+    assert {
+        point.position_basis for point in additions if point.image_id == "d"
+    } == {"post_reappearance_primary_field"}
+    primary_by_key = {
+        (point.trajectory_id, point.image_id): point for point in primary
+    }
+    assert all(
+        primary_by_key[(point.trajectory_id, point.image_id)].state == "dormant"
+        for point in additions
+    )
+    final_by_key = {**primary_by_key}
+    final_by_key.update(
+        {(point.trajectory_id, point.image_id): point for point in additions}
+    )
+    assert final_by_key.keys() == primary_by_key.keys()
+    for key, point in primary_by_key.items():
+        if point.available:
+            assert final_by_key[key] == point
+
+
+def test_reappearance_fields_never_chain_from_an_augmented_source_position():
+    images = _images(("a", "b", "c", "d"))
+    primary_edges = [
+        FieldEdge(_field("a", "b", 0, [100.0, 0.0])),
+        FieldEdge(
+            _field(
+                "b",
+                "c",
+                1,
+                [0.0, 0.0],
+                available=[False] * 4,
+                points=GRID + [100.0, 0.0],
+            )
+        ),
+        FieldEdge(
+            _field(
+                "b",
+                "d",
+                1,
+                [0.0, 0.0],
+                available=[False] * 4,
+                points=GRID + [100.0, 0.0],
+                target_step=3,
+            )
+        ),
+    ]
+    recovery_edges = [
+        FieldEdge(
+            _field("a", "c", 0, [200.0, 0.0], target_step=2),
+            pair_kind="recovery",
+            skipped_images=1,
+        ),
+        FieldEdge(
+            _field("c", "d", 2, [100.0, 0.0], points=GRID + [200.0, 0.0]),
+            pair_kind="recovery",
+            skipped_images=0,
+        ),
+    ]
+    primary = build_trajectories(
+        primary_edges, images, _settings(), TrajectoryConfig()
+    )
+    batches = tuple(
+        tuple(point for point in primary if point.image_id == image.image_id)
+        for image in images
+    )
+
+    additions = tuple(
+        point
+        for batch in iter_frozen_primary_augmentations(
+            batches, (*primary_edges, *recovery_edges), images, _settings()
+        )
+        for point in batch
+    )
+
+    assert {point.image_id for point in additions} == {"c"}
+    assert {point.position_basis for point in additions} == {
+        "recovery_pair_field"
+    }
 
 
 def test_new_trajectory_is_created_when_outgoing_coverage_enters():

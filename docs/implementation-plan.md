@@ -128,10 +128,11 @@ builder before a production rebuild.
   trajectory Parquet catalogue plus a checksummed statistics/provenance
   summary. Keep SQLite as the single authoritative resume/audit product and
   avoid per-pair output directories.
-- [ ] **Measured-loss recovery audit.** Compose primary fields first, identify
-  genuine dormant parcels, compute only bounded non-consecutive recovery
-  pairs, and deterministically recompose. Recovery fields never generate
-  deformation cells.
+- [x] **Measured reappearance architecture.** Compose and freeze primary
+  fields first, identify genuine dormant entries, compute only bounded
+  non-consecutive reappearance pairs, and deterministically augment those
+  entries. Reappearance fields never generate deformation cells or new
+  trajectory identities.
 - [ ] **Seed-occupancy experiment.** Compare current target-time measured
   occupancy with bounded exclusion around a dormant parcel's last measured
   position. Do not predict an unmeasured target coordinate. Report duplicate
@@ -180,9 +181,9 @@ builder before a production rebuild.
 5. On the GPU host, run the new 5%/1,024 km2 April-week plan. Do not rerun
    overlap strata unless field diagnostics reveal a new failure mode.
 6. Rebuild primary fields only if matcher- or domain-level settings changed;
-   otherwise reuse immutable fields and recompose the global catalogue.
-7. Run elapsed-time-bounded recovery, recompose, compare manifests, and render final
-   pan-Arctic outputs.
+   otherwise reuse immutable fields and rebuild the frozen primary catalogue.
+7. Run elapsed-time-bounded reappearance pairs, augment the frozen catalogue,
+   compare manifests, and render final pan-Arctic outputs.
 
-The candidate and recovery horizons are currently both 96 hours. This remains
-an explicit production choice, not an established physical constant.
+The configured candidate and recovery horizons remain separate policy choices,
+not established physical constants or part of the continuation contract.

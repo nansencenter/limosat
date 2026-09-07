@@ -9,11 +9,11 @@ import zlib
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 
 import numpy as np
 
-from .catalog import ImageCatalogue, ImagePair
+from .catalog import ImageCatalogue, ImagePair, ImageRecord
 from .config import RunConfig
 from .deformation import DeformationCell
 from .models import DisplacementField, MotionMatches, PairResult
@@ -21,7 +21,7 @@ from .planning import PlannedPair
 from .trajectory import ConvergenceEvent, TrajectoryPoint
 
 
-DATABASE_SCHEMA_VERSION = 4
+DATABASE_SCHEMA_VERSION = 5
 PAIR_MATCH_ENCODING = "zlib-le-v1"
 
 
@@ -612,13 +612,224 @@ class RunStore:
             JOIN trajectory_points source
               ON source.run_id=target.run_id
              AND source.trajectory_id=target.trajectory_id
+            LEFT JOIN trajectory_augmentations target_augmentation
+              ON target_augmentation.run_id=target.run_id
+             AND target_augmentation.trajectory_id=target.trajectory_id
+             AND target_augmentation.image_id=target.image_id
+            LEFT JOIN trajectory_augmentations source_augmentation
+              ON source_augmentation.run_id=source.run_id
+             AND source_augmentation.trajectory_id=source.trajectory_id
+             AND source_augmentation.image_id=source.image_id
             WHERE target.run_id=?
-              AND target.image_id=? AND target.state='dormant'
+              AND target.image_id=?
+              AND (target.state='dormant'
+                   OR target_augmentation.augmentation_kind='reappearance')
               AND source.image_id=? AND source.x_m IS NOT NULL
+              AND source_augmentation.image_id IS NULL
             ORDER BY target.trajectory_id
             """,
             (self.config.run_id, target_image_id, source_image_id),
         ).fetchall()
+
+    def iter_global_trajectory_point_batches(
+        self, images: Sequence[ImageRecord]
+    ):
+        """Yield one frozen, deterministic primary batch per image."""
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN")
+            for image in images:
+                rows = connection.execute(
+                    """
+                    SELECT trajectory_id,image_id,time_utc,state,position_basis,
+                           x_m,y_m,source_pair_id,selected_matches,
+                           support_radius_m,maximum_residual_m
+                    FROM trajectory_points
+                    WHERE run_id=? AND image_id=?
+                    ORDER BY trajectory_id
+                    """,
+                    (self.config.run_id, image.image_id),
+                ).fetchall()
+                yield tuple(_trajectory_point(row) for row in rows)
+
+    def restore_primary_trajectories(self) -> int:
+        """Reversibly remove previously applied trajectory augmentations."""
+        with closing(self._connect()) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            expected = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM trajectory_augmentations WHERE run_id=?",
+                    (self.config.run_id,),
+                ).fetchone()[0]
+            )
+            invalid = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM trajectory_augmentations augmentation
+                    JOIN trajectory_points point
+                      ON point.run_id=augmentation.run_id
+                     AND point.trajectory_id=augmentation.trajectory_id
+                     AND point.image_id=augmentation.image_id
+                    WHERE augmentation.run_id=? AND NOT (
+                      (augmentation.augmentation_kind='reappearance'
+                       AND point.state='reappeared'
+                       AND point.position_basis='recovery_pair_field')
+                      OR
+                      (augmentation.augmentation_kind='post_reappearance_primary'
+                       AND point.state='observed'
+                       AND point.position_basis='post_reappearance_primary_field')
+                    )
+                    """,
+                    (self.config.run_id,),
+                ).fetchone()[0]
+            )
+            if invalid:
+                raise ValueError(
+                    "trajectory augmentation audit does not match final rows"
+                )
+            restored = connection.execute(
+                """
+                UPDATE trajectory_points
+                   SET state='dormant',position_basis='missing',x_m=NULL,y_m=NULL,
+                       source_pair_id=NULL,selected_matches=NULL,
+                       support_radius_m=NULL,maximum_residual_m=NULL
+                 WHERE run_id=? AND EXISTS (
+                       SELECT 1 FROM trajectory_augmentations augmentation
+                        WHERE augmentation.run_id=trajectory_points.run_id
+                          AND augmentation.trajectory_id=trajectory_points.trajectory_id
+                          AND augmentation.image_id=trajectory_points.image_id
+                 )
+                """,
+                (self.config.run_id,),
+            ).rowcount
+            if restored != expected:
+                raise ValueError(
+                    "trajectory augmentation audit does not match final rows"
+                )
+            connection.execute(
+                "DELETE FROM trajectory_augmentations WHERE run_id=?",
+                (self.config.run_id,),
+            )
+            connection.execute(
+                "DELETE FROM trajectory_convergence_events WHERE run_id=?",
+                (self.config.run_id,),
+            )
+        return restored
+
+    def replace_trajectory_augmentation_batches(
+        self, batches: Iterable[Iterable[TrajectoryPoint]]
+    ) -> dict[str, int]:
+        """Atomically fill only frozen primary dormant entries with measurements."""
+        counts = {"reappearance": 0, "post_reappearance_primary": 0}
+        with closing(self._connect()) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM trajectory_augmentations WHERE run_id=?",
+                    (self.config.run_id,),
+                ).fetchone()[0]
+            )
+            if existing:
+                raise ValueError(
+                    "restore the frozen primary catalogue before augmentation"
+                )
+            for batch in batches:
+                for point in batch:
+                    if point.position_basis == "recovery_pair_field":
+                        kind = "reappearance"
+                        expected_state = "reappeared"
+                    elif point.position_basis == "post_reappearance_primary_field":
+                        kind = "post_reappearance_primary"
+                        expected_state = "observed"
+                    else:
+                        raise ValueError(
+                            "trajectory augmentation has an invalid position basis"
+                        )
+                    if point.state != expected_state or point.source_pair_id is None:
+                        raise ValueError(
+                            "trajectory augmentation state or provenance is invalid"
+                        )
+                    changed = connection.execute(
+                        """
+                        UPDATE trajectory_points
+                           SET state=?,position_basis=?,x_m=?,y_m=?,source_pair_id=?,
+                               selected_matches=?,support_radius_m=?,maximum_residual_m=?
+                         WHERE run_id=? AND trajectory_id=? AND image_id=?
+                           AND state='dormant' AND x_m IS NULL AND y_m IS NULL
+                        """,
+                        (
+                            point.state,
+                            point.position_basis,
+                            point.x_m,
+                            point.y_m,
+                            point.source_pair_id,
+                            _finite_or_none(point.selected_matches),
+                            _finite_or_none(point.support_radius_m),
+                            _finite_or_none(point.maximum_residual_m),
+                            self.config.run_id,
+                            point.trajectory_id,
+                            point.image_id,
+                        ),
+                    ).rowcount
+                    if changed != 1:
+                        raise ValueError(
+                            "trajectory augmentation may update only one frozen "
+                            "primary dormant entry"
+                        )
+                    connection.execute(
+                        """
+                        INSERT INTO trajectory_augmentations
+                        (run_id,trajectory_id,image_id,augmentation_kind)
+                        VALUES (?,?,?,?)
+                        """,
+                        (
+                            self.config.run_id,
+                            point.trajectory_id,
+                            point.image_id,
+                            kind,
+                        ),
+                    )
+                    counts[kind] += 1
+        return counts
+
+    def trajectory_counts(self) -> dict:
+        """Return compact authoritative primary/final trajectory counts."""
+        with closing(self._connect()) as connection:
+            states = dict(
+                connection.execute(
+                    """
+                    SELECT state,COUNT(*) FROM trajectory_points
+                    WHERE run_id=? GROUP BY state ORDER BY state
+                    """,
+                    (self.config.run_id,),
+                )
+            )
+            augmentations = dict(
+                connection.execute(
+                    """
+                    SELECT augmentation_kind,COUNT(*) FROM trajectory_augmentations
+                    WHERE run_id=? GROUP BY augmentation_kind
+                    ORDER BY augmentation_kind
+                    """,
+                    (self.config.run_id,),
+                )
+            )
+            totals = connection.execute(
+                """
+                SELECT
+                  (SELECT COUNT(*) FROM trajectories WHERE run_id=?),
+                  (SELECT COUNT(*) FROM trajectory_points WHERE run_id=?)
+                """,
+                (self.config.run_id, self.config.run_id),
+            ).fetchone()
+        return {
+            "trajectories": int(totals[0]),
+            "trajectory_points": int(totals[1]),
+            "trajectory_states": {key: int(value) for key, value in states.items()},
+            "trajectory_augmentations": {
+                key: int(value) for key, value in augmentations.items()
+            },
+        }
 
     def run_record(self) -> dict:
         with closing(self._connect()) as connection:
@@ -644,6 +855,10 @@ class RunStore:
             )
             connection.execute(
                 "DELETE FROM trajectory_convergence_events WHERE run_id=?",
+                (self.config.run_id,),
+            )
+            connection.execute(
+                "DELETE FROM trajectory_augmentations WHERE run_id=?",
                 (self.config.run_id,),
             )
             connection.execute(
@@ -839,6 +1054,14 @@ class RunStore:
                      WHERE run_id=? AND selection='primary') primary_pairs,
                   (SELECT COUNT(*) FROM trajectories WHERE run_id=?) trajectories,
                   (SELECT COUNT(*) FROM trajectory_points WHERE run_id=?) trajectory_points,
+                  (SELECT COUNT(*) FROM trajectory_augmentations
+                     WHERE run_id=?) trajectory_augmentations,
+                  (SELECT COUNT(*) FROM trajectory_augmentations
+                     WHERE run_id=? AND augmentation_kind='reappearance')
+                     direct_reappearances,
+                  (SELECT COUNT(*) FROM trajectory_augmentations
+                     WHERE run_id=? AND augmentation_kind='post_reappearance_primary')
+                     post_reappearance_primary_points,
                   (SELECT COUNT(*) FROM trajectory_convergence_events
                      WHERE run_id=?) trajectory_convergence_events,
                   (SELECT COUNT(*) FROM deformation_cells WHERE run_id=?) deformation_cells,
@@ -849,7 +1072,7 @@ class RunStore:
                   (SELECT COALESCE(SUM(compressed_bytes),0) FROM pair_match_archives
                      WHERE run_id=?) retained_pair_match_compressed_bytes
                 """,
-                (self.config.run_id,) * 9,
+                (self.config.run_id,) * 12,
             ).fetchone())
         return {
             "images": images,
@@ -928,7 +1151,7 @@ class RunStore:
                 raise ValueError(
                     "unsupported LiMOSAT SQLite schema "
                     f"{version or 'legacy'}; global catalogue runs require a new "
-                    "schema-v4 database path and run_id"
+                    f"schema-v{DATABASE_SCHEMA_VERSION} database path and run_id"
                 )
             if not tables:
                 connection.executescript(_SCHEMA)
@@ -1022,6 +1245,22 @@ def implementation_sha256() -> str:
 
 def _finite_or_none(value):
     return None if value is None or not np.isfinite(value) else float(value)
+
+
+def _trajectory_point(row: sqlite3.Row) -> TrajectoryPoint:
+    return TrajectoryPoint(
+        trajectory_id=row["trajectory_id"],
+        image_id=row["image_id"],
+        time_utc=datetime.fromisoformat(row["time_utc"]),
+        state=row["state"],
+        position_basis=row["position_basis"],
+        x_m=row["x_m"],
+        y_m=row["y_m"],
+        source_pair_id=row["source_pair_id"],
+        selected_matches=row["selected_matches"],
+        support_radius_m=row["support_radius_m"],
+        maximum_residual_m=row["maximum_residual_m"],
+    )
 
 
 def _utc_now() -> str:
@@ -1121,6 +1360,14 @@ CREATE TABLE IF NOT EXISTS trajectory_points (
 );
 CREATE INDEX IF NOT EXISTS trajectory_points_run_image_state
   ON trajectory_points(run_id,image_id,state,trajectory_id);
+CREATE TABLE IF NOT EXISTS trajectory_augmentations (
+  run_id TEXT NOT NULL, trajectory_id TEXT NOT NULL, image_id TEXT NOT NULL,
+  augmentation_kind TEXT NOT NULL
+    CHECK(augmentation_kind IN ('reappearance','post_reappearance_primary')),
+  PRIMARY KEY(run_id,trajectory_id,image_id),
+  FOREIGN KEY(run_id,trajectory_id,image_id)
+    REFERENCES trajectory_points(run_id,trajectory_id,image_id)
+);
 CREATE TABLE IF NOT EXISTS trajectory_convergence_events (
   run_id TEXT NOT NULL, image_id TEXT NOT NULL, time_utc TEXT NOT NULL,
   winner_trajectory_id TEXT NOT NULL, candidate_trajectory_id TEXT NOT NULL,

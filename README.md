@@ -32,10 +32,11 @@ limosat status config.yaml
 ```
 
 The run command uses component labels only to plan compute, resumes completed
-image pairs without overwriting them, composes one global parcel catalogue,
-schedules non-consecutive recovery pairs only after measured trajectory loss,
-writes deformation from primary pair fields, and emits
-`run-manifest-v4.json`. Set `retain_pair_matches: true` for assessment runs to
+image pairs without overwriting them, composes and freezes one primary global
+parcel catalogue, schedules non-consecutive reappearance pairs only after
+measured trajectory loss, sparsely augments frozen dormant entries, writes
+deformation from primary pair fields, and emits `run-manifest-v5.json`. Set
+`retain_pair_matches: true` for assessment runs to
 keep the selected post-gate, pre-consensus EfficientLoFTR matches as one
 compressed, checksummed SQLite record per completed image pair.
 
@@ -93,8 +94,8 @@ assessment checksums with:
 limosat finalize config.yaml
 ```
 
-This writes `global-trajectory-catalogue-v1.parquet` and
-`assessment-summary-v1.json`. SQLite remains the authoritative resumable run
+This writes `global-trajectory-catalogue-v2.parquet` and
+`assessment-summary-v2.json`. SQLite remains the authoritative resumable run
 and contains fields, deformation, provenance, and optional retained matches.
 Parquet finalization imports PyArrow only when requested; PyArrow is not a core
 runtime dependency.
@@ -113,7 +114,7 @@ See [operations](docs/operations.md) for catalogue and recovery behavior,
 pending scientific and operational decision gates.
 
 Completed production CSV fields can also be composed without imagery or GPU
-inference. `scripts/replay_global_catalogue_fields.py` creates a new schema-v4
+inference. `scripts/replay_global_catalogue_fields.py` creates a new schema-v5
 SQLite catalogue and checksummed field-replay provenance file;
 `scripts/render_global_catalogue.py` creates the static distributions and
 thin-trail pan-Arctic animation. Replay products are analysis outputs outside
@@ -126,10 +127,15 @@ Git, not substitutes for a native run manifest.
   in SQLite; they are never encoded as zero displacement.
 - Trajectories are virtual material points advected only through supported,
   orientation-preserving fields. Dormant points have no coordinate.
-- Reappearance requires a measured non-consecutive recovery pair; no temporal
-  prediction is included in the primary trajectory product.
-- Sparse targeted recovery fields reconnect trajectories but are not emitted as
-  standalone deformation products.
+- Reappearance requires a measured non-consecutive pair; no temporal prediction
+  is included in the trajectory product.
+- Primary trajectory IDs, entries, measured positions, seeds, and deformation
+  are frozen before measured reappearance is applied.
+- Reappearance fields can fill only frozen dormant entries from frozen primary
+  source measurements. Later full primary fields can continue only a measured
+  reappearance-derived coordinate.
+- Sparse targeted reappearance fields reconnect trajectories but are not emitted
+  as standalone deformation products.
 
 ## License and citation
 

@@ -29,6 +29,7 @@ from .trajectory import (
     audit_trajectory_convergence,
     build_trajectories,
     compose_global_trajectories,
+    iter_frozen_primary_augmentations,
     iter_global_trajectory_points,
 )
 from .run import LiMOSATRun
@@ -65,6 +66,7 @@ __all__ = [
     "build_candidate_plan",
     "audit_trajectory_convergence",
     "compose_global_trajectories",
+    "iter_frozen_primary_augmentations",
     "iter_global_trajectory_points",
     "deformation_from_field",
     "load_catalogue",

@@ -203,6 +203,18 @@ def test_staged_workers_do_not_write_sqlite_and_batches_recompose_globally(tmp_p
         ).fetchone()[0]
     assert dormant > 0
     assert primary["recovery_pairs"] == 0
+    with sqlite3.connect(cfg.database) as connection:
+        frozen_entries = connection.execute(
+            """
+            SELECT trajectory_id,image_id,time_utc,state,position_basis,x_m,y_m,
+                   source_pair_id,selected_matches,support_radius_m,
+                   maximum_residual_m
+            FROM trajectory_points ORDER BY trajectory_id,time_utc,image_id
+            """
+        ).fetchall()
+        frozen_ids = connection.execute(
+            "SELECT trajectory_id FROM trajectories ORDER BY trajectory_id"
+        ).fetchall()
 
     recovery = stages.process_pairs("recovery")
     assert recovery["planned_pairs"] == 1
@@ -223,7 +235,20 @@ def test_staged_workers_do_not_write_sqlite_and_batches_recompose_globally(tmp_p
                 """
             )
         )
+        augmentation_counts = dict(
+            connection.execute(
+                """
+                SELECT augmentation_kind,COUNT(*)
+                FROM trajectory_augmentations GROUP BY augmentation_kind
+                """
+            )
+        )
+        final_ids = connection.execute(
+            "SELECT trajectory_id FROM trajectories ORDER BY trajectory_id"
+        ).fetchall()
     assert reappeared > 0
+    assert augmentation_counts == {"reappearance": reappeared}
+    assert final_ids == frozen_ids
     assert deformation["primary"] > 0
     assert deformation["recovery"] == 0
     assert final["manifest_sha256"]
@@ -237,6 +262,30 @@ def test_staged_workers_do_not_write_sqlite_and_batches_recompose_globally(tmp_p
             FROM trajectory_points ORDER BY trajectory_id,time_utc,image_id
             """
         ).fetchall()
+    frozen_by_key = {(row[0], row[1]): row for row in frozen_entries}
+    staged_by_key = {(row[0], row[1]): row for row in staged_rows}
+    assert staged_by_key.keys() == frozen_by_key.keys()
+    assert all(
+        staged_by_key[key] == entry
+        for key, entry in frozen_by_key.items()
+        if entry[5] is not None
+    )
+
+    resumed_final = stages.compose(
+        "final", ["limosat", "compose", "config", "--phase", "final"]
+    )
+    assert resumed_final["restored_augmentations"] == reappeared
+    with sqlite3.connect(cfg.database) as connection:
+        resumed_rows = connection.execute(
+            """
+            SELECT trajectory_id,image_id,time_utc,state,position_basis,x_m,y_m,
+                   source_pair_id,selected_matches,support_radius_m,
+                   maximum_residual_m
+            FROM trajectory_points ORDER BY trajectory_id,time_utc,image_id
+            """
+        ).fetchall()
+    assert resumed_rows == staged_rows
+
     single = replace(
         cfg,
         database=str(tmp_path / "single.sqlite"),

@@ -60,7 +60,7 @@ CUDA configurations require `pair_workers: 1`; `limosat pairs --batch-index I
 per GPU. Each worker writes an immutable pair product and does not write the
 global SQLite database.
 
-## Matching and recovery
+## Matching and measured reappearance
 
 Each independently scheduled production pair estimates coarse phase
 correlation. EfficientLoFTR runs on north-up tiles whose non-overlapping source
@@ -137,19 +137,22 @@ evidence keeps the tile. SIC paths and SHA256 checksums and every gate count
 are recorded with the completed pair.
 
 Residual field recovery may rerun a tile when a large routing residual and
-target-boundary pressure agree. Catalogue recovery is separate: after all
-primary pair fields are composed globally, LiMOSAT identifies parcels measured
+target-boundary pressure agree. Catalogue reappearance is separate: after all
+primary pair fields are composed globally and frozen, LiMOSAT identifies parcels measured
 at an earlier source image but dormant at a candidate target image and matches
 only source-tile cores within the configured 6.4 km buffer.
 `maximum_recovery_elapsed_hours` bounds recovery from the parcel's measured
 source time to the candidate target time. Images elsewhere in the pan-Arctic
 catalogue do not affect eligibility. Every candidate is discarded unless the
 primary composition contains a parcel that was measured at its source and is
-dormant at its target. Eligible work is ranked recent-first and each recovery
-field is spatially targeted to those measured source positions. Recovery
+dormant at its target. Eligible work is ranked recent-first and each reappearance
+field is spatially targeted to those measured source positions. Reappearance
 fields can reconnect trajectories, but only full primary pair fields generate
-deformation cells. After recovery completes, trajectories are recomposed from
-all completed fields.
+deformation cells. After pair processing completes, a single writer augments
+only frozen primary dormant entries. It never recomposes seed occupancy or
+primary identity from a combined edge set. Direct reappearance samples only
+frozen primary source coordinates. Later full primary fields can continue only
+a measured reappearance-derived coordinate.
 
 At a target image, the composer evaluates parcels whose last measured row is
 at the source of an incoming completed pair field. A parcel unsupported by all
@@ -176,10 +179,12 @@ positions. Existing completed products are verified and never overwritten.
 
 `limosat compose` is the only pair-product SQLite writer. It checksum-verifies
 and imports every expected worker product before streaming per-image
-trajectory batches into one transaction. An interruption rolls back the
-incomplete trajectory composition; already imported immutable pair fields
+trajectory batches into one transaction. Primary composition establishes the
+complete identity and entry universe. Final composition applies a sparse,
+reversible augmentation audit to dormant entries only. An interruption rolls
+back the incomplete augmentation; already imported immutable pair fields
 remain valid. Primary composition derives deformation only from primary pair
-fields. Recovery workers run only after primary composition supplies genuine
+fields. Reappearance workers run only after primary composition supplies genuine
 measured-loss positions.
 When `targeted_recovery` is false, no recovery pair work is selected; the
 Olivia launcher also omits the recovery GPU stage entirely.
@@ -190,7 +195,7 @@ the stages separately without changing their scientific behavior. SQLite is
 the authoritative scientific and finalized resume product after composition;
 pair-product files are intermediate compute-resume state.
 
-The output directory contains `run-manifest-v4.json`. Scientific arrays and
+The output directory contains `run-manifest-v5.json`. Scientific arrays and
 tables live in SQLite; no result products belong in Git. `limosat status`
 reports the run and pair status counts. Assessment runs should set
 `retain_pair_matches: true`; production runs may disable it after the field

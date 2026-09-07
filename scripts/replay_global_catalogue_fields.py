@@ -128,8 +128,8 @@ def main() -> int:
             "time": "timezone-aware UTC",
         },
         "product_schemas": {
-            "sqlite": 4,
-            "lagrangian_trajectory": 4,
+            "sqlite": 5,
+            "lagrangian_trajectory": 5,
             "field_replay_provenance": 1,
         },
         "source": {

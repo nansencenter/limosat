@@ -1,6 +1,6 @@
 # Product schemas
 
-## SQLite schema version 4
+## SQLite schema version 5
 
 `runs` stores the resolved configuration JSON and SHA256, a checksum of all
 LiMOSAT Python source, the checkpoint SHA256, status, UTC runtime boundaries,
@@ -51,7 +51,16 @@ image and millimetre-rounded seed coordinate. Neither global trajectory table
 contains `component_id`. `trajectory_points` uses states `created`,
 `observed`, `dormant`, and `reappeared`. Dormant coordinates are SQL
 `NULL`. `position_basis` distinguishes `seed_grid`,
-`primary_pair_field`, `recovery_pair_field`, and `missing`.
+`primary_pair_field`, `recovery_pair_field`,
+`post_reappearance_primary_field`, and `missing`.
+
+`trajectory_augmentations` is the sparse, reversible audit of measured
+reappearance. Every entry references an existing primary `trajectory_points`
+entry that was dormant with `NULL` coordinates. Its `augmentation_kind` is
+`reappearance` for a directly sampled non-consecutive field or
+`post_reappearance_primary` for later continuation through a full primary
+field. Removing these audited updates deterministically restores the frozen
+primary catalogue; no trajectory or entry is added or deleted.
 
 `trajectory_convergence_events` is a non-destructive diagnostic. It stores the
 measured candidate and deterministically preferred trajectory, separation and
@@ -61,9 +70,9 @@ trajectory identity or coordinates.
 `deformation_cells` stores primary-pair Delaunay triangle centroid and area,
 plus divergence, shear, total deformation, and vorticity in inverse seconds.
 
-## Manifest schema version 4
+## Manifest schema version 5
 
-`run-manifest-v4.json` records:
+`run-manifest-v5.json` records:
 
 - resolved config and config SHA256;
 - EfficientLoFTR checkpoint SHA256;
@@ -78,6 +87,8 @@ plus divergence, shear, total deformation, and vorticity in inverse seconds.
   checksums, selected phase/same-centre routing hypothesis, actual matcher
   calls, and tile-gate counts;
 - trajectory, trajectory-point, and deformation-cell counts;
+- the frozen-primary measured-reappearance policy and sparse augmentation
+  counts;
 - the match-retention stage, per-pair archive checksum/size, and aggregate
   retained pair/match/byte counts; and
 - the explicit policy that sparse recovery fields are not deformation products.
@@ -102,17 +113,17 @@ Only the coordinator imports them into SQLite, and their checksums are retained
 in pair diagnostics in the native manifest. A worker cannot replace a marked
 product with different content.
 
-## Finalized trajectory catalogue version 1
+## Finalized trajectory catalogue version 2
 
-`limosat finalize CONFIG` requires a complete schema-v4 native run, verifies
+`limosat finalize CONFIG` requires a complete schema-v5 native run, verifies
 the recorded manifest checksum, checkpoints the SQLite WAL, and runs SQLite
 quick and foreign-key checks. It writes:
 
-- `global-trajectory-catalogue-v1.parquet`, ordered by global trajectory ID and
+- `global-trajectory-catalogue-v2.parquet`, ordered by global trajectory ID and
   timezone-aware UTC time, with nullable float64 EPSG:3413 `x_m`/`y_m`, state,
   position basis, source image pair, selected-match count, support radius, and
   maximum residual; and
-- `assessment-summary-v1.json`, containing database/manifest/Parquet paths,
+- `assessment-summary-v2.json`, containing database/manifest/Parquet paths,
   SHA256s, sizes, integrity results, scientific row counts, verified raw-match
   archive counts, and raw-match totals.
 
@@ -125,7 +136,7 @@ command and is deliberately not a core dependency.
 `field-replay-provenance-v1.json` is an analysis provenance record, not the
 native run manifest. It identifies the immutable production state/plan and
 ordered completed-field set, reports whether each field checksum was verified,
-records SQLite schema 4 and trajectory product schema 4, and compares the new
+records SQLite schema 5 and trajectory product schema 5, and compares the new
 global catalogue with the prior component-sharded summary. A separate
 `render-report-v1.json` records deterministic trajectory selection, frame
 timing, source checksums, and checksums for figures, MP4, and GIF outputs.

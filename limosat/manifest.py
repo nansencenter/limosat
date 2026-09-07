@@ -14,7 +14,7 @@ from .pair_products import PAIR_PRODUCT_SCHEMA_VERSION
 from .store import RunStore, file_sha256
 
 
-MANIFEST_SCHEMA_VERSION = 4
+MANIFEST_SCHEMA_VERSION = 5
 
 
 def write_manifest(
@@ -34,11 +34,11 @@ def write_manifest(
         "status": "complete",
         "method": "EfficientLoFTR",
         "product_schemas": {
-            "sqlite": 4,
+            "sqlite": 5,
             "pair_displacement_field": 1,
             "pair_match_archive": 1,
             "pair_worker_product": PAIR_PRODUCT_SCHEMA_VERSION,
-            "lagrangian_trajectory": 4,
+            "lagrangian_trajectory": 5,
             "deformation_cell": 1,
         },
         "coordinates": {
@@ -83,7 +83,20 @@ def write_manifest(
         "execution_architecture": {
             "pair_workers_write_sqlite": False,
             "pair_products": "immutable atomic NPZ plus JSON completion marker",
-            "trajectory_composition": "single-writer streamed CPU composition",
+            "trajectory_composition": (
+                "single-writer primary composition followed by sparse measured "
+                "reappearance augmentation of frozen dormant entries"
+            ),
+            "primary_identity_frozen_before_reappearance": True,
+        },
+        "measured_reappearance_policy": {
+            "primary_entries_and_trajectory_ids_frozen": True,
+            "direct_source_positions": "frozen primary measurements only",
+            "eligible_targets": "frozen primary dormant entries only",
+            "later_primary_continuation": (
+                "allowed only from a previously measured reappearance"
+            ),
+            "intervening_dormant_coordinates": "NULL",
         },
         "recovery_deformation_policy": (
             "non-consecutive recovery pair fields reconnect trajectories only; "
@@ -92,8 +105,8 @@ def write_manifest(
     }
     output = Path(config.output_directory)
     output.mkdir(parents=True, exist_ok=True)
-    path = output / "run-manifest-v4.json"
-    temporary = output / ".run-manifest-v4.json.writing"
+    path = output / "run-manifest-v5.json"
+    temporary = output / ".run-manifest-v5.json.writing"
     temporary.write_text(
         json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n",
         encoding="utf-8",

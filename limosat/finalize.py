@@ -14,8 +14,8 @@ from .config import RunConfig
 from .store import DATABASE_SCHEMA_VERSION, PAIR_MATCH_ENCODING, file_sha256
 
 
-TRAJECTORY_CATALOGUE_SCHEMA_VERSION = 1
-ASSESSMENT_SUMMARY_SCHEMA_VERSION = 1
+TRAJECTORY_CATALOGUE_SCHEMA_VERSION = 2
+ASSESSMENT_SUMMARY_SCHEMA_VERSION = 2
 
 
 def finalize_products(
@@ -37,7 +37,7 @@ def finalize_products(
     output = Path(config.output_directory)
     output.mkdir(parents=True, exist_ok=True)
 
-    parquet_path = output / "global-trajectory-catalogue-v1.parquet"
+    parquet_path = output / "global-trajectory-catalogue-v2.parquet"
     if export_parquet:
         _write_trajectory_parquet(
             database, config.run_id, parquet_path, batch_size
@@ -76,8 +76,8 @@ def finalize_products(
         },
         "products": products,
     }
-    report_path = output / "assessment-summary-v1.json"
-    temporary = output / ".assessment-summary-v1.json.writing"
+    report_path = output / "assessment-summary-v2.json"
+    temporary = output / ".assessment-summary-v2.json.writing"
     temporary.write_text(
         json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n",
         encoding="utf-8",
@@ -135,16 +135,78 @@ def _checkpoint_and_check(database: Path, run_id: str) -> dict[str, str | int]:
             """,
             (run_id,),
         ).fetchone()[0]
+        augmentation_errors = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM trajectory_augmentations augmentation
+            JOIN trajectory_points point
+              ON point.run_id=augmentation.run_id
+             AND point.trajectory_id=augmentation.trajectory_id
+             AND point.image_id=augmentation.image_id
+            LEFT JOIN pairs pair
+              ON pair.run_id=point.run_id
+             AND pair.pair_id=point.source_pair_id
+            WHERE augmentation.run_id=? AND NOT (
+              (augmentation.augmentation_kind='reappearance'
+               AND point.state='reappeared'
+               AND point.position_basis='recovery_pair_field'
+               AND pair.kind='recovery')
+              OR
+              (augmentation.augmentation_kind='post_reappearance_primary'
+               AND point.state='observed'
+               AND point.position_basis='post_reappearance_primary_field'
+               AND pair.kind='primary')
+            )
+            """,
+            (run_id,),
+        ).fetchone()[0]
+        noncausal_augmentation_errors = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM trajectory_augmentations later
+            JOIN trajectory_points later_point
+              ON later_point.run_id=later.run_id
+             AND later_point.trajectory_id=later.trajectory_id
+             AND later_point.image_id=later.image_id
+            JOIN pairs pair
+              ON pair.run_id=later_point.run_id
+             AND pair.pair_id=later_point.source_pair_id
+            WHERE later.run_id=?
+              AND later.augmentation_kind='post_reappearance_primary'
+              AND NOT EXISTS (
+                SELECT 1
+                FROM trajectory_augmentations source
+                JOIN trajectory_points source_point
+                  ON source_point.run_id=source.run_id
+                 AND source_point.trajectory_id=source.trajectory_id
+                 AND source_point.image_id=source.image_id
+                WHERE source.run_id=later.run_id
+                  AND source.trajectory_id=later.trajectory_id
+                  AND source.image_id=pair.source_image_id
+                  AND source_point.time_utc < later_point.time_utc
+              )
+            """,
+            (run_id,),
+        ).fetchone()[0]
         if checkpoint[0]:
             raise RuntimeError(
                 "SQLite WAL checkpoint is busy; stop run writers before finalization"
             )
-        if quick_check != "ok" or foreign_key_errors or coordinate_errors:
+        if (
+            quick_check != "ok"
+            or foreign_key_errors
+            or coordinate_errors
+            or augmentation_errors
+            or noncausal_augmentation_errors
+        ):
             raise ValueError(
                 "SQLite integrity check failed: "
                 f"quick_check={quick_check}, "
                 f"foreign_key_errors={foreign_key_errors}, "
-                f"trajectory_coordinate_errors={coordinate_errors}"
+                f"trajectory_coordinate_errors={coordinate_errors}, "
+                f"trajectory_augmentation_errors={augmentation_errors}, "
+                "noncausal_trajectory_augmentation_errors="
+                f"{noncausal_augmentation_errors}"
             )
         archive_count = 0
         for row in connection.execute(
@@ -180,6 +242,10 @@ def _checkpoint_and_check(database: Path, run_id: str) -> dict[str, str | int]:
         "quick_check": quick_check,
         "foreign_key_errors": foreign_key_errors,
         "trajectory_coordinate_errors": int(coordinate_errors),
+        "trajectory_augmentation_errors": int(augmentation_errors),
+        "noncausal_trajectory_augmentation_errors": int(
+            noncausal_augmentation_errors
+        ),
         "verified_pair_match_archives": archive_count,
         "wal_checkpoint_busy": int(checkpoint[0]),
         "wal_frames": int(checkpoint[1]),
@@ -214,7 +280,7 @@ def _write_trajectory_parquet(
             ("maximum_residual_m", pa.float64()),
         ],
         metadata={
-            b"limosat_schema": b"global_trajectory_catalogue_v1",
+            b"limosat_schema": b"global_trajectory_catalogue_v2",
             b"crs": b"EPSG:3413",
             b"coordinate_unit": b"metre",
             b"time_zone": b"UTC",
@@ -291,6 +357,14 @@ def _product_counts(database: Path, run_id: str) -> dict[str, int | dict]:
                  WHERE run_id=? AND available=1) available_field_nodes,
               (SELECT COUNT(*) FROM deformation_cells
                  WHERE run_id=?) deformation_cells,
+              (SELECT COUNT(*) FROM trajectory_augmentations
+                 WHERE run_id=?) trajectory_augmentations,
+              (SELECT COUNT(*) FROM trajectory_augmentations
+                 WHERE run_id=? AND augmentation_kind='reappearance')
+                 direct_reappearances,
+              (SELECT COUNT(*) FROM trajectory_augmentations
+                 WHERE run_id=? AND augmentation_kind='post_reappearance_primary')
+                 post_reappearance_primary_entries,
               (SELECT COUNT(*) FROM pair_match_archives
                  WHERE run_id=?) retained_pair_match_archives,
               (SELECT COALESCE(SUM(match_count),0) FROM pair_match_archives
@@ -298,7 +372,7 @@ def _product_counts(database: Path, run_id: str) -> dict[str, int | dict]:
               (SELECT COALESCE(SUM(compressed_bytes),0) FROM pair_match_archives
                  WHERE run_id=?) retained_pair_match_compressed_bytes
             """,
-            (run_id,) * 10,
+            (run_id,) * 13,
         ).fetchone()
     counts = dict(zip((
         "images",
@@ -308,6 +382,9 @@ def _product_counts(database: Path, run_id: str) -> dict[str, int | dict]:
         "field_nodes",
         "available_field_nodes",
         "deformation_cells",
+        "trajectory_augmentations",
+        "direct_reappearances",
+        "post_reappearance_primary_entries",
         "retained_pair_match_archives",
         "retained_pair_matches",
         "retained_pair_match_compressed_bytes",
