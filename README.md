@@ -62,6 +62,23 @@ Enable persistence by providing a SQL engine and Zarr storage path to store both
 4.	Run `examples/limosat_drift.ipynb`
 5. Visualise results
 
+## Finalize trajectory products
+
+Completed production trajectory databases should pass through the versioned,
+non-destructive QC finalizer before downstream use:
+
+```bash
+python -m limosat.qc --input raw.sqlite --table run_name \
+  --input-sha256 "$RAW_SHA256" --configured-speed-m-per-day 35000 \
+  --output-dir qc_work \
+  --cleaned-output raw_qc.sqlite
+```
+
+Set `RAW_SHA256` to the closed source file's checksum and use the source run's
+effective speed setting. Rejected vectors split trajectories without deleting
+point rows. The output includes a decision audit and integrity manifest.
+See [the trajectory-QC deployment contract](docs/trajectory_qc.md).
+
 ## License
 
 This project is licensed under the MIT License. See the LICENSE file for details.
