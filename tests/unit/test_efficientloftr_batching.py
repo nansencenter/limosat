@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import math
+import threading
 
 import numpy as np
 import pytest
+from shapely import box
 
 from limosat import MatcherConfig, RoutingConfig, RunConfig
 from limosat.efficientloftr import EfficientLoFTR
-from limosat.pairs import PairProcessor
+from limosat.pairs import PairProcessor, TileRegion
 
 from test_efficientloftr_fields import StationaryMatcher, _config, _pair
 
@@ -42,6 +44,24 @@ class BatchStationaryMatcher:
             matcher.match(source, target)
             for source, target in zip(sources, targets, strict=True)
         ]
+
+
+class PrefetchObservingMatcher(BatchStationaryMatcher):
+    def __init__(self, second_batch_ready, sample_count, sample_lock) -> None:
+        super().__init__()
+        self.second_batch_ready = second_batch_ready
+        self.sample_count = sample_count
+        self.sample_lock = sample_lock
+        self.sample_count_at_first_match = None
+        self.thread_ids = []
+
+    def match_batch(self, sources, targets):
+        self.thread_ids.append(threading.get_ident())
+        if not self.batch_sizes:
+            assert self.second_batch_ready.wait(timeout=1.0)
+            with self.sample_lock:
+                self.sample_count_at_first_match = self.sample_count[0]
+        return super().match_batch(sources, targets)
 
 
 def test_match_batch_pads_to_static_shape_and_splits_real_tiles():
@@ -125,3 +145,55 @@ def test_pair_processor_batches_residual_recovery_tiles(tmp_path, monkeypatch):
         planned / config.matcher.tile_batch_size
     )
     assert sum(matcher.batch_sizes) == 2 * planned
+
+
+def test_pair_processor_prefetches_exactly_one_ordered_batch(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    pair = _pair(tmp_path)
+    second_batch_ready = threading.Event()
+    sample_lock = threading.Lock()
+    sample_count = [0]
+    sampled_centers = []
+    sampling_thread_ids = []
+    matcher = PrefetchObservingMatcher(
+        second_batch_ready, sample_count, sample_lock
+    )
+    processor = PairProcessor(config, matcher)
+
+    def sample_pair(_pair, center, _shift):
+        with sample_lock:
+            sampled_centers.append(center)
+            sampling_thread_ids.append(threading.get_ident())
+            sample_count[0] += 1
+            if sample_count[0] == 8:
+                second_batch_ready.set()
+        image = np.zeros((16, 16), dtype=np.uint8)
+        valid = np.ones_like(image, dtype=bool)
+        return (image, image.copy(), valid, valid.copy()), None
+
+    monkeypatch.setattr(processor, "_sample_pair", sample_pair)
+    regions = tuple(
+        TileRegion(index, 0, index, (float(index * 100), 0.0), box(0, 0, 1, 1))
+        for index in range(12)
+    )
+    centers = np.asarray([item.center_xy_m for item in regions])
+    main_thread = threading.get_ident()
+
+    result = processor._process_hypothesis(  # noqa: SLF001
+        pair,
+        box(-1_000, -1_000, 2_000, 1_000),
+        regions,
+        centers,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+
+    assert matcher.batch_sizes == [4, 4, 4]
+    assert matcher.sample_count_at_first_match == 8
+    assert matcher.thread_ids == [main_thread] * 3
+    assert all(thread_id != main_thread for thread_id in sampling_thread_ids)
+    assert sampled_centers == [item.center_xy_m for item in regions]
+    assert result.matcher_tiles == 12

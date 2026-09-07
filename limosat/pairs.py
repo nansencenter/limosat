@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -274,7 +275,6 @@ class PairProcessor:
         matching_seconds = 0.0
         matcher_calls = 0
         matcher_tiles = 0
-        pending_tiles: list[_PreparedTile] = []
         matched_tiles = []
         gate_counts = {
             "skipped_open_water_both_dates": 0,
@@ -282,21 +282,47 @@ class PairProcessor:
             "skipped_no_target_support": 0,
             "skipped_no_physics_reachable_valid_overlap": 0,
         }
-        for region, shift in zip(regions, shifts, strict=True):
-            target_center = tuple(np.asarray(region.center_xy_m) + np.asarray(shift))
-            if self._both_dates_open_water(
-                source_sic, target_sic, region.center_xy_m, target_center
-            ):
-                gate_counts["skipped_open_water_both_dates"] += 1
-                continue
-            sampled_at = time.perf_counter()
-            prepared, skip_reason = self._sample_pair(pair, region.center_xy_m, shift)
-            sampling_seconds += time.perf_counter() - sampled_at
-            if prepared is None:
-                gate_counts[f"skipped_{skip_reason}"] += 1
-                continue
-            pending_tiles.append(_PreparedTile(region, shift, *prepared))
-            if len(pending_tiles) == self.config.matcher.tile_batch_size:
+        region_shifts = iter(zip(regions, shifts, strict=True))
+
+        def prepare_batch():
+            pending: list[_PreparedTile] = []
+            elapsed = 0.0
+            skipped = {key: 0 for key in gate_counts}
+            for region, shift in region_shifts:
+                target_center = tuple(
+                    np.asarray(region.center_xy_m) + np.asarray(shift)
+                )
+                if self._both_dates_open_water(
+                    source_sic,
+                    target_sic,
+                    region.center_xy_m,
+                    target_center,
+                ):
+                    skipped["skipped_open_water_both_dates"] += 1
+                    continue
+                sampled_at = time.perf_counter()
+                prepared, skip_reason = self._sample_pair(
+                    pair, region.center_xy_m, shift
+                )
+                elapsed += time.perf_counter() - sampled_at
+                if prepared is None:
+                    skipped[f"skipped_{skip_reason}"] += 1
+                    continue
+                pending.append(_PreparedTile(region, shift, *prepared))
+                if len(pending) == self.config.matcher.tile_batch_size:
+                    break
+            return pending, elapsed, skipped
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            prepared = executor.submit(prepare_batch)
+            while True:
+                pending_tiles, elapsed, skipped = prepared.result()
+                sampling_seconds += elapsed
+                for key, count in skipped.items():
+                    gate_counts[key] += count
+                if not pending_tiles:
+                    break
+                prepared = executor.submit(prepare_batch)
                 results, elapsed, calls = self._match_prepared_tiles(
                     pair, pending_tiles
                 )
@@ -307,16 +333,6 @@ class PairProcessor:
                 matching_seconds += elapsed
                 matcher_calls += calls
                 matcher_tiles += len(pending_tiles)
-                pending_tiles = []
-        if pending_tiles:
-            results, elapsed, calls = self._match_prepared_tiles(pair, pending_tiles)
-            matched_tiles.extend(
-                (item.region, item.shift, result)
-                for item, result in zip(pending_tiles, results, strict=True)
-            )
-            matching_seconds += elapsed
-            matcher_calls += calls
-            matcher_tiles += len(pending_tiles)
 
         recovery_tiles: list[tuple[int, _PreparedTile]] = []
         for index, (region, shift, (batch, target_px)) in enumerate(matched_tiles):
