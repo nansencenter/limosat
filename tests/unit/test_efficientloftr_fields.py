@@ -11,6 +11,7 @@ from limosat import (
     ImagePair,
     ImageRecord,
     MatcherConfig,
+    MotionMatches,
     OpenWaterConfig,
     RoutingConfig,
     RunConfig,
@@ -18,6 +19,7 @@ from limosat import (
     build_trajectories,
 )
 from limosat.efficientloftr import speed_limit_mask
+from limosat.field import _weighted_mean, estimate_queries
 from limosat.imagery import _interpolate_grid, north_up_patch, projected_coordinates
 from limosat.pairs import PairProcessor
 from limosat.routing import CoarseTranslation
@@ -237,6 +239,48 @@ def test_speed_limit_uses_elapsed_seconds_and_metres_per_day():
         30_000.0,
     )
     assert keep.tolist() == [True, False]
+
+
+def test_field_estimation_breaks_neighbour_boundary_ties_canonically():
+    angles = np.linspace(0.0, 2.0 * np.pi, 13, endpoint=False)
+    source = np.column_stack((np.cos(angles), np.sin(angles))) * 100.0
+    target = source + np.column_stack((np.arange(13), -np.arange(13)))
+    scores = np.arange(13, dtype=np.float64)
+    tiles = np.arange(13, dtype=np.int32)
+    matches = MotionMatches(source, target, scores, tiles, tiles)
+    config = FieldConfig(
+        neighbour_count=12,
+        minimum_agreeing_matches=3,
+        maximum_neighbour_distance_m=200.0,
+        agreement_distance_m=100.0,
+    )
+
+    expected = estimate_queries(matches, [[0.0, 0.0]], config)
+    permutation = np.random.default_rng(20260906).permutation(13)
+    candidate = estimate_queries(
+        MotionMatches(
+            source[permutation],
+            target[permutation],
+            scores[permutation],
+            tiles[permutation],
+            tiles[permutation],
+        ),
+        [[0.0, 0.0]],
+        config,
+    )
+
+    for key in expected:
+        np.testing.assert_array_equal(candidate[key], expected[key])
+
+
+def test_specialized_weighted_mean_matches_numpy_average():
+    vectors = np.asarray([[1.0, 2.0], [4.0, 8.0]])
+    weights = np.asarray([3.0, 1.0])
+
+    np.testing.assert_array_equal(
+        _weighted_mean(vectors, weights),
+        np.average(vectors, axis=0, weights=weights),
+    )
 
 
 def test_small_synthetic_sequence_flows_from_tiles_to_trajectories(tmp_path):

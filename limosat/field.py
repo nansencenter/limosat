@@ -73,18 +73,10 @@ def estimate_queries(
     residual = np.full(count, np.nan, dtype=np.float64)
     if not len(matches):
         return _estimates(displacement, available, selected, candidates, radius, residual)
-    tree = cKDTree(matches.source_xy_m)
     vectors = matches.displacement_m
-    for index, point in enumerate(query):
-        distances, neighbours = tree.query(
-            point,
-            k=min(config.neighbour_count, len(matches)),
-            distance_upper_bound=config.maximum_neighbour_distance_m,
-        )
-        distances = np.atleast_1d(distances)
-        neighbours = np.atleast_1d(neighbours)
-        finite = np.isfinite(distances) & (neighbours < len(matches))
-        distances, neighbours = distances[finite], neighbours[finite]
+    for index, (distances, neighbours) in enumerate(
+        _canonical_neighbours(matches, query, config)
+    ):
         candidates[index] = len(neighbours)
         if not len(neighbours):
             continue
@@ -104,16 +96,84 @@ def estimate_queries(
 
 
 def weighted_geometric_median(vectors: np.ndarray, weights: np.ndarray) -> np.ndarray:
-    estimate = np.average(vectors, axis=0, weights=weights)
+    estimate = _weighted_mean(vectors, weights)
     for _ in range(100):
         distance = np.linalg.norm(vectors - estimate, axis=1)
         if np.any(distance <= 1.0e-3):
-            return np.average(vectors[distance <= 1.0e-3], axis=0, weights=weights[distance <= 1.0e-3])
-        updated = np.average(vectors, axis=0, weights=weights / distance)
+            close = distance <= 1.0e-3
+            return _weighted_mean(vectors[close], weights[close])
+        updated = _weighted_mean(vectors, weights / distance)
         if np.linalg.norm(updated - estimate) <= 1.0e-3:
             return updated
         estimate = updated
     return estimate
+
+
+def _canonical_neighbours(
+    matches: MotionMatches, query: np.ndarray, config: FieldConfig
+):
+    selected_count = min(config.neighbour_count, len(matches))
+    tree = cKDTree(matches.source_xy_m)
+    distances, neighbours = tree.query(
+        query,
+        k=min(selected_count + 1, len(matches)),
+        distance_upper_bound=config.maximum_neighbour_distance_m,
+        workers=1,
+    )
+    distances = np.asarray(distances)
+    neighbours = np.asarray(neighbours)
+    if distances.ndim == 1:
+        distances = distances[:, None]
+        neighbours = neighbours[:, None]
+
+    for point, row_distances, row_neighbours in zip(
+        query, distances, neighbours, strict=True
+    ):
+        finite = np.isfinite(row_distances) & (row_neighbours < len(matches))
+        selected = row_neighbours[finite].astype(np.int64, copy=False)
+        squared = np.sum((matches.source_xy_m[selected] - point) ** 2, axis=1)
+        order = _canonical_neighbour_order(matches, selected, squared)
+        selected, squared = selected[order], squared[order]
+
+        if len(selected) > selected_count:
+            boundary = squared[selected_count - 1]
+            tolerance = 100.0 * np.finfo(np.float64).eps * max(boundary, 1.0)
+            if squared[selected_count] <= boundary + tolerance:
+                selected = np.asarray(
+                    tree.query_ball_point(point, np.sqrt(boundary + tolerance)),
+                    dtype=np.int64,
+                )
+                squared = np.sum(
+                    (matches.source_xy_m[selected] - point) ** 2, axis=1
+                )
+                keep = squared <= boundary + tolerance
+                selected, squared = selected[keep], squared[keep]
+                order = _canonical_neighbour_order(matches, selected, squared)
+                selected, squared = selected[order], squared[order]
+
+        yield np.sqrt(squared[:selected_count]), selected[:selected_count]
+
+
+def _canonical_neighbour_order(
+    matches: MotionMatches, neighbours: np.ndarray, squared_distances: np.ndarray
+) -> np.ndarray:
+    return np.lexsort(
+        (
+            neighbours,
+            matches.target_tile[neighbours],
+            matches.source_tile[neighbours],
+            matches.target_xy_m[neighbours, 1],
+            matches.target_xy_m[neighbours, 0],
+            matches.source_xy_m[neighbours, 1],
+            matches.source_xy_m[neighbours, 0],
+            -matches.score[neighbours],
+            squared_distances,
+        )
+    )
+
+
+def _weighted_mean(vectors: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    return np.sum(vectors * weights[:, None], axis=0) / np.sum(weights)
 
 
 def reject_folds(
