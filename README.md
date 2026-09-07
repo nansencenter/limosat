@@ -45,6 +45,13 @@ Enable persistence by providing a SQL engine and Zarr storage path to store both
 4.	Follow the current library example in `examples/README.md`.
 5. Visualise results
 
+## Trajectory quality control
+
+After tracking finishes, QC checks drift vectors and writes a separate database.
+Rejected vectors split trajectories without deleting keypoints or modifying the
+original database. See the [trajectory QC guide](docs/trajectory_qc.md) for usage
+and limitations.
+
 ## License
 
 This project is licensed under the MIT License. See the LICENSE file for details.
