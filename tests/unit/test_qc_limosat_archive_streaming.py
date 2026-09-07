@@ -309,6 +309,16 @@ def test_invalid_terminal_markers_prevent_publication(tmp_path):
     assert not (args.output_dir / "materialization_manifest.json").exists()
 
 
+def test_qc_import_does_not_load_image_processing_dependencies():
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import sys; import limosat.qc; "
+         "assert not {'limosat.image_processor', 'nansat', 'cartopy'} & sys.modules.keys()"],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_package_cli_completes_with_preserved_source_and_verifiable_manifest(tmp_path):
     source = tmp_path / "source.sqlite"
     fixture_database(source)

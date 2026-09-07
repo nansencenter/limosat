@@ -111,6 +111,8 @@ The production package has one entry point: `python -m limosat.qc`.
 `core.py` contains the scoring rules, `archive.py` handles streaming and
 trajectory finalization, and `audit.py` stores diagnostics. Experimental SIC,
 buoy, plotting, and research-report workflows are not production dependencies.
+LiMOSAT's public image-processing classes are imported only when requested, so
+starting QC does not load Nansat or the image-processing stack.
 The former experimental QC launchers have been removed; historical reports
 remain as evidence, not executable deployment instructions.
 
