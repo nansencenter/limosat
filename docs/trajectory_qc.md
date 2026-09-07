@@ -1,166 +1,127 @@
-# LiMOSAT trajectory QC finalization
+# Trajectory quality control
 
-## Status and ownership
+LiMOSAT trajectory quality control (QC) checks drift vectors after tracking has
+finished and writes a separate QC database. It applies to both directly matched
+and interpolated vectors.
 
-Trajectory-vector QC v1 is a frozen, non-destructive post-run finalization stage.
-The scientific implementation, protocol, tests, and SQLite output contract live
-in this repository under `limosat/qc/`. A deployment repository should only
-invoke the CLI, supply run-specific values and paths, retain the raw product,
-and gate publication on successful validation. It must not duplicate the
-threshold logic.
+A drift vector is the displacement between consecutive keypoints in a
+trajectory. When QC rejects a vector, it splits the trajectory at the target
+keypoint and keeps both parts. No keypoints are deleted, and the original
+database is not modified.
 
-The implementation preserves the tested v1 decisions. Independent visual
-labelling in low-concentration and seasonal strata remains outstanding; the
-historical experiment reports document that evidence boundary. Packaging alone
-does not establish the false-rejection rate in those strata.
+## Run QC
 
-The frozen protocol is
-`limosat/qc/protocols/trajectory_link_qc_v1.json`. The implementation checks its
-fixed parameters against that file before processing. The source run's effective
-`max_speed_m_per_day` remains a required run-specific input; it must not be
-guessed from the data or replaced by a deployment default. Deployment must
-resolve the effective value from the run configuration and its LiMOSAT version,
-then record that value in its finalization manifest.
-
-## Terminology
-
-QC follows the production terminology in `Keypoints` and `ImageProcessor`:
-
-- A **keypoint** is a stored observation in a trajectory.
-- A **match** is a correspondence obtained by matching images or templates.
-- A **drift vector** is the displacement between consecutive keypoints. QC
-  evaluates both directly matched and interpolated vectors.
-- A **trajectory** is the time-ordered sequence of keypoints. Rejecting a vector
-  splits this sequence without deleting either endpoint.
-
-The scoring entry point is `score_vectors`; `score_edges` remains a compatibility
-wrapper for existing callers. Existing SQLite names (`qc_flagged_edges`,
-`qc_link_sample`, and `links` counts) and the protocol ID/path are unchanged to
-preserve report and provenance compatibility. They refer to drift vectors.
-The geometric term **edge** remains appropriate for a Delaunay triangle side;
-`topology_max_edge_m` is a source-triangle size limit, not a drift-length limit.
-
-## Required lifecycle
-
-For every finite production run:
-
-1. Finish tracking and close the SQLite writer.
-2. Preserve the raw SQLite and template Zarr store unchanged.
-3. Record or verify the raw SQLite SHA-256.
-4. Run trajectory QC into a new work directory and a new output SQLite.
-5. Require the materialization checks to pass before publishing downstream.
-6. Publish the raw database, QC database, audit sidecar, manifests, and protocol
-   ID together. Downstream trajectory analysis uses the `<source_table>__qc`
-   table.
-
-The QC database is an analysis product and is never used to resume tracking:
-trajectory IDs and `is_last` markers change, but template Zarr state is not
-rewritten. Resume or extend the raw run, then finalize the extended result
-again.
-
-For continuous NRT processing, apply the same command only to closed periods
-or immutable database snapshots. Run it again over the complete finite product
-when that production period closes. Do not scan a database while LiMOSAT is
-writing it.
-
-## Official command
-
-The streaming finalizer is the production entry point for all database sizes:
+Finish tracking and close the database before running QC. Keep the original
+SQLite database and template Zarr store.
 
 ```bash
 python -m limosat.qc \
-  --input /path/to/raw_run.sqlite \
-  --table raw_run_table \
+  --input /path/to/run.sqlite \
+  --table run_table \
   --input-sha256 "$RAW_SHA256" \
   --configured-speed-m-per-day 35000 \
   --output-dir /path/to/qc_work \
-  --cleaned-output /path/to/raw_run_qc.sqlite
+  --cleaned-output /path/to/run_qc.sqlite
 ```
 
-The default stage is `all`: it prepares a descriptor-free compact database,
-scans vectors in complete image-time groups with resumable checkpoints, and
-materializes the cleaned product. Large deployments may call `--stage prepare`,
-`--stage scan`, and `--stage materialize` separately. A partial scan cannot be
-materialized.
+Before running the command:
 
-`RAW_SHA256` must contain the source file's verified lowercase SHA-256. The CLI
-checks the file before and after preparation/materialization and rejects a
-nonempty SQLite WAL. Checkpoint or snapshot SQLite using its backup facilities
-before finalization. Work directories and checkpoint pickle files must be
-trusted and private to the run.
+- Set `RAW_SHA256` to the original database's verified lowercase SHA-256 checksum.
+- Replace `35000` with the effective `max_speed_m_per_day` used during tracking,
+  in metres per day. Do not infer this value from the drift vectors.
+- Use a new work directory and a new output database path.
+- Ensure coordinates are in EPSG:3413, in metres, and acquisition times use a
+  consistent UTC format that sorts chronologically, as written by LiMOSAT.
 
-To resume an interrupted run, repeat the command with `--resume`; preparation
-is skipped and the scan resumes at its last complete image checkpoint. The
-source, protocol, code, configuration, and compact manifest must match.
-Completed stage-only commands are not publication success: deployment must
-require the final `materialization_manifest.json` with `status: complete`.
+The table name is optional if the input contains exactly one LiMOSAT trajectory
+table. If `--cleaned-output` is omitted, the output is named
+`<input_name>_qc.sqlite` inside the work directory.
 
-V1 expects EPSG:3413 coordinates in metres and uniform UTC acquisition-time
-strings that sort chronologically, as written by LiMOSAT. Mixed timestamp
-formats or other projections must be normalized in a separate input copy.
-Closed NRT snapshots need previous observations for vectors crossing the snapshot
-boundary; isolated daily slices omit those vectors. IDs are deterministic within
-one immutable input, and may change when an extended run is finalized again.
+Do not run QC while LiMOSAT is writing to the input database. QC verifies the
+checksum before and after reading the source and refuses a nonempty SQLite
+write-ahead log (WAL). Use SQLite's checkpoint or backup facilities to obtain a
+closed, consistent database; do not delete a WAL file manually.
 
-The audit records every rejected/review vector, duplicate, pair/image summary,
-and a deterministic 1/1000 background sample. Detailed local diagnostics for
-every accepted vector are not stored. The archive work database and publication
-database are separate; allow room for both plus the preserved raw input.
+## What QC checks
 
-The production package has one entry point: `python -m limosat.qc`.
-`core.py` contains the scoring rules, `archive.py` handles streaming and
-trajectory finalization, and `audit.py` stores diagnostics. Experimental SIC,
-buoy, plotting, and research-report workflows are not production dependencies.
-LiMOSAT's public image-processing classes are imported only when requested, so
-starting QC does not load Nansat or the image-processing stack.
-The former experimental QC launchers have been removed; historical reports
-remain as evidence, not executable deployment instructions.
+QC compares each drift vector with neighbouring vectors from the same source
+and target images. A robust local fit estimates the displacement and its
+variability without using the vector being checked.
 
-## Refactor verification (2026-09-07)
+The version 2 rules reject vectors that exceed the absolute speed limit of
+60,000 m/day, or have a sufficiently large, locally supported displacement
+error. Additional checks use the tracking speed limit and reversals in the
+orientation of neighbouring keypoints. Vectors marked for review are recorded
+but remain connected.
 
-The lean implementation was checked against all six saved `edge_audit.csv`
-files under `results/limosat_qc_20260903/`: 253,024 vectors had identical reject,
-review, and decision-reason values. These checks used the 1,000 m prescreen,
-50,000 m/day for the three archive windows, 35,000 m/day for Radarsat-2 2024,
-and 30,000 m/day for the 2020 and NRT samples, matching the historical audits.
-This is regression evidence, not new independent scientific validation or a
-rerun of the full Kingston archive.
+Correlation, sea-ice concentration and external drift or buoy data are not used
+to reject vectors. Low sea-ice concentration alone therefore does not cause
+rejection. Where there are too few neighbours, only the absolute speed limit
+is applied. QC does not guarantee that all incorrect matches are removed;
+false-rejection rates have not been quantified across all seasons and sea-ice
+concentrations.
 
-The focused tests cover scoring, sparse support, motion boundaries, duplicate
-points, repeated trajectory breaks, convergence remapping, point preservation,
-resume equivalence, source integrity, and publication gates. Run them with:
+The versioned rules and thresholds are supplied in
+[the QC protocol](../limosat/qc/protocols/trajectory_link_qc_v2.json) and are
+checked by the command before processing.
 
-```bash
-python -m pytest -q tests/unit/test_qc_limosat_trajectories.py \
-  tests/unit/test_qc_limosat_archive_streaming.py
-```
+Version 2 preserves the speed and residual thresholds. It limits the absolute
+sum of affine prediction weights to 2; larger weights or a rank-deficient fit
+use a robust median translation instead. This prevents narrow or one-sided
+neighbour geometry from amplifying small displacement differences. The archive
+prescreen now skips a fit only when a conservative residual bound rules out
+every local reject and review decision. These changes require new QC runs;
+the original version 1 protocol remains available for historical provenance.
+Independent stratified visual validation is still required before operational
+promotion; passing regression tests does not establish a false-rejection rate.
 
-## Publication gate
+## Outputs
 
-A deployment job succeeds only when the command exits successfully and all of
-the following are true:
+Use the `<source_table>__qc` table in the output database for trajectory analysis.
 
-- scan metadata status is `complete`;
-- source and cleaned row counts agree;
-- every output trajectory has exactly one `is_last` row;
-- no output trajectory repeats an image;
-- SQLite `quick_check` returns `ok`;
-- the output SHA-256 is recorded in `materialization_manifest.json`.
+- Rejected vectors split trajectories. New trajectory IDs are assigned above
+  the maximum original ID.
+- Each resulting trajectory has one `is_last` keypoint.
+- `converged_to` references are updated to the applicable trajectory segment
+  at the observation time and image.
+- Duplicate observations with the same trajectory, image and time are excluded
+  from scoring and preserved as separate single-keypoint trajectories.
 
-The raw database must remain available even after the QC product is published.
-A rejected vector removes no point: its target begins a deterministic new segment
-above the maximum original trajectory ID. Review vectors remain connected and are
-recorded in the audit.
+The work directory contains processing checkpoints, `qc_analysis.sqlite` with
+QC decisions and summaries, and `materialization_manifest.json` with the final
+validation result and output checksum. Detailed diagnostics cover all rejected
+and review vectors, plus a deterministic 1-in-1,000 sample of other vectors;
+they are not stored for every accepted vector. Allow disk space for the work
+databases and QC output in addition to the original database.
 
-The archive finalizer maps `converged_to` to the latest applicable split segment
-at the convergence row's time/image. Repeated trajectory/image/time rows are
-excluded from scoring and preserved as singleton trajectories. The older
-in-memory analysis helper has a different nearest-time convergence fallback;
-deployment should consistently use the archive CLI above.
+Treat the output as ready only when the command exits successfully and
+`materialization_manifest.json` reports `status: complete`. The command checks
+keypoint counts, trajectory end-marker counts and positions, duplicate images
+within trajectories, and SQLite integrity before completing the output.
 
-## Protocol changes
+Retain the original database, QC database and QC records together. Automated
+processing should invoke this command after tracking and require successful
+validation before publishing the QC output.
 
-Do not alter v1 thresholds in place. Any scientific rule or threshold change
-requires a new protocol ID and protocol JSON, regression tests, a comparison
-against v1, and a new deployment selection. SIC, correlation, buoy data, and
-OSI SAF drift remain diagnostics rather than v1 rejection gates.
+## Resume or extend processing
+
+To resume interrupted QC, repeat the same command with `--resume`. Processing
+continues from the last complete image checkpoint. The input, code, protocol,
+configuration and work database must be unchanged. Resume requires the existing
+audit database to match the run identity and checkpoint counts. Rebuild work
+directories created with earlier code; checkpoints cannot cross protocol versions.
+Source end markers preceding later observations are refused during preparation.
+Keep the work directory private and resume only from trusted checkpoints.
+
+For large runs, the same command also supports separate `--stage prepare`,
+`--stage scan` and `--stage materialize` steps. The default, `--stage all`,
+performs all three. An incomplete scan cannot produce a completed QC output.
+
+To extend tracking, use the original database and template Zarr store, not the
+QC database. Run QC again after tracking finishes. QC changes trajectory IDs
+and end markers but does not update templates; IDs may also change when an
+extended run is processed again.
+
+For near-real-time processing, use closed periods or consistent database
+snapshots. Include earlier keypoints needed to evaluate vectors crossing the
+start of the period; isolated daily slices omit these vectors.

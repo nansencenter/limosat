@@ -83,7 +83,8 @@ def test_bundled_protocol_matches_code_defaults():
         qc.validate_frozen_protocol(qc.QCConfig(search_radius_m=20_000.0))
 
 
-def test_archive_prescreen_preserves_full_qc_decisions():
+@pytest.mark.parametrize("prescreen", [1_000.0, 1_000_000.0])
+def test_archive_prescreen_preserves_full_qc_decisions(prescreen):
     vectors = affine_vector_fixture()
     injected = np.array([32, 66, 112, 158, 190])
     vectors.loc[injected, "u_m"] += 15_000.0
@@ -95,12 +96,77 @@ def test_archive_prescreen_preserves_full_qc_decisions():
 
     full = qc.score_vectors(vectors, qc.QCConfig())
     accelerated = qc.score_vectors(
-        vectors, qc.QCConfig(), prescreen_residual_m=1_000.0
+        vectors, qc.QCConfig(), prescreen_residual_m=prescreen
     )
 
     assert accelerated.reject.tolist() == full.reject.tolist()
     assert accelerated.review.tolist() == full.review.tolist()
     assert accelerated.local_evaluated.sum() < full.local_evaluated.sum()
+
+
+def geometry_fixture(x, y, u, v=None):
+    """Float64 positions/displacements in metres; all vectors span one day."""
+    x, y, u = (np.asarray(values, dtype=float) for values in (x, y, u))
+    v = np.zeros_like(u) if v is None else np.asarray(v, dtype=float)
+    return pd.DataFrame(dict(
+        source_image_id=1, target_image_id=2,
+        x0_m=x, y0_m=y, x1_m=x + u, y1_m=y + v,
+        u_m=u, v_m=v, speed_m_per_day=np.hypot(u, v),
+    ))
+
+
+@pytest.mark.parametrize("prescreen", [None, 1_000.0])
+def test_narrow_neighbour_geometry_does_not_amplify_small_motion_noise(prescreen):
+    rng = np.random.default_rng(4)
+    vectors = geometry_fixture(
+        np.r_[0., np.linspace(5_000., 15_000., 12)],
+        np.r_[0., 1_000. + rng.normal(0, .1, 12)],
+        np.r_[3_000., 1_000. + rng.normal(0, 35., 12)],
+    )
+    result = qc.score_vectors(vectors, qc.QCConfig(), prescreen_residual_m=prescreen)
+    assert result.loc[0, "local_evaluated"]
+    assert result.loc[0, "local_residual_m"] < 2_100
+    assert not result.loc[0, "reject"]
+    assert not result.loc[0, "review"]
+
+
+def test_prescreen_handles_zero_median_residual_with_one_sided_neighbours():
+    x, y = np.meshgrid([10_000., 10_500., 11_000., 11_500.], [-1_000., 0., 1_000.])
+    vectors = geometry_fixture(
+        np.r_[0., x.ravel()], np.r_[0., y.ravel()],
+        np.r_[1_500., 2 * x.ravel() - 20_000.],
+    )
+    full = qc.score_vectors(vectors, qc.QCConfig())
+    fast = qc.score_vectors(vectors, qc.QCConfig(), prescreen_residual_m=1_000.)
+    assert full.loc[0, "coarse_local_residual_m"] == 0
+    assert fast.loc[0, "local_evaluated"]
+    assert not full.loc[0, "reject"]  # Unsafe extrapolation falls back to translation.
+    pd.testing.assert_frame_equal(full[["reject", "review"]], fast[["reject", "review"]])
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_prescreen_decisions_match_for_irregular_contaminated_fields(seed):
+    rng = np.random.default_rng(seed)
+    xy = rng.uniform(-20_000., 20_000., (80, 2))
+    uv = xy @ np.array([[.4, .2], [-.1, .3]]) + rng.normal(0, 100., (80, 2))
+    uv[::7] += rng.normal(0, 25_000., uv[::7].shape)
+    vectors = geometry_fixture(*xy.T, *uv.T)
+    full = qc.score_vectors(vectors, qc.QCConfig())
+    fast = qc.score_vectors(vectors, qc.QCConfig(), prescreen_residual_m=1_000.)
+    pd.testing.assert_frame_equal(full[["reject", "review"]], fast[["reject", "review"]])
+
+
+@pytest.mark.parametrize("matrix", [
+    [[.2, .1], [0., 0.]],  # Coherent shear.
+    [[np.cos(.3) - 1, -np.sin(.3)], [np.sin(.3), np.cos(.3) - 1]],
+])
+def test_coherent_shear_and_rotation_are_retained(matrix):
+    x, y = np.meshgrid(np.linspace(-20_000., 20_000., 9), np.linspace(-20_000., 20_000., 9))
+    xy = np.column_stack([x.ravel(), y.ravel()])
+    uv = xy @ np.asarray(matrix).T
+    result = qc.score_vectors(geometry_fixture(*xy.T, *uv.T), qc.QCConfig())
+    assert not result.reject.any()
+    assert not result.review.any()
 
 
 def test_sparse_pair_is_only_subject_to_hard_speed_gate():

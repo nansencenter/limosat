@@ -13,8 +13,8 @@ import pandas as pd
 from scipy.spatial import Delaunay, QhullError, cKDTree
 
 
-PROTOCOL_ID = "limosat_trajectory_link_qc_v1_20260904"
-PROTOCOL_PATH = Path(__file__).resolve().parent / "protocols" / "trajectory_link_qc_v1.json"
+PROTOCOL_ID = "limosat_trajectory_link_qc_v2_20260907"
+PROTOCOL_PATH = Path(__file__).resolve().parent / "protocols" / "trajectory_link_qc_v2.json"
 FROZEN_CONFIG_FIELDS = (
     "search_radius_m",
     "max_neighbors",
@@ -29,6 +29,7 @@ FROZEN_CONFIG_FIELDS = (
     "moderate_local_floor_m",
     "hard_speed_m_per_day",
     "topology_max_edge_m",
+    "max_prediction_weight_l1",
 )
 
 
@@ -51,10 +52,14 @@ class QCConfig:
     hard_speed_m_per_day: float = 60_000.0
     topology_max_edge_m: float = 20_000.0  # Source-triangle side, not drift length.
 
+    max_prediction_weight_l1: float = 2.0  # Bound amplification at the query.
+
     def validate(self) -> None:
         for field, value in asdict(self).items():
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{field} must be finite and positive")
+        if self.max_prediction_weight_l1 < 2:
+            raise ValueError("max_prediction_weight_l1 must be >= 2")
         if self.max_neighbors < self.min_neighbors:
             raise ValueError("max_neighbors must be >= min_neighbors")
         if self.min_neighbors < 3:
@@ -75,7 +80,7 @@ def load_protocol() -> dict:
 
 
 def validate_frozen_protocol(config: QCConfig) -> None:
-    """Fail if code defaults and the bundled v1 protocol have drifted apart."""
+    """Fail if code defaults and the bundled protocol have drifted apart."""
 
     parameters = load_protocol()["parameters"]
     mismatches = {
@@ -103,6 +108,7 @@ def _weighted_affine(
     neighbor_uv: np.ndarray,
     distances: np.ndarray,
     mask: np.ndarray,
+    max_prediction_weight_l1: float,
 ) -> tuple[np.ndarray, np.ndarray]:
     centred_km = (neighbor_xy - query_xy) / 1_000.0
     design = np.column_stack([np.ones(len(neighbor_xy)), centred_km])
@@ -110,12 +116,17 @@ def _weighted_affine(
     weights = 1.0 / (1.0 + (distances / spatial_scale) ** 2)
     weighted_design = design[mask] * np.sqrt(weights[mask, None])
     weighted_values = neighbor_uv[mask] * np.sqrt(weights[mask, None])
-    coefficients, _, rank, _ = np.linalg.lstsq(weighted_design, weighted_values, rcond=None)
-    if rank < 3:
-        prediction = np.median(neighbor_uv[mask], axis=0)
-        fitted = np.repeat(prediction[None, :], len(neighbor_uv), axis=0)
-        return prediction, fitted
-    return coefficients[0], design @ coefficients
+    # Reuse one SVD for both the fit and its prediction weights. A full-rank
+    # fit can still extrapolate wildly from a narrow or one-sided neighbour set.
+    left, singular, right = np.linalg.svd(weighted_design, full_matrices=False)
+    tolerance = np.finfo(float).eps * max(weighted_design.shape) * singular[0]
+    if singular[-1] > tolerance:
+        prediction_weights = ((right[:, 0] / singular) @ left.T) * np.sqrt(weights[mask])
+        if np.abs(prediction_weights).sum() <= max_prediction_weight_l1:
+            coefficients = right.T @ ((left.T @ weighted_values) / singular[:, None])
+            return prediction_weights @ neighbor_uv[mask], design @ coefficients
+    prediction = np.median(neighbor_uv[mask], axis=0)
+    return prediction, np.repeat(prediction[None, :], len(neighbor_uv), axis=0)
 
 
 def _local_prediction(
@@ -134,11 +145,10 @@ def _local_prediction(
         mask = np.zeros(len(neighbor_uv), dtype=bool)
         mask[nearest] = True
 
-    prediction = median_uv
-    fitted = np.repeat(prediction[None, :], len(neighbor_uv), axis=0)
     for _ in range(3):
         prediction, fitted = _weighted_affine(
-            query_xy, neighbor_xy, neighbor_uv, distances, mask
+            query_xy, neighbor_xy, neighbor_uv, distances, mask,
+            config.max_prediction_weight_l1,
         )
         fit_residual = np.linalg.norm(neighbor_uv - fitted, axis=1)
         centre, scale = robust_scale(fit_residual[mask], config.noise_floor_m)
@@ -150,6 +160,13 @@ def _local_prediction(
             break
         mask = new_mask
 
+    else:
+        # The last iteration changed the mask. Refit only in this case so
+        # prediction and residual scale describe the same final inlier set.
+        prediction, fitted = _weighted_affine(
+            query_xy, neighbor_xy, neighbor_uv, distances, mask,
+            config.max_prediction_weight_l1,
+        )
     fit_residual = np.linalg.norm(neighbor_uv - fitted, axis=1)
     centre, scale = robust_scale(fit_residual[mask], config.noise_floor_m)
     inlier_fraction = float(mask.mean())
@@ -182,12 +199,16 @@ def score_vectors(
     matched or interpolated. Neighbours come from the same source/target image
     pair, with the vector being scored excluded from its own local fit.
 
-    ``prescreen_residual_m`` is an archive-scale acceleration: exact affine
-    fits are limited to topology incidents, speed candidates, and vectors that
-    differ from the neighbour median by more than the prescreen.
+    ``prescreen_residual_m`` skips fits only when an upper bound on the
+    residual is below both the prescreen and every local decision floor.
+    Reject/review decisions therefore agree with unaccelerated scoring.
     """
 
     config.validate()
+    if prescreen_residual_m is not None and (
+        not math.isfinite(prescreen_residual_m) or prescreen_residual_m <= 0
+    ):
+        raise ValueError("prescreen_residual_m must be finite and positive")
     result = vectors.copy().reset_index(drop=True)
     float_defaults = {
         "local_u_m": np.nan,
@@ -241,16 +262,19 @@ def score_vectors(
         if prescreen_residual_m is None:
             evaluate = np.ones(len(pair_index), dtype=bool)
         else:
-            evaluate = (
-                (coarse_residual > prescreen_residual_m)
-                | (
-                    result.loc[pair_index, "speed_m_per_day"].to_numpy(float)
-                    > config.configured_speed_m_per_day
-                )
-                | result.loc[
-                    pair_index, "topology_flip_incident"
-                ].to_numpy(bool)
+            # For any retained affine fit, ||prediction - median|| <= L * R,
+            # where L bounds the absolute prediction weights and R is the
+            # largest neighbour deviation. This also covers any clipped subset
+            # and the coordinate-median fallback (bounded by sqrt(2) * R).
+            deviations = np.linalg.norm(neighbor_uv - coarse_prediction[:, None, :], axis=2)
+            radius = np.max(np.where(valid_all, deviations, 0.0), axis=1)
+            residual_bound = coarse_residual + config.max_prediction_weight_l1 * radius
+            safe_floor = min(
+                prescreen_residual_m, config.moderate_local_floor_m,
+                config.strong_local_floor_m, config.ultra_local_floor_m,
             )
+            # A small margin avoids skipping borderline cases through roundoff.
+            evaluate = residual_bound >= safe_floor * (1.0 - 1e-10)
         for local_index in np.flatnonzero(evaluate):
             output_index = pair_index[local_index]
             valid = valid_all[local_index]

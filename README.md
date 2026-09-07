@@ -45,10 +45,10 @@ Enable persistence by providing a SQL engine and Zarr storage path to store both
 4.	Follow the current library example in `examples/README.md`.
 5. Visualise results
 
-## Finalize trajectory products
+## Trajectory quality control
 
-Completed production trajectory databases should pass through the versioned,
-non-destructive QC finalizer before downstream use:
+After tracking finishes, run quality control (QC) to check drift vectors and
+write a separate QC database:
 
 ```bash
 python -m limosat.qc --input raw.sqlite --table run_name \
@@ -59,8 +59,8 @@ python -m limosat.qc --input raw.sqlite --table run_name \
 
 Set `RAW_SHA256` to the closed source file's checksum and use the source run's
 effective speed setting. Rejected vectors split trajectories without deleting
-point rows. The output includes a decision audit and integrity manifest.
-See [the trajectory-QC deployment contract](docs/trajectory_qc.md).
+keypoints. The output includes QC decisions and a validation summary.
+See [the trajectory QC guide](docs/trajectory_qc.md).
 
 ## License
 

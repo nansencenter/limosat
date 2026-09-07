@@ -263,7 +263,11 @@ class AuditWriter:
     def __init__(self, path: Path, *, resume: bool):
         if path.exists() and not resume:
             raise FileExistsError(path)
-        self.connection = sqlite3.connect(path)
+        if resume and not path.is_file():
+            raise FileNotFoundError(path)
+        self.connection = sqlite3.connect(
+            f"{path.resolve().as_uri()}?mode=rw", uri=True
+        ) if resume else sqlite3.connect(path)
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA synchronous=NORMAL")
         self.connection.execute("PRAGMA temp_store=MEMORY")
@@ -272,7 +276,44 @@ class AuditWriter:
         self.pairs = []
         self.images = []
         self.duplicates = []
-        self._create_schema()
+        if not resume:
+            self._create_schema()
+
+    def bind_run(self, identity: dict, *, resume: bool):
+        if resume:
+            row = self.connection.execute(
+                "SELECT value_json FROM qc_metadata WHERE key = 'run_identity'"
+            ).fetchone()
+            if row is None or json.loads(row[0]) != identity:
+                raise ValueError("Audit database does not match the checkpoint run")
+        else:
+            self.connection.execute(
+                "INSERT INTO qc_metadata VALUES ('run_identity', ?)",
+                (json.dumps(identity, sort_keys=True),),
+            )
+            self.connection.commit()
+
+    def validate_checkpoint(self, target_time: str, target_image_id: int, stats: dict):
+        """Check persisted coverage before deleting any post-checkpoint rows."""
+        boundary = (target_time, target_image_id)
+        images, points, links = self.connection.execute(
+            "SELECT COUNT(*), COALESCE(SUM(point_rows), 0), COALESCE(SUM(links), 0) "
+            "FROM qc_image_summary WHERE (target_time, target_image_id) <= (?, ?)",
+            boundary,
+        ).fetchone()
+        rejected, review = self.connection.execute(
+            "SELECT COALESCE(SUM(reject), 0), COALESCE(SUM(review), 0) "
+            "FROM qc_flagged_edges WHERE (target_time, target_image_id) <= (?, ?)",
+            boundary,
+        ).fetchone()
+        duplicates = self.connection.execute(
+            "SELECT COUNT(*) FROM qc_duplicate_points WHERE (time, image_id) <= (?, ?)",
+            boundary,
+        ).fetchone()[0]
+        observed = dict(images=images, point_rows=points, links=links,
+                        rejected=rejected, review=review, duplicate_points=duplicates)
+        if any(value != stats[key] for key, value in observed.items()):
+            raise ValueError("Audit database coverage does not match the checkpoint")
 
     def _create_schema(self):
         audit_schema = ", ".join(
@@ -330,6 +371,10 @@ class AuditWriter:
             "(time = ? AND image_id > ?)",
             (target_time, target_time, target_image_id),
         )
+        # A previously completed scan may be ahead of the restored checkpoint.
+        # It must not remain publishable while the replay is partial.
+        self.connection.execute("DELETE FROM qc_metadata WHERE key != 'run_identity'")
+        self.connection.execute("DELETE FROM qc_distribution_counts")
         self.connection.commit()
 
     def add_duplicate(self, record: tuple):

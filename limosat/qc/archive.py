@@ -170,8 +170,20 @@ def build_compact_database(args) -> dict:
             "(time, image_id, source_rowid)"
         )
         connection.execute(
-            "CREATE INDEX idx_compact_trajectory ON compact_points (trajectory_id, source_rowid)"
+            "CREATE INDEX idx_compact_trajectory ON compact_points "
+            "(trajectory_id, time, image_id, source_rowid)"
         )
+        misplaced_terminal = connection.execute(
+            "SELECT terminal.trajectory_id FROM compact_points AS terminal "
+            "WHERE terminal.is_last = 1 AND EXISTS ("
+            " SELECT 1 FROM compact_points AS later "
+            " WHERE later.trajectory_id = terminal.trajectory_id "
+            " AND (later.time, later.image_id) > (terminal.time, terminal.image_id)) LIMIT 1"
+        ).fetchone()
+        if misplaced_terminal is not None:
+            raise ValueError(
+                f"Source trajectory {misplaced_terminal[0]} has a misplaced is_last marker"
+            )
         row = connection.execute(
             "SELECT COUNT(*), MIN(time), MAX(time), MIN(image_id), MAX(image_id), "
             "MIN(trajectory_id), MAX(trajectory_id) FROM compact_points"
@@ -181,6 +193,7 @@ def build_compact_database(args) -> dict:
             "source_database": str(args.input.resolve()),
             "source_table": source_table,
             "source_sha256": args.input_sha256,
+            "terminal_positions_validated": True,
             "compact_database": str(target.resolve()),
             "rows": int(row[0]),
             "minimum_time": row[1],
@@ -241,6 +254,8 @@ def scan_archive(args, config: QCConfig) -> dict:
         raise ValueError("Compact database source checksum does not match --input-sha256")
     if args.table is not None and compact_manifest.get("source_table") != args.table:
         raise ValueError("Compact database source table does not match --table")
+    if not compact_manifest.get("terminal_positions_validated"):
+        raise ValueError("Rebuild the compact database to validate source terminal positions")
     run_identity = {
         "input_sha256": args.input_sha256,
         "compact_manifest": compact_manifest,
@@ -254,6 +269,15 @@ def scan_archive(args, config: QCConfig) -> dict:
         if state.get("run_identity") != run_identity:
             raise ValueError("Checkpoint source, protocol, code, or configuration changed")
     writer = AuditWriter(sidecar, resume=resume)
+    try:
+        writer.bind_run(run_identity, resume=resume)
+        if resume:
+            writer.validate_checkpoint(
+                state["last_time_text"], state["last_image_id"], state["stats"]
+            )
+    except Exception:
+        writer.close()
+        raise
     if resume:
         active = state["active"]
         distributions = state["distributions"]
@@ -293,6 +317,18 @@ def scan_archive(args, config: QCConfig) -> dict:
     previous_image_id = last_image_id
     previous_time_text = last_time_text
     rows_since_start = 0
+
+    def checkpoint():
+        writer.flush()
+        save_checkpoint(checkpoint_path, {
+            "run_identity": run_identity,
+            "active": active,
+            "distributions": distributions,
+            "stats": stats,
+            "last_rowid": last_rowid,
+            "last_image_id": previous_image_id,
+            "last_time_text": previous_time_text,
+        })
 
     def progress(status: str):
         elapsed = max(time.perf_counter() - started, 1e-9)
@@ -389,19 +425,7 @@ def scan_archive(args, config: QCConfig) -> dict:
                             payload = progress("running")
                             print(json.dumps(payload, sort_keys=True), flush=True)
                         if stats["images"] % args.checkpoint_images == 0:
-                            writer.flush()
-                            save_checkpoint(
-                                checkpoint_path,
-                                {
-                                    "run_identity": run_identity,
-                                    "active": active,
-                                    "distributions": distributions,
-                                    "stats": stats,
-                                    "last_rowid": last_rowid,
-                                    "last_image_id": previous_image_id,
-                                    "last_time_text": previous_time_text,
-                                },
-                            )
+                            checkpoint()
                         if args.maximum_rows and rows_since_start >= args.maximum_rows:
                             stop_requested = True
                             break
@@ -531,22 +555,11 @@ def scan_archive(args, config: QCConfig) -> dict:
                     last_rowid = rowid
             if not stop_requested:
                 finish_image()
-            writer.flush()
             final_status = "partial" if stop_requested else "complete"
-            save_checkpoint(
-                checkpoint_path,
-                {
-                    "run_identity": run_identity,
-                    "active": active,
-                    "distributions": distributions,
-                    "stats": stats,
-                    "last_rowid": last_rowid,
-                    "last_image_id": previous_image_id,
-                    "last_time_text": previous_time_text,
-                },
-            )
+            checkpoint()
             metadata = {
                 "status": final_status,
+                "run_identity": run_identity,
                 "input_database": str(args.input.resolve()),
                 "input_sha256": args.input_sha256 or sha256(args.input),
                 **implementation_hashes,
@@ -661,6 +674,10 @@ def materialize(args) -> dict:
             (maximum_id, break_count),
         )
         connection.execute(
+            "CREATE UNIQUE INDEX idx_qc_duplicate_rowid "
+            "ON qc_duplicate_assignment (duplicate_rowid)"
+        )
+        connection.execute(
             f"UPDATE {quote_identifier(cleaned_table)} AS clean SET trajectory_id = COALESCE(("
             " SELECT assignment.new_trajectory_id FROM qc_break_assignment AS assignment "
             " WHERE assignment.original_trajectory_id = clean.trajectory_id "
@@ -731,6 +748,14 @@ def materialize(args) -> dict:
             f"SELECT COUNT(*) FROM (SELECT trajectory_id FROM {quote_identifier(cleaned_table)} "
             "GROUP BY trajectory_id HAVING SUM(is_last) != 1)"
         ).fetchone()[0]
+        misplaced_last = connection.execute(
+            f"SELECT COUNT(*) FROM {quote_identifier(cleaned_table)} AS terminal "
+            "WHERE terminal.is_last = 1 AND EXISTS ("
+            f" SELECT 1 FROM {quote_identifier(cleaned_table)} AS later "
+            " WHERE later.trajectory_id = terminal.trajectory_id "
+            " AND (later.time, later.image_id, later.rowid) > "
+            " (terminal.time, terminal.image_id, terminal.rowid))"
+        ).fetchone()[0]
         repeated_image = connection.execute(
             f"SELECT COUNT(*) FROM (SELECT trajectory_id, image_id FROM {quote_identifier(cleaned_table)} "
             "GROUP BY trajectory_id, image_id HAVING COUNT(*) != 1)"
@@ -751,6 +776,7 @@ def materialize(args) -> dict:
             "duplicate_point_assignments": int(duplicate_count),
             "expected_duplicate_point_assignments": int(expected_duplicate_count),
             "invalid_is_last_trajectories": int(invalid_last),
+            "misplaced_is_last_markers": int(misplaced_last),
             "repeated_trajectory_image_groups": int(repeated_image),
             "quick_check": quick_check,
             "elapsed_seconds": time.perf_counter() - started,
@@ -762,10 +788,16 @@ def materialize(args) -> dict:
             failures.append("source row count differs from the completed scan")
         if break_count != expected_break_count:
             failures.append("break assignment count differs from rejected-vector count")
+        if break_count != metadata["stats"]["rejected"]:
+            failures.append("break assignment count differs from scan statistics")
         if duplicate_count != expected_duplicate_count:
             failures.append("duplicate assignment count differs from duplicate audit")
+        if duplicate_count != metadata["stats"]["duplicate_points"]:
+            failures.append("duplicate assignment count differs from scan statistics")
         if invalid_last:
             failures.append(f"{invalid_last} trajectories have invalid is_last counts")
+        if misplaced_last:
+            failures.append(f"{misplaced_last} misplaced is_last markers")
         if repeated_image:
             failures.append(f"{repeated_image} trajectory/image groups are repeated")
         if quick_check != "ok":

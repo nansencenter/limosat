@@ -380,3 +380,114 @@ def test_materialization_refuses_source_changed_after_scan(tmp_path):
     with pytest.raises(ValueError, match="Source SQLite checksum"):
         streaming.materialize(args)
     assert not args.cleaned_output.exists()
+
+
+def test_preparation_refuses_misplaced_terminal_before_a_large_jump(tmp_path):
+    source = tmp_path / "source.sqlite"
+    fixture_database(source)
+    with sqlite3.connect(source) as connection:
+        connection.execute("UPDATE fixture SET is_last = (image_id = 2) WHERE trajectory_id = 0")
+        connection.execute("UPDATE fixture SET geometry = 'POINT (100 0)' WHERE trajectory_id = 0 AND image_id = 2")
+        connection.execute("UPDATE fixture SET geometry = 'POINT (140000 0)' WHERE trajectory_id = 0 AND image_id = 3")
+    args = arguments(source, tmp_path / "qc")
+    with pytest.raises(ValueError, match="misplaced is_last"):
+        streaming.build_compact_database(args)
+    assert not args.compact_database.exists()
+    assert streaming.sha256(source) == args.input_sha256
+
+
+def test_terminal_duplicates_are_allowed_and_preserved(tmp_path):
+    source = tmp_path / "source.sqlite"
+    duplicate_point_database(source)
+    with sqlite3.connect(source) as connection:
+        connection.execute("INSERT INTO fixture SELECT * FROM fixture WHERE is_last = 1")
+    args = arguments(source, tmp_path / "qc")
+    streaming.build_compact_database(args)
+    streaming.scan_archive(args, streaming.QCConfig())
+    result = streaming.materialize(args)
+    assert result["cleaned_rows"] == 5
+    assert result["duplicate_point_assignments"] == 2
+    assert result["misplaced_is_last_markers"] == 0
+
+
+@pytest.mark.parametrize("damage", ["missing", "lost_reject", "wrong_run"])
+def test_resume_refuses_missing_or_inconsistent_audit(tmp_path, damage):
+    source = tmp_path / "source.sqlite"
+    fixture_database(source)
+    args = arguments(source, tmp_path / "qc")
+    args.maximum_rows = 20
+    streaming.build_compact_database(args)
+    streaming.scan_archive(args, streaming.QCConfig())
+    audit = args.output_dir / "qc_analysis.sqlite"
+    if damage == "missing":
+        audit.rename(args.output_dir / "saved_audit.sqlite")
+    else:
+        with sqlite3.connect(audit) as connection:
+            connection.execute(
+                "DELETE FROM qc_flagged_edges" if damage == "lost_reject" else
+                "UPDATE qc_metadata SET value_json = '{}' WHERE key = 'run_identity'"
+            )
+        before = streaming.sha256(audit)
+    args.resume = True
+    args.maximum_rows = None
+    with pytest.raises((FileNotFoundError, ValueError)):
+        streaming.scan_archive(args, streaming.QCConfig())
+    if damage == "missing":
+        assert not audit.exists()
+    else:
+        assert streaming.sha256(audit) == before
+
+
+def test_materialization_refuses_rejects_missing_from_completed_audit(tmp_path):
+    source = tmp_path / "source.sqlite"
+    fixture_database(source)
+    args = arguments(source, tmp_path / "qc")
+    streaming.build_compact_database(args)
+    streaming.scan_archive(args, streaming.QCConfig())
+    with sqlite3.connect(args.output_dir / "qc_analysis.sqlite") as connection:
+        connection.execute("DELETE FROM qc_flagged_edges")
+    with pytest.raises(ValueError, match="differs from scan statistics"):
+        streaming.materialize(args)
+    assert not args.cleaned_output.exists()
+
+
+def test_resume_rolls_back_audit_ahead_of_checkpoint(tmp_path):
+    source = tmp_path / "source.sqlite"
+    fixture_database(source)
+    args = arguments(source, tmp_path / "qc")
+    args.maximum_rows = 20
+    streaming.build_compact_database(args)
+    streaming.scan_archive(args, streaming.QCConfig())
+    checkpoint = args.output_dir / "scan_checkpoint.pkl"
+    saved = checkpoint.read_bytes()
+    args.resume = True
+    args.maximum_rows = None
+    streaming.scan_archive(args, streaming.QCConfig())
+    # Simulate a crash after audit commit but before checkpoint replacement.
+    checkpoint.write_bytes(saved)
+    metadata = streaming.scan_archive(args, streaming.QCConfig())
+    result = streaming.materialize(args)
+    assert metadata["stats"]["links"] == 20
+    assert result["break_assignments"] == 1
+    assert result["cleaned_rows"] == 30
+
+
+def test_partial_replay_cannot_publish_stale_completion_metadata(tmp_path):
+    source = tmp_path / "source.sqlite"
+    fixture_database(source)
+    args = arguments(source, tmp_path / "qc")
+    args.maximum_rows = 10
+    streaming.build_compact_database(args)
+    streaming.scan_archive(args, streaming.QCConfig())
+    checkpoint = args.output_dir / "scan_checkpoint.pkl"
+    saved = checkpoint.read_bytes()
+    args.resume = True
+    args.maximum_rows = None
+    streaming.scan_archive(args, streaming.QCConfig())
+    checkpoint.write_bytes(saved)
+    args.maximum_rows = 10
+    metadata = streaming.scan_archive(args, streaming.QCConfig())
+    assert metadata["status"] == "partial"
+    with pytest.raises(ValueError, match="Scan must be complete"):
+        streaming.materialize(args)
+    assert not args.cleaned_output.exists()
