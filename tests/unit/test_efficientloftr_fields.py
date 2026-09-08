@@ -90,7 +90,9 @@ def _config(tmp_path):
             agreement_distance_m=50.0,
             maximum_triangle_edge_m=400.0,
         ),
-        routing=RoutingConfig(initial="same_center", residual_edge_recovery=False),
+        routing=RoutingConfig(
+            coarse_matching=False, initial="same_center", residual_edge_recovery=False
+        ),
     )
 
 
@@ -164,6 +166,7 @@ def test_low_overlap_phase_failure_falls_back_without_losing_pair(tmp_path):
         **{
             **config.__dict__,
             "routing": RoutingConfig(
+                coarse_matching=False,
                 initial="phase_correlation", residual_edge_recovery=False
             ),
         }
@@ -181,6 +184,7 @@ def test_low_response_phase_is_compared_with_same_center(tmp_path, monkeypatch):
         **{
             **config.__dict__,
             "routing": RoutingConfig(
+                coarse_matching=False,
                 initial="phase_correlation",
                 phase_correlation_minimum_response=0.05,
                 residual_edge_recovery=False,
@@ -216,6 +220,7 @@ def test_nonfinite_phase_correlation_falls_back_to_same_center(
         **{
             **config.__dict__,
             "routing": RoutingConfig(
+                coarse_matching=False,
                 initial="phase_correlation", residual_edge_recovery=False
             ),
         }

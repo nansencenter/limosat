@@ -13,7 +13,7 @@ from shapely.geometry.base import BaseGeometry
 from .config import FieldConfig, MatcherConfig, RoutingConfig
 from .field import sample_field
 from .imagery import north_up_patch
-from .models import DisplacementField
+from .models import DisplacementField, MotionMatches
 
 
 @dataclass(frozen=True)
@@ -142,3 +142,26 @@ def residual_edge_correction(
     elif residual[1] < -slack:
         aligned.append(np.mean(target_px[:, 1] >= matcher.tile_size_px - edge) >= 0.25)
     return residual if aligned and any(aligned) else None
+
+
+def coarse_match_shift(
+    matches: MotionMatches,
+    center_xy_m: tuple[float, float],
+    support_radius_m: float,
+    minimum_matches: int,
+    maximum_displacement_m: float,
+) -> tuple[np.ndarray | None, str]:
+    """Predict fine-tile motion from local coarse matches, never a field value."""
+    displacement = matches.displacement_m
+    local = (
+        np.isfinite(matches.source_xy_m).all(axis=1)
+        & np.isfinite(displacement).all(axis=1)
+        & (np.linalg.norm(matches.source_xy_m - center_xy_m, axis=1) <= support_radius_m)
+        & (np.linalg.norm(displacement, axis=1) <= maximum_displacement_m)
+    )
+    if int(local.sum()) < minimum_matches:
+        return None, "insufficient_support"
+    shift = np.median(displacement[local], axis=0)
+    if not np.isfinite(shift).all() or np.linalg.norm(shift) > maximum_displacement_m:
+        return None, "invalid_shift"
+    return shift, "refined"

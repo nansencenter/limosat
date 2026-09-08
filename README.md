@@ -80,6 +80,24 @@ pair. A response below 0.05 runs both phase-shifted and same-centre hypotheses;
 the normal field and fold gates select the better truth-free result. Too little
 common raster support falls back to same-centre rather than dropping the pair.
 Non-finite phase-correlation output also falls back to same-centre.
+
+Before fine matching, a coarse EfficientLoFTR pass refines each target-tile
+position. It uses the same model and pixel dimensions at 320 m resolution,
+then takes the median displacement of at least 12 matches within 35.84 km of
+the source-tile centre. Fine matching retains its configured resolution
+(default 80 m), source ownership, validity checks and speed limit. Coarse
+matches only position tiles: they never enter displacement fields, deformation
+or trajectories. Missing coarse support retains the initial or earlier-drift
+prior; existing residual-edge recovery remains available after fine matching.
+
+`routing.coarse_matching` defaults to `true`; set it to `false` for fine-only
+routing. Coarse resolution, minimum match count and local support radius are
+configurable in `config.defaults.yaml`. Pair diagnostics record coarse tile
+refinements and fallback reasons; matcher call counts and timings include both
+passes. Each low-response routing hypothesis receives its own coarse pass.
+Better positioning can restore lost matching coverage, but does not guarantee
+correct motion or remove all deformation artifacts from uneven field support.
+
 Optional OSI SAF filtering skips a tile only when complete SIC samples on both
 dates are below 15%.
 

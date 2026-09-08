@@ -98,8 +98,24 @@ class RoutingConfig:
     require_orbit_metadata: bool = False
     primary_maximum_pairs_per_target: int | None = None
     candidate_pair_ids: tuple[str, ...] = ()
+    coarse_matching: bool = True
+    coarse_pixel_size_m: float = 320.0
+    coarse_minimum_matches: int = 12
+    coarse_support_radius_m: float = 35_840.0
 
     def __post_init__(self) -> None:
+        if not isinstance(self.coarse_matching, bool):
+            raise ValueError("coarse_matching must be a boolean")
+        for name in ("coarse_pixel_size_m", "coarse_support_radius_m"):
+            value = getattr(self, name)
+            if not 0 < value < float("inf"):
+                raise ValueError(f"{name} must be finite and positive")
+        if (
+            isinstance(self.coarse_minimum_matches, bool)
+            or not isinstance(self.coarse_minimum_matches, int)
+            or self.coarse_minimum_matches < 1
+        ):
+            raise ValueError("coarse_minimum_matches must be a positive integer")
         if not 0 <= self.phase_correlation_minimum_response <= 1:
             raise ValueError(
                 "phase_correlation_minimum_response must be in [0, 1]"

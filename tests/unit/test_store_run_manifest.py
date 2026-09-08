@@ -48,7 +48,7 @@ def _config(tmp_path):
             agreement_distance_m=100.0,
             maximum_triangle_edge_m=1_500.0,
         ),
-        routing=RoutingConfig(initial="same_center"),
+        routing=RoutingConfig(coarse_matching=False, initial="same_center"),
     )
 
 

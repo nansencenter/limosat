@@ -46,7 +46,7 @@ def config(tmp_path, *, retain_matches=True):
             agreement_distance_m=100.0,
             maximum_triangle_edge_m=1_500.0,
         ),
-        routing=RoutingConfig(initial="same_center"),
+        routing=RoutingConfig(coarse_matching=False, initial="same_center"),
     )
 
 
@@ -327,7 +327,9 @@ def test_field_only_worker_product_preserves_match_count_on_import(tmp_path):
 def test_disabled_recovery_schedules_no_pair_work(tmp_path):
     cfg = replace(
         config(tmp_path),
-        routing=RoutingConfig(initial="same_center", targeted_recovery=False),
+        routing=RoutingConfig(
+            coarse_matching=False, initial="same_center", targeted_recovery=False
+        ),
     )
     images = catalogue(tmp_path)
     processor = Processor()

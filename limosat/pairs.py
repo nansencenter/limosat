@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol
 
 import numpy as np
@@ -25,6 +25,7 @@ from .imagery import north_up_patch, projected_coordinates, projected_footprint
 from .models import DisplacementField, MotionMatches, PairResult
 from .routing import (
     CoarseTranslationUnavailable,
+    coarse_match_shift,
     coarse_phase_translation,
     residual_edge_correction,
     targeted_domain,
@@ -75,6 +76,16 @@ class _HypothesisResult:
     matcher_calls: int
     matcher_tiles: int
     gate_counts: dict[str, int]
+
+
+@dataclass(frozen=True)
+class _CoarseRoutingResult:
+    shifts: np.ndarray
+    sampling_seconds: float
+    matching_seconds: float
+    matcher_calls: int
+    matcher_tiles: int
+    counts: dict[str, int]
 
 
 class PairProcessor:
@@ -282,6 +293,16 @@ class PairProcessor:
             "skipped_no_target_support": 0,
             "skipped_no_physics_reachable_valid_overlap": 0,
         }
+        if self.config.routing.coarse_matching:
+            refined = self._refine_tile_shifts(
+                pair, regions, shifts, source_sic, target_sic
+            )
+            shifts = refined.shifts
+            sampling_seconds += refined.sampling_seconds
+            matching_seconds += refined.matching_seconds
+            matcher_calls += refined.matcher_calls
+            matcher_tiles += refined.matcher_tiles
+            gate_counts.update(refined.counts)
         region_shifts = iter(zip(regions, shifts, strict=True))
 
         def prepare_batch():
@@ -395,6 +416,84 @@ class PairProcessor:
             matcher_calls,
             matcher_tiles,
             gate_counts,
+        )
+
+    def _refine_tile_shifts(
+        self,
+        pair: ImagePair,
+        regions: tuple[TileRegion, ...],
+        shifts: np.ndarray,
+        source_sic,
+        target_sic,
+    ) -> _CoarseRoutingResult:
+        """Run one bounded coarse pass with the same model before fine sampling."""
+        settings = self.config.routing
+        coarse_config = replace(
+            self.config,
+            matcher=replace(
+                self.config.matcher, pixel_size_m=settings.coarse_pixel_size_m
+            ),
+        )
+        coarse = PairProcessor(coarse_config, self.matcher, self.sic_index)
+        refined = shifts.copy()
+        counts = {
+            "coarse_tiles_refined": 0,
+            "coarse_fallback_insufficient_support": 0,
+            "coarse_fallback_invalid_shift": 0,
+            "coarse_fallback_no_source_core_support": 0,
+            "coarse_fallback_no_target_support": 0,
+            "coarse_fallback_no_physics_reachable_valid_overlap": 0,
+            "coarse_skipped_open_water_both_dates": 0,
+        }
+        sampling_seconds = matching_seconds = 0.0
+        calls = evaluations = 0
+        pending: list[_PreparedTile] = []
+        indices: list[int] = []
+
+        def match_pending():
+            nonlocal matching_seconds, calls, evaluations
+            results, elapsed, batch_calls = coarse._match_prepared_tiles(pair, pending)
+            matching_seconds += elapsed
+            calls += batch_calls
+            evaluations += len(pending)
+            for index, (matches, _target_px) in zip(indices, results, strict=True):
+                shift, reason = coarse_match_shift(
+                    matches,
+                    regions[index].center_xy_m,
+                    settings.coarse_support_radius_m,
+                    settings.coarse_minimum_matches,
+                    self.config.matcher.maximum_displacement_m(pair.elapsed_seconds),
+                )
+                if shift is not None:
+                    refined[index] = shift
+                    counts["coarse_tiles_refined"] += 1
+                else:
+                    counts[f"coarse_fallback_{reason}"] += 1
+            pending.clear()
+            indices.clear()
+
+        for index, (region, shift) in enumerate(zip(regions, shifts, strict=True)):
+            target_center = tuple(np.asarray(region.center_xy_m) + shift)
+            if coarse._both_dates_open_water(
+                source_sic, target_sic, region.center_xy_m, target_center
+            ):
+                counts["coarse_skipped_open_water_both_dates"] += 1
+                continue
+            started = time.perf_counter()
+            sampled, reason = coarse._sample_pair(pair, region.center_xy_m, shift)
+            sampling_seconds += time.perf_counter() - started
+            if sampled is None:
+                counts[f"coarse_fallback_{reason}"] += 1
+                continue
+            pending.append(_PreparedTile(region, shift, *sampled))
+            indices.append(index)
+            if len(pending) == self.config.matcher.tile_batch_size:
+                match_pending()
+        if pending:
+            match_pending()
+        counts["coarse_matcher_tile_evaluations"] = evaluations
+        return _CoarseRoutingResult(
+            refined, sampling_seconds, matching_seconds, calls, evaluations, counts
         )
 
     def _overlap(self, pair: ImagePair) -> BaseGeometry:

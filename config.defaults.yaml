@@ -36,6 +36,10 @@ routing:
   initial: phase_correlation
   phase_correlation_failure: same_center
   phase_correlation_minimum_response: 0.05
+  coarse_matching: true
+  coarse_pixel_size_m: 320.0
+  coarse_minimum_matches: 12
+  coarse_support_radius_m: 35840.0
   residual_edge_recovery: true
   targeted_recovery: true
   maximum_recovery_elapsed_hours: 96.0

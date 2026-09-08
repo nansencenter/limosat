@@ -127,6 +127,7 @@ def test_pair_processor_batches_residual_recovery_tiles(tmp_path, monkeypatch):
         **{
             **base.__dict__,
             "routing": RoutingConfig(
+                coarse_matching=False,
                 initial="same_center", residual_edge_recovery=True
             ),
         }
