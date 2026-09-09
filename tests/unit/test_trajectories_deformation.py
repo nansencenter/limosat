@@ -15,7 +15,7 @@ from limosat import (
     iter_frozen_primary_augmentations,
 )
 from limosat.deformation import deformation_from_field
-from limosat.trajectory import targeted_recovery_positions
+from limosat.trajectory import _supported_continuations, targeted_recovery_positions
 
 
 START = datetime(2020, 1, 1, tzinfo=timezone.utc)
@@ -263,6 +263,64 @@ def test_new_trajectory_is_created_when_outgoing_coverage_enters():
 
     created_at_b = [point for point in points if point.image_id == "b" and point.state == "created"]
     assert len(created_at_b) == 4
+
+
+def test_boundary_reappearance_continues_only_into_frozen_dormant_entries():
+    geometry = np.array([[0., 0.], [4000., 0.], [8000., 0.], [0., 4000.]])
+    images = _images(("a", "b", "c", "d"))
+    ids = ["parcel-a", "parcel-b", "parcel-c", "parcel-d"]
+    seeds = tuple(TrajectoryPoint(identity, "a", START, "created", "seed_grid",
+                                  float(x), float(y), None)
+                  for identity, (x, y) in zip(ids, geometry))
+    batches = (seeds,) + tuple(
+        tuple(TrajectoryPoint(identity, image.image_id, image.time_utc,
+                              "dormant", "missing", None, None, None)
+              for identity in ids)
+        for image in images[1:]
+    )
+    recovery = FieldEdge(_field("a", "c", 0, [100., 0.], points=geometry,
+                                target_step=2), pair_kind="recovery")
+    primary = FieldEdge(_field("c", "d", 2, [100., 0.],
+                               points=geometry + [100., 0.]))
+    additions = tuple(point for batch in iter_frozen_primary_augmentations(
+        batches, (recovery, primary), images, FieldConfig()) for point in batch)
+    assert len(additions) == 6
+    by_key = {(p.trajectory_id, p.image_id): p for p in additions}
+    assert by_key[("parcel-d", "c")].position_basis == "recovery_pair_field"
+    assert by_key[("parcel-d", "d")].position_basis == "post_reappearance_primary_field"
+    assert by_key[("parcel-d", "d")].x_m == 200.
+    assert all(p.trajectory_id != "parcel-c" for p in additions)
+    frozen = {(p.trajectory_id, p.image_id): p for batch in batches for p in batch}
+    assert all(frozen[key].state == "dormant" for key in by_key)
+    final = {**frozen, **by_key}
+    assert final.keys() == frozen.keys()
+    assert all(final[(p.trajectory_id, "a")] == p for p in seeds)
+
+
+def test_supported_boundary_seed_gets_a_primary_measurement():
+    geometry = np.array([[0., 0.], [4000., 0.], [8000., 0.], [0., 4000.]])
+    edge = FieldEdge(_field("a", "b", 0, [100., 0.], points=geometry))
+    points = build_trajectories([edge], _images(("a", "b")),
+                                FieldConfig(), TrajectoryConfig())
+    observed = [p for p in points if p.state == "observed"]
+    assert len(observed) == 3
+    assert any(p.x_m == 100. and p.y_m == 4000. for p in observed)
+    assert sum(p.state == "dormant" for p in points) == 1
+
+
+def test_recovered_boundary_candidate_uses_existing_source_time_ranking():
+    geometry = np.array([[0., 0.], [4000., 0.], [8000., 0.], [0., 4000.]])
+    ids = ["parcel-a", "parcel-b", "parcel-c", "parcel-d"]
+    positions = [dict(zip(ids, geometry)), dict(zip(ids, geometry))]
+    older = FieldEdge(_field("a", "c", 0, [100., 0.], points=geometry,
+                             target_step=2))
+    newer = FieldEdge(_field("b", "c", 1, [200., 0.], points=geometry))
+    for incoming in [((0, 2, older), (1, 2, newer)),
+                     ((1, 2, newer), (0, 2, older))]:
+        chosen = _supported_continuations(incoming, positions, ids, FieldConfig())
+        assert chosen["parcel-d"].edge is newer
+        np.testing.assert_array_equal(chosen["parcel-d"].displacement_m, [200., 0.])
+        assert "parcel-c" not in chosen
 
 
 def test_global_continuation_crosses_former_component_boundaries():
