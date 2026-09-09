@@ -525,7 +525,11 @@ def test_singleton_removal_accounts_for_every_source_row_and_vector(tmp_path, ki
     assert streaming.sha256(source) == args.input_sha256
 
 
-def test_materialization_refuses_older_protocol(tmp_path):
+@pytest.mark.parametrize("field,value", [
+    ("protocol_id", "limosat_trajectory_link_qc_v2_20260907"),
+    ("protocol_sha256", "0" * 64),
+])
+def test_materialization_refuses_mismatched_protocol(tmp_path, field, value):
     source = tmp_path / 'raw.sqlite'
     fixture_database(source)
     args = arguments(source, tmp_path / 'work')
@@ -533,7 +537,7 @@ def test_materialization_refuses_older_protocol(tmp_path):
     streaming.scan_archive(args, streaming.QCConfig())
     with sqlite3.connect(args.output_dir / 'qc_analysis.sqlite') as con:
         con.execute('UPDATE qc_metadata SET value_json=? WHERE key=?',
-                    (json.dumps('limosat_trajectory_link_qc_v2_20260907'), 'protocol_id'))
+                    (json.dumps(value), field))
     with pytest.raises(ValueError, match='protocol'):
         streaming.materialize(args)
     assert not args.cleaned_output.exists()
