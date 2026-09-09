@@ -223,17 +223,21 @@ def sample_field(
     if valid.sum() < 3 or not count:
         return FieldSamples(displacement, available, selected, radius, residual)
     source = field.source_xy_m[valid]
-    target = source + field.displacement_m[valid]
+    vectors = field.displacement_m[valid]
+    target = source + vectors
     try:
         triangulation = Delaunay(source)
     except QhullError:
         return FieldSamples(displacement, available, selected, radius, residual)
     vertices = triangulation.simplices
+    source_triangles = source[vertices]
     usable = (
-        (_maximum_edge(source[vertices]) <= maximum_triangle_edge_m)
-        & (_area(source[vertices]) * _area(target[vertices]) > 0)
+        (_maximum_edge(source_triangles) <= maximum_triangle_edge_m)
+        & (_area(source_triangles) * _area(target[vertices]) > 0)
     )
+    del source_triangles, target
     simplex = triangulation.find_simplex(query)
+    _recover_boundary_simplices(triangulation, usable, query, simplex)
     query_indices = np.flatnonzero(simplex >= 0)
     if not len(query_indices):
         return FieldSamples(displacement, available, selected, radius, residual)
@@ -246,12 +250,103 @@ def sample_field(
     first = np.einsum("nij,nj->ni", affine[:, :2], query[query_indices] - affine[:, 2])
     weights = np.column_stack((first, 1.0 - first.sum(axis=1)))
     triangle_vertices = vertices[chosen]
-    displacement[query_indices] = np.einsum("ni,nij->nj", weights, field.displacement_m[valid][triangle_vertices])
+    displacement[query_indices] = np.einsum("ni,nij->nj", weights, vectors[triangle_vertices])
     selected[query_indices] = np.einsum("ni,ni->n", weights, field.selected_matches[valid][triangle_vertices])
     radius[query_indices] = _weighted(weights, field.support_radius_m[valid][triangle_vertices])
     residual[query_indices] = _weighted(weights, field.maximum_residual_m[valid][triangle_vertices])
     available[query_indices] = True
     return FieldSamples(displacement, available, selected, radius, residual)
+
+
+def _recover_boundary_simplices(
+    triangulation: Delaunay,
+    usable: np.ndarray,
+    query: np.ndarray,
+    simplex: np.ndarray,
+) -> None:
+    """Fill rejected boundary lookups without replacing successful simplices.
+
+    A shared edge has one neighbouring simplex; an exact vertex can have more
+    than two incident simplices. Search only those existing local alternatives,
+    keeping the same containment tolerance as the default simplex lookup.
+    """
+    tolerance = 100.0 * np.finfo(np.float64).eps
+    inside = np.flatnonzero(simplex >= 0)
+    rejected = inside[~usable[simplex[inside]]]
+    vertex_queries = []
+    vertex_indices = []
+    if len(rejected):
+        chosen = simplex[rejected]
+        vertices = triangulation.simplices[chosen]
+        exact = np.all(
+            query[rejected, None, :] == triangulation.points[vertices], axis=2
+        )
+        at_vertex = exact.any(axis=1)
+        vertex_queries.append(rejected[at_vertex])
+        vertex_indices.append(vertices[at_vertex, exact[at_vertex].argmax(axis=1)])
+
+        edge_queries = rejected[~at_vertex]
+        chosen = chosen[~at_vertex]
+        affine = triangulation.transform[chosen]
+        first = np.einsum(
+            "nij,nj->ni", affine[:, :2], query[edge_queries] - affine[:, 2]
+        )
+        weights = np.column_stack((first, 1.0 - first.sum(axis=1)))
+        on_edge = (np.abs(weights) <= tolerance) & np.all(
+            weights >= -tolerance, axis=1
+        )[:, None]
+        rows, facets = np.nonzero(on_edge)
+        neighbours = triangulation.neighbors[chosen[rows], facets]
+        keep = neighbours >= 0
+        rows, neighbours = rows[keep], neighbours[keep]
+        keep = usable[neighbours]
+        rows, neighbours = rows[keep], neighbours[keep]
+        affine = triangulation.transform[neighbours]
+        first = np.einsum(
+            "nij,nj->ni", affine[:, :2], query[edge_queries[rows]] - affine[:, 2]
+        )
+        weights = np.column_stack((first, 1.0 - first.sum(axis=1)))
+        contains = np.all(weights >= -tolerance, axis=1)
+        # Near a vertex more than one facet can qualify. Use a stable simplex
+        # index rather than the order in which queries reached the boundary.
+        replacement = np.full(len(edge_queries), len(usable), dtype=np.intp)
+        np.minimum.at(replacement, rows[contains], neighbours[contains])
+        found = replacement < len(usable)
+        simplex[edge_queries[found]] = replacement[found]
+
+    outside = np.flatnonzero(simplex < 0)
+    if len(outside):
+        points = triangulation.points
+        in_bounds = np.all(
+            (query[outside] >= points.min(axis=0))
+            & (query[outside] <= points.max(axis=0)),
+            axis=1,
+        )
+        outside = outside[in_bounds]
+        if len(outside):
+            # Directed lookup can also miss an exact hull vertex. The tree is
+            # queried only for these rejected rows, with a numerical-radius
+            # bound; only an exactly equal coordinate may be recovered.
+            radius = np.finfo(np.float64).eps * max(np.abs(points).max(), 1.0)
+            distance, vertex = cKDTree(points).query(
+                query[outside], distance_upper_bound=radius, workers=1
+            )
+            exact = distance == 0.0
+            outside, vertex = outside[exact], vertex[exact]
+            exact = np.all(query[outside] == points[vertex], axis=1)
+            vertex_queries.append(outside[exact])
+            vertex_indices.append(vertex[exact])
+
+    if vertex_indices and any(len(indices) for indices in vertex_indices):
+        best = np.full(len(triangulation.points), len(usable), dtype=np.intp)
+        selected = np.flatnonzero(usable)
+        np.minimum.at(
+            best, triangulation.simplices[selected].ravel(), np.repeat(selected, 3)
+        )
+        queries = np.concatenate(vertex_queries)
+        chosen = best[np.concatenate(vertex_indices)]
+        found = chosen < len(usable)
+        simplex[queries[found]] = chosen[found]
 
 
 def _estimates(displacement, available, selected, candidates, radius, residual):
