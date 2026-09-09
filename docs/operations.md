@@ -62,6 +62,19 @@ global SQLite database.
 
 ## Matching and measured reappearance
 
+Field sampling first uses the containing triangle returned by the directed
+lookup. If that triangle is unusable, an exact vertex or shared edge can use
+another existing incident triangle under the same maximum-edge and orientation
+requirements. The fallback preserves successful samples and does not extend
+support into holes or extrapolate beyond the field. Floating-point edge
+containment uses the simplex lookup's default numerical tolerance.
+
+Recovering a sample does not guarantee a longer trajectory. During primary
+recomposition it can change the preferred source pair, subsequent coordinates,
+and seed occupancy, even though previously successful samples at identical
+query coordinates remain unchanged. During measured reappearance, the frozen
+primary history and dormant-entry restrictions still apply.
+
 Each independently scheduled production pair estimates coarse phase
 correlation. EfficientLoFTR runs on north-up tiles whose non-overlapping source
 cores prevent duplicate ownership. Endpoint validity, elapsed-time speed,

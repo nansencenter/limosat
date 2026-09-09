@@ -145,6 +145,10 @@ Git, not substitutes for a native run manifest.
   in SQLite; they are never encoded as zero displacement.
 - Trajectories are virtual material points advected only through supported,
   orientation-preserving fields. Dormant points have no coordinate.
+- Sampling preserves successful triangle lookups. At an exact field vertex or
+  shared triangle edge, a rejected lookup can use an existing incident triangle
+  that passes the same edge-length and orientation gates. An available vertex
+  without a usable incident triangle remains unsupported.
 - Reappearance requires a measured non-consecutive pair; no temporal prediction
   is included in the trajectory product.
 - Primary trajectory IDs, entries, measured positions, seeds, and deformation
