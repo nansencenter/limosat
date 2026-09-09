@@ -208,3 +208,10 @@ def test_orientation_diagnostic_detects_and_removes_fold():
 
     assert before["topology_flip_count"].sum() > 0
     assert after["topology_flip_count"].sum() == 0
+
+
+def test_v1_finalization_contract():
+    protocol = qc.load_protocol()
+    assert protocol["protocol_id"] == "limosat_trajectory_link_qc_v1"
+    assert protocol["split_semantics"]["minimum_segment_points"] == 2
+    assert protocol["split_semantics"]["point_rows_deleted"] is True

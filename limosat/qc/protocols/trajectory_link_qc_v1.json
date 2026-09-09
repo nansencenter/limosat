@@ -1,6 +1,6 @@
 {
-  "protocol_id": "limosat_trajectory_link_qc_v1_20260904",
-  "status": "frozen_v1_post_run_finalization",
+  "protocol_id": "limosat_trajectory_link_qc_v1",
+  "status": "v1_pending_independent_validation",
   "decision_unit": "one drift vector between consecutive keypoints within an original LiMOSAT trajectory",
   "crs": "EPSG:3413",
   "coordinate_units": "metres",
@@ -20,7 +20,8 @@
     "hard_speed_m_per_day": 60000,
     "topology_max_edge_m": 20000,
     "archive_prescreen_residual_m": 1000,
-    "configured_speed_m_per_day": "required from the source tracking run"
+    "configured_speed_m_per_day": "required from the source tracking run",
+    "max_prediction_weight_l1": 2.0
   },
   "neighbour_model": {
     "exact_image_pair_only": true,
@@ -31,7 +32,9 @@
     "minimum_neighbours": 8,
     "minimum_inlier_fraction": 0.6,
     "fit_clip_mad_z": 4,
-    "residual_noise_floor_m": 150
+    "residual_noise_floor_m": 150,
+    "prediction_guard": "Use coordinate-median translation when affine prediction weights have L1 norm > 2 or the fit is rank deficient.",
+    "final_fit": "Refit on the final clipped inlier set before reporting residuals."
   },
   "automatic_rejection": {
     "hard_actual_gap_speed_m_per_day": 60000,
@@ -54,11 +57,15 @@
     "OSI SAF drift"
   ],
   "split_semantics": {
-    "point_rows_deleted": false,
+    "point_rows_deleted": true,
     "rule": "the target keypoint of each rejected vector begins a new trajectory segment",
     "new_ids": "deterministic integers above the maximum original trajectory ID",
     "is_last": "recomputed once per resulting segment",
-    "converged_to": "archive finalizer maps to the latest split segment at or before the convergence row time and image",
-    "duplicate_points": "exclude additional trajectory/image/time rows from scoring and preserve them as deterministic singleton trajectories"
-  }
+    "converged_to": "Map to the latest applicable split segment, then clear references to removed singleton segments to NULL and audit them in qc_cleared_convergence.",
+    "duplicate_points": "Exclude additional trajectory/image/time rows from scoring; audit deterministic singleton assignments, then remove them from the cleaned trajectory table.",
+    "source_terminal_validation": "Refuse source terminal markers preceding another observation of the same trajectory; duplicates at the terminal image/time are allowed.",
+    "minimum_segment_points": 2,
+    "singleton_removal": "Remove one-keypoint segments at finalization; record removed source rowids and segment IDs in qc_removed_singletons."
+  },
+  "archive_prescreen": "Skip local fits only when coarse residual + 2 * maximum neighbour deviation from the coarse median is below both the prescreen and every local decision floor."
 }

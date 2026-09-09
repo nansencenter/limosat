@@ -613,6 +613,9 @@ def materialize(args) -> dict:
         raise ValueError("Scan must be complete before materialization")
     if metadata.get("input_sha256") != args.input_sha256:
         raise ValueError("QC scan source checksum does not match --input-sha256")
+    if (metadata.get("protocol_id") != PROTOCOL_ID
+            or metadata.get("protocol_sha256") != sha256(PROTOCOL_PATH)):
+        raise ValueError("QC scan protocol does not match materialization protocol")
     source_table = metadata["source_table"]
     cleaned_table = source_table + "__qc"
     target = args.cleaned_output
@@ -720,6 +723,45 @@ def materialize(args) -> dict:
             f"CREATE INDEX {quote_identifier('idx_' + cleaned_table + '_traj_last')} "
             f"ON {quote_identifier(cleaned_table)} (trajectory_id, is_last)"
         )
+        # Remove zero-vector segments only, after all split/duplicate assignments.
+        # Preserve their source rowids and segment IDs in a separate audit.
+        connection.execute(
+            "CREATE TABLE qc_removed_singletons ("
+            "source_rowid INTEGER PRIMARY KEY, trajectory_id INTEGER NOT NULL UNIQUE)"
+        )
+        connection.execute(
+            "INSERT INTO qc_removed_singletons "
+            f"SELECT MIN(rowid), trajectory_id FROM {quote_identifier(cleaned_table)} "
+            "GROUP BY trajectory_id HAVING COUNT(*) = 1"
+        )
+        connection.execute(
+            f"DELETE FROM {quote_identifier(cleaned_table)} WHERE rowid IN "
+            "(SELECT source_rowid FROM qc_removed_singletons)"
+        )
+        connection.execute(
+            "CREATE TABLE qc_cleared_convergence ("
+            "source_rowid INTEGER PRIMARY KEY, removed_trajectory_id INTEGER NOT NULL)"
+        )
+        if "converged_to" in columns:
+            connection.execute(
+                "INSERT INTO qc_cleared_convergence "
+                f"SELECT rowid, converged_to FROM {quote_identifier(cleaned_table)} "
+                "WHERE converged_to IN (SELECT trajectory_id FROM qc_removed_singletons)"
+            )
+            connection.execute(
+                f"UPDATE {quote_identifier(cleaned_table)} SET converged_to = NULL "
+                "WHERE rowid IN (SELECT source_rowid FROM qc_cleared_convergence)"
+            )
+        removed_singletons = connection.execute(
+            "SELECT COUNT(*) FROM qc_removed_singletons"
+        ).fetchone()[0]
+        cleared_convergence = connection.execute(
+            "SELECT COUNT(*) FROM qc_cleared_convergence"
+        ).fetchone()[0]
+        remaining_singletons, retained_vectors = connection.execute(
+            "SELECT COALESCE(SUM(n = 1), 0), COALESCE(SUM(n - 1), 0) FROM ("
+            f"SELECT COUNT(*) AS n FROM {quote_identifier(cleaned_table)} GROUP BY trajectory_id)"
+        ).fetchone()
         for table in (
             "qc_flagged_edges",
             "qc_pair_summary",
@@ -771,6 +813,10 @@ def materialize(args) -> dict:
             "cleaned_table": cleaned_table,
             "source_rows": int(source_rows),
             "cleaned_rows": int(cleaned_rows),
+            "removed_singleton_rows": int(removed_singletons),
+            "remaining_singleton_trajectories": int(remaining_singletons),
+            "cleared_convergence_references": int(cleared_convergence),
+            "retained_vectors": int(retained_vectors),
             "break_assignments": int(break_count),
             "expected_break_assignments": int(expected_break_count),
             "duplicate_point_assignments": int(duplicate_count),
@@ -782,8 +828,12 @@ def materialize(args) -> dict:
             "elapsed_seconds": time.perf_counter() - started,
         }
         failures = []
-        if source_rows != cleaned_rows:
-            failures.append("source and cleaned row counts differ")
+        if source_rows != cleaned_rows + removed_singletons:
+            failures.append("source rows differ from cleaned plus removed singleton rows")
+        if remaining_singletons:
+            failures.append("singleton trajectories remain in the cleaned table")
+        if retained_vectors != metadata["stats"]["links"] - metadata["stats"]["rejected"]:
+            failures.append("retained vector count differs from accepted scan vectors")
         if source_rows != metadata["stats"]["point_rows"]:
             failures.append("source row count differs from the completed scan")
         if break_count != expected_break_count:

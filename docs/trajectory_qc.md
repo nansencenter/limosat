@@ -1,8 +1,7 @@
 # Trajectory quality control
 
 QC checks drift vectors after tracking finishes and writes a separate SQLite
-database. Rejected vectors split trajectories; all keypoints are preserved and
-the original database is unchanged.
+database. Rejected vectors split trajectories; the original database is unchanged.
 
 ## Run QC
 
@@ -33,7 +32,7 @@ QC checks actual-gap speed and displacement consistency with nearby vectors
 from the same source and target images. Large local discrepancies can be
 rejected using additional speed or geometric checks. Review flags retain the
 vector for inspection. Exact rules and thresholds are defined in the
-[QC protocol](../limosat/qc/protocols/trajectory_link_qc_v2.json).
+[QC v1 protocol](../limosat/qc/protocols/trajectory_link_qc_v1.json).
 
 Both directly matched and interpolated vectors are checked. Where neighbour
 support is insufficient, only the absolute speed limit of 60,000 m/day applies.
@@ -44,6 +43,10 @@ retained vectors are not guaranteed to be valid.
 
 Use the `<source_table>__qc` table in the output database for analysis. Trajectory
 IDs, end markers and convergence references reflect the resulting segments.
+Finalization discards any leftover one-keypoint segments and audits their removal;
+accepted drift vectors are unaffected. Row accounting is
+`source_rows = cleaned_rows + removed_singleton_rows`.
+
 The work directory contains QC decisions in `qc_analysis.sqlite` and an output
 validation summary in `materialization_manifest.json`. Use the output only after
 the command succeeds and the manifest reports `status: complete`.

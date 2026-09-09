@@ -129,7 +129,7 @@ def test_stream_scan_and_materialization_preserve_suffix_after_break(tmp_path):
         assignments = connection.execute(
             "SELECT original_trajectory_id, new_trajectory_id FROM qc_break_assignment"
         ).fetchall()
-    assert split == [(0, 1), (10, 0), (10, 1)]
+    assert split == [(10, 0), (10, 1)]
     assert assignments == [(0, 10)]
     with sqlite3.connect(args.compact_database) as connection:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(compact_points)")}
@@ -141,7 +141,7 @@ def test_stream_scan_and_materialization_preserve_suffix_after_break(tmp_path):
     assert counts == (20, 1, 0)
 
 
-def test_multiple_breaks_preserve_points_and_remap_convergence(tmp_path):
+def test_multiple_breaks_remove_singletons_and_clear_convergence(tmp_path):
     source = tmp_path / "source.sqlite"
     fixture_database(source)
     with sqlite3.connect(source) as connection:
@@ -164,11 +164,17 @@ def test_multiple_breaks_preserve_points_and_remap_convergence(tmp_path):
         assert connection.execute(
             'SELECT trajectory_id, is_last FROM "fixture__qc" '
             'WHERE rowid IN (1, 11, 21) ORDER BY time'
-        ).fetchall() == [(0, 1), (10, 1), (11, 1)]
+        ).fetchall() == []
         assert connection.execute(
             'SELECT converged_to FROM "fixture__qc" '
             'WHERE trajectory_id = 1 ORDER BY time'
-        ).fetchall() == [(0,), (10,), (11,)]
+        ).fetchall() == [(None,), (None,), (None,)]
+        assert connection.execute(
+            'SELECT source_rowid, trajectory_id FROM qc_removed_singletons ORDER BY source_rowid'
+        ).fetchall() == [(1, 0), (11, 10), (21, 11)]
+        assert connection.execute(
+            'SELECT source_rowid, removed_trajectory_id FROM qc_cleared_convergence ORDER BY source_rowid'
+        ).fetchall() == [(2, 0), (12, 10), (22, 11)]
         clean_points = connection.execute(
             'SELECT rowid, image_id, geometry, descriptors, corr, time, interpolated '
             'FROM "fixture__qc" ORDER BY rowid'
@@ -178,7 +184,7 @@ def test_multiple_breaks_preserve_points_and_remap_convergence(tmp_path):
             'SELECT rowid, image_id, geometry, descriptors, corr, time, interpolated '
             'FROM fixture ORDER BY rowid'
         ).fetchall()
-    assert clean_points == raw_points
+    assert clean_points == [row for row in raw_points if row[0] not in (1, 11, 21)]
 
 
 def test_resume_maximum_rows_is_per_invocation(tmp_path):
@@ -238,10 +244,10 @@ def test_materialization_assigns_suffix_by_time_not_rowid(tmp_path):
             'SELECT image_id, trajectory_id, is_last FROM "fixture__qc" '
             "WHERE rowid IN (1, 2, 3) ORDER BY image_id"
         ).fetchall()
-    assert split == [(1, 0, 1), (2, 2, 0), (3, 2, 1)]
+    assert split == [(2, 2, 0), (3, 2, 1)]
 
 
-def test_exact_duplicate_point_is_preserved_as_singleton(tmp_path):
+def test_exact_duplicate_point_is_audited_and_removed(tmp_path):
     source = tmp_path / "source.sqlite"
     output_dir = tmp_path / "qc"
     duplicate_point_database(source)
@@ -265,7 +271,7 @@ def test_exact_duplicate_point_is_preserved_as_singleton(tmp_path):
         rows = connection.execute(
             'SELECT rowid, trajectory_id, is_last FROM "fixture__qc" ORDER BY rowid'
         ).fetchall()
-    assert rows == [(1, 0, 0), (2, 0, 0), (3, 1, 1), (4, 0, 1)]
+    assert rows == [(1, 0, 0), (2, 0, 0), (4, 0, 1)]
 
 
 def test_resume_refuses_changed_config_without_modifying_audit(tmp_path):
@@ -333,7 +339,7 @@ def test_package_cli_completes_with_preserved_source_and_verifiable_manifest(tmp
     assert result.returncode == 0, result.stderr
     manifest = json.loads((output_dir / "materialization_manifest.json").read_text())
     assert manifest["status"] == "complete"
-    assert manifest["cleaned_rows"] == 30
+    assert manifest["cleaned_rows"] == 29
     assert manifest["break_assignments"] == 1
     assert streaming.sha256(source) == before
     assert streaming.sha256(output_dir / "source_qc.sqlite") == manifest["output_sha256"]
@@ -396,7 +402,7 @@ def test_preparation_refuses_misplaced_terminal_before_a_large_jump(tmp_path):
     assert streaming.sha256(source) == args.input_sha256
 
 
-def test_terminal_duplicates_are_allowed_and_preserved(tmp_path):
+def test_terminal_duplicates_are_allowed_and_removed(tmp_path):
     source = tmp_path / "source.sqlite"
     duplicate_point_database(source)
     with sqlite3.connect(source) as connection:
@@ -405,7 +411,7 @@ def test_terminal_duplicates_are_allowed_and_preserved(tmp_path):
     streaming.build_compact_database(args)
     streaming.scan_archive(args, streaming.QCConfig())
     result = streaming.materialize(args)
-    assert result["cleaned_rows"] == 5
+    assert result["cleaned_rows"] == 3
     assert result["duplicate_point_assignments"] == 2
     assert result["misplaced_is_last_markers"] == 0
 
@@ -469,7 +475,7 @@ def test_resume_rolls_back_audit_ahead_of_checkpoint(tmp_path):
     result = streaming.materialize(args)
     assert metadata["stats"]["links"] == 20
     assert result["break_assignments"] == 1
-    assert result["cleaned_rows"] == 30
+    assert result["cleaned_rows"] == 29
 
 
 def test_partial_replay_cannot_publish_stale_completion_metadata(tmp_path):
@@ -489,5 +495,49 @@ def test_partial_replay_cannot_publish_stale_completion_metadata(tmp_path):
     metadata = streaming.scan_archive(args, streaming.QCConfig())
     assert metadata["status"] == "partial"
     with pytest.raises(ValueError, match="Scan must be complete"):
+        streaming.materialize(args)
+    assert not args.cleaned_output.exists()
+
+
+@pytest.mark.parametrize('kind', ['seed', 'all_rejected', 'accepted'])
+def test_singleton_removal_accounts_for_every_source_row_and_vector(tmp_path, kind):
+    source = tmp_path / 'raw.sqlite'
+    with sqlite3.connect(source) as con:
+        con.execute('CREATE TABLE fixture (image_id INTEGER, trajectory_id INTEGER, '
+                    'is_last INTEGER, geometry TEXT, time TEXT, corr REAL, interpolated INTEGER)')
+        rows = [(1, 0, 1, 'POINT (0 0)', '2024-01-01', 0.7, 0)]
+        if kind != 'seed':
+            rows[0] = (1, 0, 0, 'POINT (0 0)', '2024-01-01', 0.7, 0)
+            x = 70000 if kind == 'all_rejected' else 100
+            rows.append((2, 0, 1, f'POINT ({x} 0)', '2024-01-02', 0.7, 0))
+        con.executemany('INSERT INTO fixture VALUES (?,?,?,?,?,?,?)', rows)
+    args = arguments(source, tmp_path / 'work')
+    streaming.build_compact_database(args)
+    metadata = streaming.scan_archive(args, streaming.QCConfig())
+    result = streaming.materialize(args)
+    assert result['source_rows'] == result['cleaned_rows'] + result['removed_singleton_rows']
+    assert result['remaining_singleton_trajectories'] == 0
+    assert result['retained_vectors'] == metadata['stats']['links'] - metadata['stats']['rejected']
+    assert result['cleaned_rows'] == (2 if kind == 'accepted' else 0)
+    with sqlite3.connect(args.cleaned_output) as con:
+        removed = con.execute('SELECT source_rowid FROM qc_removed_singletons ORDER BY source_rowid').fetchall()
+    assert removed == ([] if kind == 'accepted' else [(i+1,) for i in range(len(rows))])
+    assert streaming.sha256(source) == args.input_sha256
+
+
+@pytest.mark.parametrize("field,value", [
+    ("protocol_id", "limosat_trajectory_link_qc_v2_20260907"),
+    ("protocol_sha256", "0" * 64),
+])
+def test_materialization_refuses_mismatched_protocol(tmp_path, field, value):
+    source = tmp_path / 'raw.sqlite'
+    fixture_database(source)
+    args = arguments(source, tmp_path / 'work')
+    streaming.build_compact_database(args)
+    streaming.scan_archive(args, streaming.QCConfig())
+    with sqlite3.connect(args.output_dir / 'qc_analysis.sqlite') as con:
+        con.execute('UPDATE qc_metadata SET value_json=? WHERE key=?',
+                    (json.dumps(value), field))
+    with pytest.raises(ValueError, match='protocol'):
         streaming.materialize(args)
     assert not args.cleaned_output.exists()

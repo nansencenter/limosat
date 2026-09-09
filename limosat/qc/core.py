@@ -13,8 +13,8 @@ import pandas as pd
 from scipy.spatial import Delaunay, QhullError, cKDTree
 
 
-PROTOCOL_ID = "limosat_trajectory_link_qc_v2_20260907"
-PROTOCOL_PATH = Path(__file__).resolve().parent / "protocols" / "trajectory_link_qc_v2.json"
+PROTOCOL_ID = "limosat_trajectory_link_qc_v1"
+PROTOCOL_PATH = Path(__file__).resolve().parent / "protocols" / "trajectory_link_qc_v1.json"
 FROZEN_CONFIG_FIELDS = (
     "search_radius_m",
     "max_neighbors",
