@@ -1,8 +1,8 @@
 # Trajectory quality control
 
 QC checks drift vectors after tracking finishes and writes a separate SQLite
-database. Rejected vectors split trajectories; all keypoints are preserved and
-the original database is unchanged.
+database. Rejected vectors split trajectories. Segments with only one keypoint
+are removed from the cleaned trajectory table; the original database is unchanged.
 
 ## Run QC
 
@@ -33,7 +33,7 @@ QC checks actual-gap speed and displacement consistency with nearby vectors
 from the same source and target images. Large local discrepancies can be
 rejected using additional speed or geometric checks. Review flags retain the
 vector for inspection. Exact rules and thresholds are defined in the
-[QC protocol](../limosat/qc/protocols/trajectory_link_qc_v2.json).
+[QC protocol](../limosat/qc/protocols/trajectory_link_qc_v3.json).
 
 Both directly matched and interpolated vectors are checked. Where neighbour
 support is insufficient, only the absolute speed limit of 60,000 m/day applies.
@@ -54,3 +54,30 @@ checkpoints cannot be reused after changing the code or protocol.
 
 To extend tracking, use the original database and template Zarr store, then run
 QC again. The QC database is an analysis output and cannot resume tracking.
+
+## Singleton removal (protocol v3)
+
+After splitting rejected vectors and assigning duplicate observations, the
+finalizer removes every one-keypoint segment, including isolated input seeds,
+duplicate singletons, and singletons created by QC breaks. Segments with at
+least two keypoints remain, preserving their rowids and accepted drift vectors.
+An output with no retained trajectories is valid and explicitly counted.
+
+The output table `qc_removed_singletons` records removed source rowids and
+post-split trajectory IDs. Original observations remain in the raw database.
+Convergence references to removed singleton segments are set to NULL; their
+previous targets are recorded in `qc_cleared_convergence`. Existing break and
+duplicate assignment tables remain provenance records, including assignments
+to segments that have subsequently been removed.
+
+Publication checks require `source_rows = cleaned_rows + removed_singleton_rows`,
+zero `remaining_singleton_trajectories`, and `retained_vectors` equal to scanned
+vectors minus rejected vectors. The manifest also records
+`cleared_convergence_references`. Consumers that require source and cleaned row
+counts to be equal must adopt this accounting before using v3 products.
+
+V3 changes finalization only: vector scoring thresholds and rejection decisions
+are unchanged from v2. The v1/v2 protocol files and previously generated products
+remain unchanged. Use new work/output paths and rerun with the v3 protocol;
+materialization refuses scans produced under an older protocol. Existing QC
+databases are not migrated in place.

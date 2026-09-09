@@ -208,3 +208,15 @@ def test_orientation_diagnostic_detects_and_removes_fold():
 
     assert before["topology_flip_count"].sum() > 0
     assert after["topology_flip_count"].sum() == 0
+
+
+def test_v3_keeps_v2_vector_scoring_rules():
+    import json
+
+    previous = json.loads((qc.PROTOCOL_PATH.parent / "trajectory_link_qc_v2.json").read_text())
+    current = qc.load_protocol()
+    for field in ("parameters", "neighbour_model", "automatic_rejection", "retained_for_review",
+                  "not_used_for_rejection", "archive_prescreen"):
+        assert current[field] == previous[field]
+    assert current["protocol_id"] != previous["protocol_id"]
+    assert current["split_semantics"]["minimum_segment_points"] == 2
