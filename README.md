@@ -52,6 +52,13 @@ Rejected vectors split trajectories without deleting keypoints or modifying the
 original database. See the [trajectory QC guide](docs/trajectory_qc.md) for usage
 and limitations.
 
+## Publish frozen QC releases
+
+The compact public trajectory-extension dataset is generated only after QC
+materialization. It is an ordinary Parquet table (not GeoParquet) containing
+accepted consecutive trajectory extensions and an adjacent integrity manifest.
+See [the published-trajectory data dictionary and commands](docs/published_trajectories.md).
+
 ## License
 
 This project is licensed under the MIT License. See the LICENSE file for details.
