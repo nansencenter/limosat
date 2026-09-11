@@ -79,6 +79,13 @@ effective speed setting. Rejected vectors split trajectories without deleting
 point rows. The output includes a decision audit and integrity manifest.
 See [the trajectory-QC deployment contract](docs/trajectory_qc.md).
 
+## Publish frozen QC releases
+
+The compact public trajectory-extension dataset is generated only after QC
+materialization. It is an ordinary Parquet table (not GeoParquet) containing
+accepted consecutive trajectory extensions and an adjacent integrity manifest.
+See [the published-trajectory data dictionary and commands](docs/published_trajectories.md).
+
 ## License
 
 This project is licensed under the MIT License. See the LICENSE file for details.
