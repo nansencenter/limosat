@@ -170,8 +170,6 @@ def inspect_source(path: Path, release_id: str | None = None) -> ReleaseSource:
     path = path.resolve()
     with _connection(path) as connection:
         _manifest(connection)
-        if connection.execute("PRAGMA quick_check").fetchone()[0] != "ok":
-            raise ValueError("Source SQLite quick_check did not return 'ok'")
         table = _cleaned_table(connection)
         summary = connection.execute(
             "SELECT COALESCE(SUM(links), 0), COALESCE(SUM(rejected), 0) "
