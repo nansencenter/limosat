@@ -52,6 +52,59 @@ class TrajectoryPoint:
 
 
 @dataclass(frozen=True)
+class TrajectoryExtension:
+    """One directly measured source-to-target trajectory extension."""
+
+    trajectory_id: str
+    pair_id: str
+    pair_kind: str
+    source_image_id: str
+    target_image_id: str
+    start_time_utc: datetime
+    end_time_utc: datetime
+    x0_m: float
+    y0_m: float
+    x1_m: float
+    y1_m: float
+    target_state: str
+    target_position_basis: str
+    selected_matches: float
+    support_radius_m: float
+    maximum_residual_m: float
+
+    def __post_init__(self) -> None:
+        start = _utc(self.start_time_utc, "start_time_utc")
+        end = _utc(self.end_time_utc, "end_time_utc")
+        object.__setattr__(self, "start_time_utc", start)
+        object.__setattr__(self, "end_time_utc", end)
+        if end <= start:
+            raise ValueError("trajectory extension time must increase")
+        if self.pair_kind not in {"primary", "recovery"}:
+            raise ValueError(f"unknown trajectory extension kind: {self.pair_kind}")
+        if not np.isfinite([self.x0_m, self.y0_m, self.x1_m, self.y1_m]).all():
+            raise ValueError("trajectory extension coordinates must be finite")
+
+    @property
+    def elapsed_seconds(self) -> float:
+        return (self.end_time_utc - self.start_time_utc).total_seconds()
+
+    @property
+    def displacement_m(self) -> np.ndarray:
+        return np.asarray(
+            [self.x1_m - self.x0_m, self.y1_m - self.y0_m],
+            dtype=np.float64,
+        )
+
+
+@dataclass(frozen=True)
+class TrajectoryBatch:
+    """Per-image points and their directly measured incoming extensions."""
+
+    points: tuple[TrajectoryPoint, ...]
+    extensions: tuple[TrajectoryExtension, ...]
+
+
+@dataclass(frozen=True)
 class ConvergenceEvent:
     """Non-destructive evidence that two measured parcel positions converge."""
 
@@ -91,13 +144,13 @@ def compose_global_trajectories(
     )
 
 
-def iter_global_trajectory_points(
+def iter_global_trajectory_batches(
     edges: Sequence[FieldEdge],
     images: Sequence[ImageRecord],
     field_config: FieldConfig,
     trajectory_config: TrajectoryConfig,
-) -> Iterator[tuple[TrajectoryPoint, ...]]:
-    """Yield deterministic per-image rows while retaining only needed positions."""
+) -> Iterator[TrajectoryBatch]:
+    """Yield deterministic points and direct extensions for each image."""
     ordered_images = tuple(
         sorted(images, key=lambda image: (image.time_utc, image.image_id))
     )
@@ -134,6 +187,7 @@ def iter_global_trajectory_points(
 
     for step, image in enumerate(ordered_images):
         points: list[TrajectoryPoint] = []
+        extensions: list[TrajectoryExtension] = []
         if step:
             incoming = incoming_by_target.get(step, ())
             eligible = sorted(
@@ -153,10 +207,8 @@ def iter_global_trajectory_points(
                         _point(identity, image, "dormant", "missing", None, None)
                     )
                     continue
-                xy = (
-                    positions[continuation.source_step][identity]
-                    + continuation.displacement_m
-                )
+                source_xy = positions[continuation.source_step][identity]
+                xy = source_xy + continuation.displacement_m
                 positions[step][identity] = xy
                 state = (
                     "reappeared"
@@ -176,6 +228,29 @@ def iter_global_trajectory_points(
                         continuation.maximum_residual_m,
                     )
                 )
+                source_image = ordered_images[continuation.source_step]
+                extensions.append(
+                    TrajectoryExtension(
+                        trajectory_id=identity,
+                        pair_id=continuation.edge.field.pair_id,
+                        pair_kind=continuation.edge.pair_kind,
+                        source_image_id=source_image.image_id,
+                        target_image_id=image.image_id,
+                        start_time_utc=source_image.time_utc,
+                        end_time_utc=image.time_utc,
+                        x0_m=float(source_xy[0]),
+                        y0_m=float(source_xy[1]),
+                        x1_m=float(xy[0]),
+                        y1_m=float(xy[1]),
+                        target_state=state,
+                        target_position_basis=(
+                            f"{continuation.edge.pair_kind}_pair_field"
+                        ),
+                        selected_matches=continuation.selected_matches,
+                        support_radius_m=continuation.support_radius_m,
+                        maximum_residual_m=continuation.maximum_residual_m,
+                    )
+                )
 
         if trajectory_config.add_as_coverage_enters:
             candidates = _outgoing_primary_points(indexed, step)
@@ -193,17 +268,36 @@ def iter_global_trajectory_points(
                 points.append(
                     _point(identity, image, "created", "seed_grid", xy, None)
                 )
-        yield tuple(
-            sorted(
-                points,
-                key=lambda point: point.trajectory_id,
-            )
+        yield TrajectoryBatch(
+            points=tuple(sorted(points, key=lambda point: point.trajectory_id)),
+            extensions=tuple(
+                sorted(
+                    extensions,
+                    key=lambda extension: (
+                        extension.trajectory_id,
+                        extension.pair_id,
+                    ),
+                )
+            ),
         )
         for source_step, target_step in tuple(last_use.items()):
             if target_step == step:
                 positions[source_step].clear()
         if step not in last_use:
             positions[step].clear()
+
+
+def iter_global_trajectory_points(
+    edges: Sequence[FieldEdge],
+    images: Sequence[ImageRecord],
+    field_config: FieldConfig,
+    trajectory_config: TrajectoryConfig,
+) -> Iterator[tuple[TrajectoryPoint, ...]]:
+    """Yield deterministic per-image rows while retaining only needed positions."""
+    for batch in iter_global_trajectory_batches(
+        edges, images, field_config, trajectory_config
+    ):
+        yield batch.points
 
 
 def build_trajectories(
@@ -582,6 +676,12 @@ def _continuation_key(candidate: _Continuation) -> tuple:
 
 def _reverse_text(value: str) -> tuple[int, ...]:
     return tuple(-ord(character) for character in value)
+
+
+def _utc(value: datetime, name: str) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{name} must be timezone-aware")
+    return value.astimezone(timezone.utc)
 
 
 def _outgoing_primary_points(indexed, source_step: int) -> np.ndarray:

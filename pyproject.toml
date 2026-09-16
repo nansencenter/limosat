@@ -27,6 +27,7 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest"]
+parquet = ["pyarrow"]
 
 [project.scripts]
 limosat = "limosat.cli:main"

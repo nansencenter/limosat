@@ -11,6 +11,7 @@ from .catalog import load_catalogue
 from .config import load_config
 from .finalize import finalize_products
 from .pair_products import PairProductStore
+from .compose import compose_primary_parquet
 from .planning import build_candidate_plan, recovery_candidates, select_overlap_probe
 from .run import LiMOSATRun
 from .stages import RunStages
@@ -40,6 +41,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     compose.add_argument("config", type=Path)
     compose.add_argument("--phase", choices=("primary", "final"), required=True)
+    compose_parquet = commands.add_parser(
+        "compose-parquet",
+        help="compose primary trajectories directly from pair products to Parquet",
+    )
+    compose_parquet.add_argument("config", type=Path)
+    compose_parquet.add_argument("output_directory", type=Path)
     status = commands.add_parser("status", help="show durable local run state")
     status.add_argument("config", type=Path)
     plan = commands.add_parser(
@@ -91,6 +98,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 arguments.phase,
             ],
         )
+    elif arguments.command == "compose-parquet":
+        result = compose_primary_parquet(config, arguments.output_directory)
     elif arguments.command == "status":
         result = RunStore(config, read_only=True).status()
         products = PairProductStore(config)

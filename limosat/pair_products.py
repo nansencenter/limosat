@@ -30,6 +30,7 @@ class PairProduct:
     path: Path
     sha256: str
     content_sha256: str
+    producer_implementation_sha256: str
 
 
 class PairProductStore:
@@ -167,8 +168,15 @@ class PairProductStore:
         kind: str,
         targeted: bool,
         targeted_positions_xy_m: np.ndarray | None = None,
+        *,
+        require_current_implementation: bool = True,
     ) -> PairProduct | None:
-        """Load a completed pair product, or ``None`` without a marker."""
+        """Load a completed pair product, or ``None`` without a marker.
+
+        Pair workers require an exact implementation match when resuming their
+        own output.  Downstream readers may accept a different implementation
+        while retaining the producer hash in their own manifest.
+        """
         data_path, marker_path = self._paths(pair.pair_id, kind)
         if not marker_path.exists():
             return None
@@ -189,11 +197,15 @@ class PairProductStore:
         }
         if marker_content_sha256 != _metadata_sha256(marker_content):
             raise ValueError(f"pair product marker failed checksum: {pair.pair_id}")
+        producer_implementation_sha256 = metadata.get("implementation_sha256")
+        if not _is_sha256(producer_implementation_sha256):
+            raise ValueError(
+                f"pair product producer hash is invalid: {pair.pair_id}"
+            )
         expected = {
             "pair_product_schema_version": PAIR_PRODUCT_SCHEMA_VERSION,
             "run_id": self.config.run_id,
             "config_sha256": self.config.sha256,
-            "implementation_sha256": self.implementation_sha256,
             "model_sha256": self.model_sha256,
             "pair_id": pair.pair_id,
             "kind": kind,
@@ -207,6 +219,8 @@ class PairProductStore:
                 targeted_positions_xy_m
             ),
         }
+        if require_current_implementation:
+            expected["implementation_sha256"] = self.implementation_sha256
         changed = [
             name for name, value in expected.items() if metadata.get(name) != value
         ]
@@ -248,6 +262,7 @@ class PairProductStore:
             data_path,
             data_sha256,
             content_sha256,
+            producer_implementation_sha256,
         )
 
     def count(self, kind: str) -> int:
@@ -368,6 +383,14 @@ def _metadata_sha256(metadata: dict) -> str:
         allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 _ARRAY_NAMES = (

@@ -164,6 +164,28 @@ def test_pair_product_round_trip_is_checked_and_immutable(tmp_path):
         products.load(pair, "primary", False)
 
 
+def test_downstream_pair_reader_retains_a_different_producer_hash(tmp_path):
+    cfg = config(tmp_path)
+    pair = catalogue(tmp_path).adjacent_pairs("component")[0]
+    products = PairProductStore(cfg)
+    saved = products.save(pair, "primary", False, result(pair))
+    producer_hash = saved.producer_implementation_sha256
+
+    products.implementation_sha256 = "f" * 64
+    with pytest.raises(ValueError, match="implementation_sha256"):
+        products.load(pair, "primary", False)
+
+    loaded = products.load(
+        pair,
+        "primary",
+        False,
+        require_current_implementation=False,
+    )
+    assert loaded is not None
+    assert loaded.producer_implementation_sha256 == producer_hash
+    assert loaded.result.field.checksum == saved.result.field.checksum
+
+
 def test_recovery_product_is_bound_to_measured_source_positions(tmp_path):
     cfg = config(tmp_path)
     images = catalogue(tmp_path).chronological()
