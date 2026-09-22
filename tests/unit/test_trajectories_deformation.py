@@ -283,7 +283,9 @@ def test_boundary_reappearance_continues_only_into_frozen_dormant_entries():
     primary = FieldEdge(_field("c", "d", 2, [100., 0.],
                                points=geometry + [100., 0.]))
     additions = tuple(point for batch in iter_frozen_primary_augmentations(
-        batches, (recovery, primary), images, FieldConfig()) for point in batch)
+        batches, (recovery, primary), images,
+        FieldConfig(grid_spacing_m=4_000.0, maximum_triangle_edge_m=6_400.0)
+    ) for point in batch)
     assert len(additions) == 6
     by_key = {(p.trajectory_id, p.image_id): p for p in additions}
     assert by_key[("parcel-d", "c")].position_basis == "recovery_pair_field"
@@ -301,7 +303,9 @@ def test_supported_boundary_seed_gets_a_primary_measurement():
     geometry = np.array([[0., 0.], [4000., 0.], [8000., 0.], [0., 4000.]])
     edge = FieldEdge(_field("a", "b", 0, [100., 0.], points=geometry))
     points = build_trajectories([edge], _images(("a", "b")),
-                                FieldConfig(), TrajectoryConfig())
+                                FieldConfig(grid_spacing_m=4_000.0,
+                                            maximum_triangle_edge_m=6_400.0),
+                                TrajectoryConfig())
     observed = [p for p in points if p.state == "observed"]
     assert len(observed) == 3
     assert any(p.x_m == 100. and p.y_m == 4000. for p in observed)
@@ -317,7 +321,10 @@ def test_recovered_boundary_candidate_uses_existing_source_time_ranking():
     newer = FieldEdge(_field("b", "c", 1, [200., 0.], points=geometry))
     for incoming in [((0, 2, older), (1, 2, newer)),
                      ((1, 2, newer), (0, 2, older))]:
-        chosen = _supported_continuations(incoming, positions, ids, FieldConfig())
+        chosen = _supported_continuations(
+            incoming, positions, ids,
+            FieldConfig(grid_spacing_m=4_000.0, maximum_triangle_edge_m=6_400.0),
+        )
         assert chosen["parcel-d"].edge is newer
         np.testing.assert_array_equal(chosen["parcel-d"].displacement_m, [200., 0.])
         assert "parcel-c" not in chosen

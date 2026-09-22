@@ -117,7 +117,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         candidate_plan = build_candidate_plan(
             catalogue,
             config.routing,
-            grid_spacing_m=config.field.grid_spacing_m,
+            grid_spacing_m=config.routing.planning_grid_spacing_m,
             maximum_speed_m_per_day=config.matcher.maximum_speed_m_per_day,
         )
         pairs = candidate_plan.pairs

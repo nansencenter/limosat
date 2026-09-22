@@ -63,12 +63,12 @@ class MatcherConfig:
 class FieldConfig:
     """Pair-field consensus settings; every distance is in metres."""
 
-    grid_spacing_m: float = 4_000.0
+    grid_spacing_m: float = 2_000.0
     neighbour_count: int = 12
     minimum_agreeing_matches: int = 8
     maximum_neighbour_distance_m: float = 6_000.0
     agreement_distance_m: float = 1_000.0
-    maximum_triangle_edge_m: float = 6_400.0
+    maximum_triangle_edge_m: float = 3_200.0
 
     def __post_init__(self) -> None:
         _require_positive(asdict(self))
@@ -80,6 +80,7 @@ class FieldConfig:
 class RoutingConfig:
     """Causal pair routing and measured-loss recovery settings."""
 
+    planning_grid_spacing_m: float = 4_000.0
     mode: Literal["same_center", "sequential", "sequential_local"] = (
         "sequential_local"
     )
@@ -104,6 +105,8 @@ class RoutingConfig:
     coarse_support_radius_m: float = 35_840.0
 
     def __post_init__(self) -> None:
+        if not 0 < self.planning_grid_spacing_m < float("inf"):
+            raise ValueError("planning_grid_spacing_m must be finite and positive")
         if not isinstance(self.coarse_matching, bool):
             raise ValueError("coarse_matching must be a boolean")
         for name in ("coarse_pixel_size_m", "coarse_support_radius_m"):

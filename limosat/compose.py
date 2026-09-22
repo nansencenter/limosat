@@ -54,7 +54,7 @@ def compose_primary_parquet(
     plan = build_candidate_plan(
         catalogue,
         config.routing,
-        grid_spacing_m=config.field.grid_spacing_m,
+        grid_spacing_m=config.routing.planning_grid_spacing_m,
         maximum_speed_m_per_day=config.matcher.maximum_speed_m_per_day,
     )
     primary = tuple(item for item in plan.pairs if item.selection == "primary")

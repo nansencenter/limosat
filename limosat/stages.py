@@ -77,7 +77,7 @@ class RunStages:
         plan = build_candidate_plan(
             self.catalogue,
             self.config.routing,
-            grid_spacing_m=self.config.field.grid_spacing_m,
+            grid_spacing_m=self.config.routing.planning_grid_spacing_m,
             maximum_speed_m_per_day=self.config.matcher.maximum_speed_m_per_day,
         )
         store = RunStore(self.config)

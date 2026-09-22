@@ -6,6 +6,7 @@ import pytest
 
 from limosat import (
     DisplacementField,
+    FieldConfig,
     ImageCatalogue,
     ImageRecord,
     MatcherConfig,
@@ -82,6 +83,10 @@ def test_matcher_defaults_retain_selected_scientific_values():
 
 def test_global_planning_defaults_are_explicit():
     routing = RoutingConfig()
+    field = FieldConfig()
+    assert field.grid_spacing_m == 2_000.0
+    assert field.maximum_triangle_edge_m == 3_200.0
+    assert routing.planning_grid_spacing_m == 4_000.0
     assert routing.candidate_minimum_elapsed_hours == 1.0
     assert routing.candidate_maximum_elapsed_hours == 96.0
     assert routing.candidate_minimum_overlap_fraction == 0.05
@@ -92,6 +97,8 @@ def test_global_planning_defaults_are_explicit():
     assert routing.primary_maximum_pairs_per_target is None
     with pytest.raises(ValueError, match="primary_maximum_pairs_per_target"):
         RoutingConfig(primary_maximum_pairs_per_target=0)
+    with pytest.raises(ValueError, match="planning_grid_spacing_m"):
+        RoutingConfig(planning_grid_spacing_m=0)
     with pytest.raises(ValueError, match="cannot be combined"):
         RoutingConfig(
             primary_maximum_pairs_per_target=2,
