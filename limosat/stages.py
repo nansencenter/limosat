@@ -8,6 +8,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Sequence
 
 import numpy as np
@@ -21,6 +22,7 @@ from .models import FieldEdge
 from .pair_products import PAIR_PRODUCT_SCHEMA_VERSION, PairProductStore
 from .pairs import PairProcessor
 from .planning import PlannedPair, build_candidate_plan, recovery_candidates
+from .recovery import RecoveryTargetStore, load_recovery_target_manifest
 from .store import RunStore
 from .trajectory import (
     TrajectoryPoint,
@@ -100,22 +102,76 @@ class RunStages:
         *,
         batch_index: int = 0,
         batch_count: int = 1,
+        recovery_target_directory: str | None = None,
     ) -> dict:
         """Measure one deterministic batch and publish immutable pair products."""
         _validate_batch(batch_index, batch_count)
-        store = RunStore(self.config, read_only=True)
-        candidates = self._pair_candidates(store, kind)
-        selected = self._work(
-            store,
-            kind,
-            candidates=candidates,
-            batch_index=batch_index,
-            batch_count=batch_count,
-        )
+        if recovery_target_directory is not None:
+            if kind != "recovery":
+                raise ValueError("recovery targets apply only to recovery pairs")
+            store = None
+            plan = build_candidate_plan(
+                self.catalogue,
+                self.config.routing,
+                grid_spacing_m=self.config.routing.planning_grid_spacing_m,
+                maximum_speed_m_per_day=(
+                    self.config.matcher.maximum_speed_m_per_day
+                ),
+            )
+            candidates = recovery_candidates(
+                plan.pairs,
+                self.config.routing.maximum_recovery_elapsed_hours,
+            )
+            target_manifest = load_recovery_target_manifest(
+                self.config, recovery_target_directory
+            )
+            if target_manifest["eligible_recovery_pairs"] != len(candidates):
+                raise ValueError(
+                    "recovery target plan differs from current eligible pairs"
+                )
+            target_pair_ids = {
+                record["pair_id"] for record in target_manifest["pairs"]
+            }
+            eligible_pair_ids = {item.pair.pair_id for item in candidates}
+            if not target_pair_ids <= eligible_pair_ids:
+                raise ValueError(
+                    "recovery target manifest contains an ineligible pair"
+                )
+            targets = RecoveryTargetStore(
+                self.config, Path(recovery_target_directory) / "pairs"
+            )
+            assigned = (
+                item
+                for index, item in enumerate(candidates)
+                if index % batch_count == batch_index
+            )
+
+            def selected_work():
+                for item in assigned:
+                    if item.pair.pair_id not in target_pair_ids:
+                        continue
+                    positions = targets.load(item.pair)
+                    if positions is None:
+                        raise RuntimeError(
+                            f"recovery targets are missing: {item.pair.pair_id}"
+                        )
+                    yield PairWork(item, positions)
+
+            selected = selected_work()
+        else:
+            store = RunStore(self.config, read_only=True)
+            candidates = self._pair_candidates(store, kind)
+            selected = self._work(
+                store,
+                kind,
+                candidates=candidates,
+                batch_index=batch_index,
+                batch_count=batch_count,
+            )
 
         def obtain(item: PairWork) -> str:
             pair = item.planned.pair
-            if store.load_field(pair.pair_id) is not None:
+            if store is not None and store.load_field(pair.pair_id) is not None:
                 return "sqlite"
             completed = self.pair_products.load(
                 pair,

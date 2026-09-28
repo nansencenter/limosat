@@ -11,8 +11,9 @@ from .catalog import load_catalogue
 from .config import load_config
 from .finalize import finalize_products
 from .pair_products import PairProductStore
-from .compose import compose_primary_parquet
+from .compose import compose_primary_parquet, compose_recovery_parquet
 from .planning import build_candidate_plan, recovery_candidates, select_overlap_probe
+from .recovery import prepare_recovery_targets
 from .run import LiMOSATRun
 from .stages import RunStages
 from .store import RunStore
@@ -36,6 +37,11 @@ def build_parser() -> argparse.ArgumentParser:
     pairs.add_argument("--kind", choices=("primary", "recovery"), required=True)
     pairs.add_argument("--batch-index", type=int, default=0)
     pairs.add_argument("--batch-count", type=int, default=1)
+    pairs.add_argument(
+        "--recovery-targets",
+        type=Path,
+        help="SQLite-free recovery targets prepared from primary Parquet output",
+    )
     compose = commands.add_parser(
         "compose", help="import completed pair products and compose trajectories"
     )
@@ -47,6 +53,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     compose_parquet.add_argument("config", type=Path)
     compose_parquet.add_argument("output_directory", type=Path)
+    prepare_recovery = commands.add_parser(
+        "prepare-recovery-parquet",
+        help="derive immutable targeted-recovery coordinates from primary Parquet",
+    )
+    prepare_recovery.add_argument("config", type=Path)
+    prepare_recovery.add_argument("primary_composition_directory", type=Path)
+    prepare_recovery.add_argument("recovery_target_directory", type=Path)
+    prepare_recovery.add_argument(
+        "--requests", type=Path,
+        help="explicit pair and trajectory requests from an adaptive selection round",
+    )
+    compose_recovery = commands.add_parser(
+        "compose-recovery-parquet",
+        help="compose frozen-primary recovery deltas from completed pair products",
+    )
+    compose_recovery.add_argument("config", type=Path)
+    compose_recovery.add_argument("primary_composition_directory", type=Path)
+    compose_recovery.add_argument("recovery_target_directory", type=Path)
+    compose_recovery.add_argument("output_directory", type=Path)
     status = commands.add_parser("status", help="show durable local run state")
     status.add_argument("config", type=Path)
     plan = commands.add_parser(
@@ -86,6 +111,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.kind,
             batch_index=arguments.batch_index,
             batch_count=arguments.batch_count,
+            recovery_target_directory=(
+                str(arguments.recovery_targets)
+                if arguments.recovery_targets is not None
+                else None
+            ),
         )
     elif arguments.command == "compose":
         result = RunStages(config).compose(
@@ -100,6 +130,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     elif arguments.command == "compose-parquet":
         result = compose_primary_parquet(config, arguments.output_directory)
+    elif arguments.command == "prepare-recovery-parquet":
+        result = prepare_recovery_targets(
+            config,
+            arguments.primary_composition_directory,
+            arguments.recovery_target_directory,
+            request_plan=arguments.requests,
+        )
+    elif arguments.command == "compose-recovery-parquet":
+        result = compose_recovery_parquet(
+            config,
+            arguments.primary_composition_directory,
+            arguments.recovery_target_directory,
+            arguments.output_directory,
+        )
     elif arguments.command == "status":
         result = RunStore(config, read_only=True).status()
         products = PairProductStore(config)

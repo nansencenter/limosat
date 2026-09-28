@@ -152,6 +152,7 @@ class FieldEdge:
     field: DisplacementField
     pair_kind: Literal["primary", "recovery"] = "primary"
     skipped_images: int = 0
+    eligible_trajectory_ids: frozenset[str] | None = None
 
     def __post_init__(self) -> None:
         if self.pair_kind not in {"primary", "recovery"}:
@@ -160,6 +161,10 @@ class FieldEdge:
             raise ValueError("skipped_images cannot be negative")
         if self.pair_kind == "primary" and self.skipped_images:
             raise ValueError("primary pair fields cannot skip catalogue images")
+        if self.eligible_trajectory_ids is not None:
+            object.__setattr__(
+                self, "eligible_trajectory_ids", frozenset(self.eligible_trajectory_ids)
+            )
 
     @property
     def source_image_id(self) -> str:

@@ -336,17 +336,18 @@ def targeted_recovery_positions(
     )
 
 
-def iter_frozen_primary_augmentations(
+def iter_frozen_primary_augmentation_batches(
     primary_points_by_image: Iterable[Sequence[TrajectoryPoint]],
     edges: Sequence[FieldEdge],
     images: Sequence[ImageRecord],
     field_config: FieldConfig,
-) -> Iterator[tuple[TrajectoryPoint, ...]]:
-    """Yield measured additions without changing the primary row universe.
+) -> Iterator[TrajectoryBatch]:
+    """Yield measured point and extension deltas over frozen primary rows.
 
     A direct reappearance samples only a frozen primary coordinate.  A later
-    primary field can continue only that reappearance-derived coordinate into
-    an existing dormant entry.  Recovery fields never consume an augmentation.
+    primary field can continue only that reappearance-derived coordinate where
+    the frozen primary has no measurement. Recovery fields never consume an
+    augmentation.
     """
     ordered_images = tuple(
         sorted(images, key=lambda image: (image.time_utc, image.image_id))
@@ -417,24 +418,27 @@ def iter_frozen_primary_augmentations(
             for identity, point in primary_by_identity.items()
             if point.available
         }
-        dormant = sorted(
-            identity
-            for identity, point in primary_by_identity.items()
-            if point.state == "dormant"
-        )
+        measured = {
+            identity for identity, point in primary_by_identity.items()
+            if point.available
+        }
         updates: dict[str, TrajectoryPoint] = {}
+        extensions: list[TrajectoryExtension] = []
 
+        primary_eligible = sorted({
+            identity
+            for source_step, _target_step, _edge in primary_by_target.get(step, ())
+            for identity in augmented_positions[source_step]
+        } - measured)
         primary = _supported_continuations(
             primary_by_target.get(step, ()),
             augmented_positions,
-            dormant,
+            primary_eligible,
             field_config,
         )
         for identity, continuation in primary.items():
-            xy = (
-                augmented_positions[continuation.source_step][identity]
-                + continuation.displacement_m
-            )
+            source_xy = augmented_positions[continuation.source_step][identity]
+            xy = source_xy + continuation.displacement_m
             augmented_positions[step][identity] = xy
             updates[identity] = _point(
                 identity,
@@ -447,18 +451,33 @@ def iter_frozen_primary_augmentations(
                 continuation.support_radius_m,
                 continuation.maximum_residual_m,
             )
+            extensions.append(
+                _augmentation_extension(
+                    identity,
+                    continuation,
+                    ordered_images[continuation.source_step],
+                    image,
+                    source_xy,
+                    xy,
+                    "observed",
+                    "post_reappearance_primary_field",
+                )
+            )
 
+        recovery_eligible = sorted({
+            identity
+            for source_step, _target_step, _edge in recovery_by_target.get(step, ())
+            for identity in frozen_positions[source_step]
+        } - measured - updates.keys())
         recovery = _supported_continuations(
             recovery_by_target.get(step, ()),
             frozen_positions,
-            [identity for identity in dormant if identity not in updates],
+            recovery_eligible,
             field_config,
         )
         for identity, continuation in recovery.items():
-            xy = (
-                frozen_positions[continuation.source_step][identity]
-                + continuation.displacement_m
-            )
+            source_xy = frozen_positions[continuation.source_step][identity]
+            xy = source_xy + continuation.displacement_m
             augmented_positions[step][identity] = xy
             updates[identity] = _point(
                 identity,
@@ -471,8 +490,31 @@ def iter_frozen_primary_augmentations(
                 continuation.support_radius_m,
                 continuation.maximum_residual_m,
             )
+            extensions.append(
+                _augmentation_extension(
+                    identity,
+                    continuation,
+                    ordered_images[continuation.source_step],
+                    image,
+                    source_xy,
+                    xy,
+                    "reappeared",
+                    "recovery_pair_field",
+                )
+            )
 
-        yield tuple(updates[identity] for identity in sorted(updates))
+        yield TrajectoryBatch(
+            points=tuple(updates[identity] for identity in sorted(updates)),
+            extensions=tuple(
+                sorted(
+                    extensions,
+                    key=lambda extension: (
+                        extension.trajectory_id,
+                        extension.pair_id,
+                    ),
+                )
+            ),
+        )
 
         for source_step, target_step in tuple(primary_last_use.items()):
             if target_step == step:
@@ -490,6 +532,49 @@ def iter_frozen_primary_augmentations(
     except StopIteration:
         return
     raise ValueError("primary trajectory batches exceed the image chronology")
+
+
+def iter_frozen_primary_augmentations(
+    primary_points_by_image: Iterable[Sequence[TrajectoryPoint]],
+    edges: Sequence[FieldEdge],
+    images: Sequence[ImageRecord],
+    field_config: FieldConfig,
+) -> Iterator[tuple[TrajectoryPoint, ...]]:
+    """Compatibility iterator yielding only frozen-primary point updates."""
+    for batch in iter_frozen_primary_augmentation_batches(
+        primary_points_by_image, edges, images, field_config
+    ):
+        yield batch.points
+
+
+def _augmentation_extension(
+    identity: str,
+    continuation: _Continuation,
+    source_image: ImageRecord,
+    target_image: ImageRecord,
+    source_xy: np.ndarray,
+    target_xy: np.ndarray,
+    target_state: str,
+    target_position_basis: str,
+) -> TrajectoryExtension:
+    return TrajectoryExtension(
+        trajectory_id=identity,
+        pair_id=continuation.edge.field.pair_id,
+        pair_kind=continuation.edge.pair_kind,
+        source_image_id=source_image.image_id,
+        target_image_id=target_image.image_id,
+        start_time_utc=source_image.time_utc,
+        end_time_utc=target_image.time_utc,
+        x0_m=float(source_xy[0]),
+        y0_m=float(source_xy[1]),
+        x1_m=float(target_xy[0]),
+        y1_m=float(target_xy[1]),
+        target_state=target_state,
+        target_position_basis=target_position_basis,
+        selected_matches=continuation.selected_matches,
+        support_radius_m=continuation.support_radius_m,
+        maximum_residual_m=continuation.maximum_residual_m,
+    )
 
 
 def audit_trajectory_convergence(
@@ -637,7 +722,10 @@ def _supported_continuations(
     chosen: dict[str, _Continuation] = {}
     identity_set = set(identities)
     for source_step, _target_step, edge in incoming:
-        eligible = sorted(identity_set.intersection(positions[source_step]))
+        eligible_ids = identity_set.intersection(positions[source_step])
+        if edge.eligible_trajectory_ids is not None:
+            eligible_ids.intersection_update(edge.eligible_trajectory_ids)
+        eligible = sorted(eligible_ids)
         if not eligible:
             continue
         queries = np.vstack([positions[source_step][identity] for identity in eligible])

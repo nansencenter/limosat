@@ -5,6 +5,10 @@ and writes trajectory points and directly measured trajectory extensions without
 importing either product into SQLite. The command does not modify the native run
 database or the pair-product directory.
 
+The local field defaults are 4 km grid spacing and a 6.4 km maximum triangle
+edge; pair planning remains on a fixed 4 km grid. Recomposition of an existing
+archive must use that archive's frozen configuration, not current defaults.
+
 ```bash
 limosat compose-parquet CONFIG OUTPUT_DIRECTORY
 ```
@@ -45,6 +49,66 @@ only to the speed gate.
 The `accepted` column excludes only hard-speed failures. PySIDA and public
 exporters can select `accepted`, while validation can examine the review rows.
 
-This initial command composes primary trajectories. Recovery augmentation remains
-on the native composition path until the frozen-primary augmentation semantics
-are added to the Parquet implementation.
+## Targeted recovery
+
+Recovery uses the completed primary composition as an immutable reference. It
+does not rewrite primary trajectory identities or fields.
+
+The default target preparation preserves the earlier dormant-row policy.
+For adaptive rounds, pass a frozen JSON request plan with
+`pair_request_schema_version: 1`, `run_id`,
+`config_sha256`, `primary_composition_manifest_sha256`, and a `pairs` list of
+`{"pair_id": ..., "trajectory_ids": [...]}`. The requested source coordinates
+are read from the immutable primary Parquet, not trusted from the plan. An
+explicit request may target either a dormant row or no row; it cannot replace
+an existing measurement.
+
+```bash
+limosat prepare-recovery-parquet \
+  CONFIG PRIMARY_COMPOSITION_DIRECTORY RECOVERY_TARGET_DIRECTORY \
+  --requests REQUEST_PLAN.json
+```
+
+Each nonempty pair target is stored atomically and bound to the run
+configuration, image-pair identity, primary-composition checksum, requested
+trajectory identities and exact coordinate-array checksum. Composition applies
+each recovery field only to the identities bound to that target set; older
+target markers without identities must be regenerated. Recovery workers consume
+those targets without
+reading or writing SQLite:
+
+```bash
+limosat pairs CONFIG --kind recovery \
+  --recovery-targets RECOVERY_TARGET_DIRECTORY \
+  --batch-index 0 --batch-count 4
+```
+
+After every targeted recovery pair product is complete, compose delta products:
+
+```bash
+limosat compose-recovery-parquet \
+  CONFIG PRIMARY_COMPOSITION_DIRECTORY RECOVERY_TARGET_DIRECTORY OUTPUT_DIRECTORY
+```
+
+The recovery composer writes `trajectory-augmentations-v1.parquet`,
+`trajectory-augmentation-extensions-qc-v1.parquet`, and
+`recovery-composition-manifest-v1.json`. Consumers overlay augmentation points
+on primary points by `(trajectory_id, image_id)` and append augmentation
+extensions to primary extensions. Recovery fields sample only frozen primary
+coordinates, inserting a row if the frozen primary has none. Later primary
+fields may continue a recovered coordinate through dormant or absent rows,
+but a recovery field never consumes an earlier augmentation. Recovery products
+remain trajectory-only and are not deformation inputs.
+
+`limosat.pair_queue.choose_pair_batch` provides the provisional adaptive policy:
+each unresolved trajectory nominates its shortest unprocessed pair, pairs are
+ranked by how many trajectories nominated them, and every unresolved position
+eligible for a selected pair is submitted for field reuse. Reassess field
+support after each bounded round before selecting the next, then compose the
+saved products to measure actual trajectory-duration gains. This is not yet a
+validated production policy.
+The existing March 2020 frozen primary archive and newly targeted experiment
+products have different run configurations, so the branch recovery CLI cannot
+compose them together directly. The March experiment uses a separate bounded,
+resumable driver and a retrospective comparison; the same-configuration CLI
+above is for runs planned together from the outset.

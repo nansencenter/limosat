@@ -13,11 +13,17 @@ from .catalog import load_catalogue
 from .config import RunConfig
 from .models import FieldEdge
 from .pair_products import PAIR_PRODUCT_SCHEMA_VERSION, PairProductStore
-from .planning import build_candidate_plan
+from .planning import build_candidate_plan, recovery_candidates
 from .qc import QC_PROTOCOL_ID, ExtensionQCConfig, ScoredExtension, score_extensions
+from .recovery import (
+    RecoveryTargetStore,
+    iter_primary_point_batches,
+    load_recovery_target_manifest,
+)
 from .store import file_sha256
 from .trajectory import (
     TrajectoryPoint,
+    iter_frozen_primary_augmentation_batches,
     iter_global_trajectory_batches,
 )
 
@@ -25,6 +31,7 @@ from .trajectory import (
 COMPOSITION_SCHEMA_VERSION = 1
 TRAJECTORY_POINT_SCHEMA_VERSION = 1
 TRAJECTORY_EXTENSION_SCHEMA_VERSION = 1
+TRAJECTORY_AUGMENTATION_SCHEMA_VERSION = 1
 
 
 def compose_primary_parquet(
@@ -186,6 +193,244 @@ def compose_primary_parquet(
     }
 
 
+def compose_recovery_parquet(
+    config: RunConfig,
+    primary_composition: str | Path,
+    recovery_targets: str | Path,
+    destination: str | Path,
+    *,
+    qc_config: ExtensionQCConfig | None = None,
+) -> dict:
+    """Write frozen-primary recovery deltas without modifying primary artifacts."""
+    pa, pq = _pyarrow()
+    primary_root = Path(primary_composition)
+    targets_root = Path(recovery_targets)
+    output = Path(destination)
+    output.mkdir(parents=True, exist_ok=True)
+    points_path = output / "trajectory-augmentations-v1.parquet"
+    extensions_path = output / "trajectory-augmentation-extensions-qc-v1.parquet"
+    manifest_path = output / "recovery-composition-manifest-v1.json"
+    for path in (points_path, extensions_path, manifest_path):
+        if path.exists():
+            raise FileExistsError(path)
+
+    primary_manifest_path = primary_root / "composition-manifest-v1.json"
+    primary_manifest = json.loads(primary_manifest_path.read_text(encoding="utf-8"))
+    if primary_manifest.get("config_sha256") != config.sha256:
+        raise ValueError("primary composition configuration differs from recovery")
+    primary_points = primary_root / "trajectory-points-v1.parquet"
+    primary_extensions = primary_root / "trajectory-extensions-qc-v1.parquet"
+    for name, path in (
+        ("trajectory_points", primary_points),
+        ("trajectory_extensions", primary_extensions),
+    ):
+        if file_sha256(path) != primary_manifest["products"][name]["sha256"]:
+            raise ValueError(f"primary {name} failed manifest checksum")
+
+    target_manifest_path = targets_root / "recovery-targets-manifest-v1.json"
+    target_manifest = load_recovery_target_manifest(config, targets_root)
+    if target_manifest.get("primary_composition_manifest_sha256") != file_sha256(
+        primary_manifest_path
+    ):
+        raise ValueError("recovery targets refer to a different primary composition")
+
+    qc = qc_config or ExtensionQCConfig(
+        configured_speed_m_per_day=config.matcher.maximum_speed_m_per_day,
+        hard_speed_m_per_day=max(60_000.0, config.matcher.maximum_speed_m_per_day),
+    )
+    catalogue = load_catalogue(config.catalogue, config.analysis_epsg)
+    plan = build_candidate_plan(
+        catalogue,
+        config.routing,
+        grid_spacing_m=config.routing.planning_grid_spacing_m,
+        maximum_speed_m_per_day=config.matcher.maximum_speed_m_per_day,
+    )
+    primary = tuple(item for item in plan.pairs if item.selection == "primary")
+    eligible = recovery_candidates(
+        plan.pairs, config.routing.maximum_recovery_elapsed_hours
+    )
+    by_pair_id = {item.pair.pair_id: item for item in eligible}
+    if target_manifest.get("eligible_recovery_pairs") != len(eligible):
+        raise ValueError("recovery target plan differs from current eligible pairs")
+    target_pair_ids = [record["pair_id"] for record in target_manifest["pairs"]]
+    if len(target_pair_ids) != len(set(target_pair_ids)):
+        raise ValueError("recovery target manifest contains duplicate pairs")
+    targeted = []
+    for pair_id in target_pair_ids:
+        item = by_pair_id.get(pair_id)
+        if item is None:
+            raise ValueError(f"recovery target is not an eligible candidate: {pair_id}")
+        targeted.append(item)
+
+    products = PairProductStore(config)
+    target_store = RecoveryTargetStore(config, targets_root / "pairs")
+    primary_edges = []
+    recovery_edges = []
+    primary_producers: set[str] = set()
+    recovery_producers: set[str] = set()
+    recovery_product_set = hashlib.sha256()
+    target_set = hashlib.sha256()
+    for item in primary:
+        product = products.load(
+            item.pair, "primary", False, require_current_implementation=False
+        )
+        if product is None:
+            raise RuntimeError(f"primary pair product is missing: {item.pair.pair_id}")
+        primary_producers.add(product.producer_implementation_sha256)
+        primary_edges.append(FieldEdge(product.result.field))
+    target_records = {record["pair_id"]: record for record in target_manifest["pairs"]}
+    for item in targeted:
+        positions = target_store.load(item.pair)
+        if positions is None:
+            raise RuntimeError(f"recovery targets are missing: {item.pair.pair_id}")
+        record = target_records[item.pair.pair_id]
+        _data_path, marker_path = target_store.paths(item.pair.pair_id)
+        if (
+            record.get("target_count") != len(positions)
+            or record.get("marker_sha256") != file_sha256(marker_path)
+        ):
+            raise ValueError(
+                f"recovery target manifest record changed: {item.pair.pair_id}"
+            )
+        target_set.update(item.pair.pair_id.encode("utf-8"))
+        target_set.update(record["marker_sha256"].encode("ascii"))
+        product = products.load(
+            item.pair,
+            "recovery",
+            True,
+            positions,
+            require_current_implementation=False,
+        )
+        if product is None:
+            raise RuntimeError(f"recovery pair product is missing: {item.pair.pair_id}")
+        recovery_producers.add(product.producer_implementation_sha256)
+        recovery_product_set.update(item.pair.pair_id.encode("utf-8"))
+        recovery_product_set.update(product.sha256.encode("ascii"))
+        recovery_product_set.update(product.content_sha256.encode("ascii"))
+        recovery_edges.append(
+            FieldEdge(
+                product.result.field,
+                pair_kind="recovery",
+                skipped_images=item.skipped_images,
+                eligible_trajectory_ids=target_store.trajectory_ids(item.pair),
+            )
+        )
+    if target_set.hexdigest() != target_manifest.get("pair_target_set_sha256"):
+        raise ValueError("recovery target set failed manifest checksum")
+    if len(primary_producers) != 1 or len(recovery_producers) > 1:
+        raise ValueError("pair products have inconsistent producer implementations")
+
+    point_schema = _point_schema(pa, config, "trajectory_augmentations_v1")
+    extension_schema = _extension_schema(
+        pa, config, qc, "trajectory_augmentation_extensions_qc_v1"
+    )
+    point_temporary = _temporary(points_path)
+    extension_temporary = _temporary(extensions_path)
+    point_writer = pq.ParquetWriter(point_temporary, point_schema, compression="zstd")
+    extension_writer = pq.ParquetWriter(
+        extension_temporary, extension_schema, compression="zstd"
+    )
+    point_count = 0
+    extension_count = 0
+    point_states: Counter[str] = Counter()
+    point_bases: Counter[str] = Counter()
+    extension_kinds: Counter[str] = Counter()
+    qc_statuses: Counter[str] = Counter()
+    try:
+        batches = iter_primary_point_batches(
+            primary_points, catalogue.chronological()
+        )
+        for batch in iter_frozen_primary_augmentation_batches(
+            batches,
+            (*primary_edges, *recovery_edges),
+            catalogue.chronological(),
+            config.field,
+        ):
+            if batch.points:
+                point_writer.write_table(
+                    pa.Table.from_pylist(
+                        [_point_row(point) for point in batch.points],
+                        schema=point_schema,
+                    )
+                )
+                point_count += len(batch.points)
+                point_states.update(point.state for point in batch.points)
+                point_bases.update(point.position_basis for point in batch.points)
+            scored = score_extensions(batch.extensions, qc)
+            if scored:
+                extension_writer.write_table(
+                    pa.Table.from_pylist(
+                        [_extension_row(value) for value in scored],
+                        schema=extension_schema,
+                    )
+                )
+                extension_count += len(scored)
+                extension_kinds.update(value.extension.pair_kind for value in scored)
+                qc_statuses.update(value.qc_status for value in scored)
+        point_writer.close()
+        point_writer = None
+        extension_writer.close()
+        extension_writer = None
+        os.replace(point_temporary, points_path)
+        os.replace(extension_temporary, extensions_path)
+    finally:
+        if point_writer is not None:
+            point_writer.close()
+        if extension_writer is not None:
+            extension_writer.close()
+        point_temporary.unlink(missing_ok=True)
+        extension_temporary.unlink(missing_ok=True)
+
+    manifest = {
+        "composition_schema_version": COMPOSITION_SCHEMA_VERSION,
+        "trajectory_augmentation_schema_version": (
+            TRAJECTORY_AUGMENTATION_SCHEMA_VERSION
+        ),
+        "trajectory_extension_schema_version": TRAJECTORY_EXTENSION_SCHEMA_VERSION,
+        "qc_protocol_id": QC_PROTOCOL_ID,
+        "run_id": config.run_id,
+        "config_sha256": config.sha256,
+        "semantics": "frozen primary rows plus recovery and post-reappearance deltas",
+        "primary_composition_manifest": str(primary_manifest_path),
+        "primary_composition_manifest_sha256": file_sha256(primary_manifest_path),
+        "recovery_target_manifest": str(target_manifest_path),
+        "recovery_target_manifest_sha256": file_sha256(target_manifest_path),
+        "primary_producer_implementation_sha256": next(iter(primary_producers)),
+        "recovery_producer_implementation_sha256": (
+            next(iter(recovery_producers)) if recovery_producers else None
+        ),
+        "targeted_recovery_pair_products": len(targeted),
+        "recovery_pair_product_set_sha256": recovery_product_set.hexdigest(),
+        "qc": asdict(qc),
+        "counts": {
+            "trajectory_augmentations": point_count,
+            "trajectory_augmentation_states": dict(sorted(point_states.items())),
+            "trajectory_augmentation_position_bases": dict(sorted(point_bases.items())),
+            "trajectory_augmentation_extensions": extension_count,
+            "trajectory_augmentation_extension_kinds": dict(
+                sorted(extension_kinds.items())
+            ),
+            "extension_qc_status": dict(sorted(qc_statuses.items())),
+        },
+        "products": {
+            "trajectory_augmentations": _file_record(points_path),
+            "trajectory_augmentation_extensions": _file_record(extensions_path),
+        },
+    }
+    temporary_manifest = _temporary(manifest_path)
+    temporary_manifest.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary_manifest, manifest_path)
+    return {
+        "manifest": str(manifest_path),
+        "trajectory_augmentations": str(points_path),
+        "trajectory_augmentation_extensions": str(extensions_path),
+        "counts": manifest["counts"],
+    }
+
+
 def _point_row(point: TrajectoryPoint) -> dict:
     return {
         "trajectory_id": point.trajectory_id,
@@ -241,7 +486,9 @@ def _extension_row(value: ScoredExtension) -> dict:
     }
 
 
-def _point_schema(pa, config: RunConfig):
+def _point_schema(
+    pa, config: RunConfig, name: str = "trajectory_points_v1"
+):
     return pa.schema(
         [
             ("trajectory_id", pa.string()),
@@ -257,14 +504,19 @@ def _point_schema(pa, config: RunConfig):
             ("maximum_residual_m", pa.float64()),
         ],
         metadata=_metadata(
-            "trajectory_points_v1",
+            name,
             config,
             {},
         ),
     )
 
 
-def _extension_schema(pa, config: RunConfig, qc: ExtensionQCConfig):
+def _extension_schema(
+    pa,
+    config: RunConfig,
+    qc: ExtensionQCConfig,
+    name: str = "trajectory_extensions_qc_v1",
+):
     fields = [
         ("trajectory_id", pa.string()),
         ("pair_id", pa.string()),
@@ -303,7 +555,7 @@ def _extension_schema(pa, config: RunConfig, qc: ExtensionQCConfig):
     return pa.schema(
         fields,
         metadata=_metadata(
-            "trajectory_extensions_qc_v1",
+            name,
             config,
             {
                 "limosat.qc_protocol": QC_PROTOCOL_ID,

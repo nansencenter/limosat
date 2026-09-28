@@ -189,6 +189,70 @@ def test_frozen_augmentation_changes_only_dormant_entries_and_propagates_causall
             assert final_by_key[key] == point
 
 
+def test_missing_target_row_reappears_and_continues_without_replacing_measurements():
+    images = _images(("a", "b", "c", "d"))
+    seeds = tuple(
+        TrajectoryPoint(
+            f"parcel-{index}", "a", images[0].time_utc, "created", "seed_grid",
+            float(x), float(y), None,
+        )
+        for index, (x, y) in enumerate(GRID)
+    )
+    measured = TrajectoryPoint(
+        "parcel-0", "c", images[2].time_utc, "observed",
+        "primary_pair_field", 200.0, 0.0, "a__c",
+    )
+    batches = (seeds, (), (measured,), ())
+    recovery = FieldEdge(
+        _field("a", "c", 0, [200.0, 0.0], target_step=2),
+        pair_kind="recovery",
+    )
+    primary = FieldEdge(
+        _field("c", "d", 2, [100.0, 0.0], points=GRID + [200.0, 0.0])
+    )
+
+    additions = tuple(
+        point
+        for batch in iter_frozen_primary_augmentations(
+            batches, (recovery, primary), images, _settings()
+        )
+        for point in batch
+    )
+
+    assert len(additions) == 6
+    assert len({(point.trajectory_id, point.image_id) for point in additions}) == 6
+    assert all(point.trajectory_id != measured.trajectory_id for point in additions)
+    assert {point.position_basis for point in additions if point.image_id == "c"} == {
+        "recovery_pair_field"
+    }
+    assert {point.position_basis for point in additions if point.image_id == "d"} == {
+        "post_reappearance_primary_field"
+    }
+    assert all(point.x_m == seeds[int(point.trajectory_id[-1])].x_m +
+               (200.0 if point.image_id == "c" else 300.0)
+               for point in additions)
+
+
+def test_frozen_augmentation_respects_per_pair_submitted_identities():
+    images = _images(("a", "b"))
+    seeds = (
+        TrajectoryPoint("submitted", "a", images[0].time_utc, "created",
+                        "seed_grid", 0.0, 0.0, None),
+        TrajectoryPoint("not-submitted", "a", images[0].time_utc, "created",
+                        "seed_grid", 1_000.0, 0.0, None),
+    )
+    recovery = FieldEdge(
+        _field("a", "b", 0, [100.0, 0.0]),
+        pair_kind="recovery",
+        eligible_trajectory_ids=frozenset({"submitted"}),
+    )
+
+    additions = tuple(point for batch in iter_frozen_primary_augmentations(
+        (seeds, ()), (recovery,), images, _settings()) for point in batch)
+
+    assert [point.trajectory_id for point in additions] == ["submitted"]
+
+
 def test_reappearance_fields_never_chain_from_an_augmented_source_position():
     images = _images(("a", "b", "c", "d"))
     primary_edges = [
