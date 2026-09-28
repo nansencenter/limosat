@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .catalog import load_catalogue
 from .config import RunConfig
+from .field import field_edge_with_fallback
 from .models import FieldEdge
 from .pair_products import PAIR_PRODUCT_SCHEMA_VERSION, PairProductStore
 from .planning import build_candidate_plan, recovery_candidates
@@ -88,7 +89,9 @@ def compose_primary_parquet(
         product_set.update(item.pair.pair_id.encode("utf-8"))
         product_set.update(product.sha256.encode("ascii"))
         product_set.update(product.content_sha256.encode("ascii"))
-        edges.append(FieldEdge(product.result.field))
+        edges.append(field_edge_with_fallback(
+            product.result.field, product.result.matches, config.field
+        ))
     if len(producer_hashes) != 1:
         raise ValueError(
             "primary pair products have multiple producer implementations: "
@@ -277,7 +280,9 @@ def compose_recovery_parquet(
         if product is None:
             raise RuntimeError(f"primary pair product is missing: {item.pair.pair_id}")
         primary_producers.add(product.producer_implementation_sha256)
-        primary_edges.append(FieldEdge(product.result.field))
+        primary_edges.append(field_edge_with_fallback(
+            product.result.field, product.result.matches, config.field
+        ))
     target_records = {record["pair_id"]: record for record in target_manifest["pairs"]}
     for item in targeted:
         positions = target_store.load(item.pair)
@@ -308,8 +313,10 @@ def compose_recovery_parquet(
         recovery_product_set.update(product.sha256.encode("ascii"))
         recovery_product_set.update(product.content_sha256.encode("ascii"))
         recovery_edges.append(
-            FieldEdge(
+            field_edge_with_fallback(
                 product.result.field,
+                product.result.matches,
+                config.field,
                 pair_kind="recovery",
                 skipped_images=item.skipped_images,
                 eligible_trajectory_ids=target_store.trajectory_ids(item.pair),

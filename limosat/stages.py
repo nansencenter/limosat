@@ -17,6 +17,7 @@ from .catalog import ImageCatalogue, load_catalogue
 from .config import RunConfig
 from .deformation import deformation_from_field
 from .efficientloftr import EfficientLoFTR
+from .field import field_edge_with_fallback
 from .manifest import write_manifest
 from .models import FieldEdge
 from .pair_products import PAIR_PRODUCT_SCHEMA_VERSION, PairProductStore
@@ -313,14 +314,14 @@ class RunStages:
             )
 
         primary_edges = [
-            FieldEdge(self._required_field(store, item.pair.pair_id))
-            for item in primary
+            self._required_edge(store, item.pair.pair_id) for item in primary
         ]
         recovery_edges = []
         if recovery:
             recovery_edges.extend(
-                FieldEdge(
-                    self._required_field(store, item.pair.pair_id),
+                self._required_edge(
+                    store,
+                    item.pair.pair_id,
                     pair_kind="recovery",
                     skipped_images=item.skipped_images,
                 )
@@ -504,6 +505,15 @@ class RunStages:
         if field is None:
             raise RuntimeError(f"completed pair field is missing: {pair_id}")
         return field
+
+    def _required_edge(self, store: RunStore, pair_id: str, **options) -> FieldEdge:
+        field = self._required_field(store, pair_id)
+        if not self.config.field.missing_node_fallback:
+            return FieldEdge(field, **options)
+        matches = store.load_pair_matches(pair_id)
+        if matches is None:
+            raise RuntimeError(f"retained pair matches are missing: {pair_id}")
+        return field_edge_with_fallback(field, matches, self.config.field, **options)
 
     @staticmethod
     def _require_complete(

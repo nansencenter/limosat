@@ -86,6 +86,7 @@ def test_global_planning_defaults_are_explicit():
     field = FieldConfig()
     assert field.grid_spacing_m == 4_000.0
     assert field.maximum_triangle_edge_m == 6_400.0
+    assert field.missing_node_fallback is False
     assert routing.planning_grid_spacing_m == 4_000.0
     assert routing.candidate_minimum_elapsed_hours == 1.0
     assert routing.candidate_maximum_elapsed_hours == 96.0
@@ -105,6 +106,17 @@ def test_global_planning_defaults_are_explicit():
             candidate_pair_ids=("a__b",),
         )
     assert RunConfig("run", "catalogue", "database", "output").retain_pair_matches is False
+    assert "missing_node_fallback" not in RunConfig(
+        "run", "catalogue", "database", "output"
+    ).to_dict()["field"]
+    assert RunConfig(
+        "run", "catalogue", "database", "output",
+        field=FieldConfig(missing_node_fallback=True),
+        retain_pair_matches=True,
+    ).to_dict()["field"]["missing_node_fallback"] is True
+    with pytest.raises(ValueError, match="requires retain_pair_matches"):
+        RunConfig("run", "catalogue", "database", "output",
+                  field=FieldConfig(missing_node_fallback=True))
     with pytest.raises(ValueError, match="pair_workers"):
         RunConfig("run", "catalogue", "database", "output", pair_workers=0)
 

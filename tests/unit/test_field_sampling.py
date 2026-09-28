@@ -5,8 +5,15 @@ import numpy as np
 import pytest
 from scipy.spatial import Delaunay
 
-from limosat import DisplacementField
-from limosat.field import _recover_boundary_simplices, sample_field
+from limosat import DisplacementField, FieldConfig, MotionMatches
+from limosat.field import (
+    _recover_boundary_simplices,
+    field_edge_with_fallback,
+    missing_node_fallback_field,
+    sample_field,
+    sample_field_with_fallback,
+)
+from limosat.trajectory import _supported_continuations
 
 
 POINTS = np.array([[0., 0.], [4000., 0.], [8000., 0.], [0., 4000.]])
@@ -103,3 +110,53 @@ def test_missing_vertex_and_nonlocal_support_are_not_filled():
     assert not sample_field(field, POINTS, 6400.).available.any()
     assert not sample_field(boundary_field(), POINTS, 3999.).available.any()
     assert len(sample_field(boundary_field(), np.empty((0, 2)), 6400.).available) == 0
+
+
+def test_missing_node_fallback_extends_support_without_changing_existing_samples():
+    original = boundary_field()
+    points = np.array([
+        [0., 0.], [4000., 0.], [0., 4000.], [4000., 4000.],
+        [8000., 0.], [8000., 4000.],
+    ])
+    baseline = replace(
+        original,
+        grid_row=np.array([0, 0, 1, 1, 0, 1]),
+        grid_column=np.array([0, 1, 0, 1, 2, 2]),
+        source_xy_m=points,
+        displacement_m=np.vstack((original.displacement_m,
+                                  [[np.nan, np.nan], [np.nan, np.nan]])),
+        available=np.array([True, True, True, True, False, False]),
+        selected_matches=np.array([8, 10, 12, 14, 0, 0]),
+        candidate_matches=np.array([12, 12, 12, 12, 0, 0]),
+        support_radius_m=np.array([100., 200., 300., 400., np.nan, np.nan]),
+        maximum_residual_m=np.array([10., 20., 30., 40., np.nan, np.nan]),
+    )
+    offsets = np.array([[-100., -100.], [100., -100.], [-100., 100.],
+                        [100., 100.], [0., -150.], [0., 150.]])
+    sources = np.vstack((points[4] + offsets, points[5] + offsets))
+    matches = MotionMatches(
+        sources, sources + [200., 0.], np.ones(12),
+        np.arange(12, dtype=np.int32), np.arange(12, dtype=np.int32),
+    )
+    config = FieldConfig(missing_node_fallback=True)
+    fallback = missing_node_fallback_field(baseline, matches, config)
+    assert fallback.available.tolist() == [True] * 6
+    np.testing.assert_array_equal(fallback.displacement_m[:4], baseline.displacement_m[:4])
+
+    query = np.array([[2000., 2000.], [6000., 2000.]])
+    before = sample_field(baseline, query, 6400.)
+    combined = sample_field_with_fallback(baseline, fallback, query, 6400.)
+    assert before.available.tolist() == [True, False]
+    assert combined.available.tolist() == [True, True]
+    np.testing.assert_array_equal(combined.displacement_m[0], before.displacement_m[0])
+    assert np.isfinite(combined.displacement_m[1]).all()
+
+    edge = field_edge_with_fallback(baseline, matches, config)
+    assert edge.fallback_field is not None
+    chosen = _supported_continuations(
+        [(0, 1, edge)], [{"old": query[0], "new": query[1]}],
+        ["old", "new"], config,
+    )
+    assert set(chosen) == {"old", "new"}
+    np.testing.assert_array_equal(chosen["old"].displacement_m,
+                                  before.displacement_m[0])

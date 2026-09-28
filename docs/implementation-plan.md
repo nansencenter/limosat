@@ -118,7 +118,11 @@ builder before a production rebuild.
   baseline-preserving fallback: keep every baseline estimate unchanged, then
   evaluate local and sparse tiers only for missing field grid points. Report
   deformation on both identical cells and all newly created cells before
-  changing `FieldConfig` defaults.
+  changing `FieldConfig` defaults. The missing-only fallback is now available
+  as an opt-in trajectory-composition prototype (`field.missing_node_fallback:
+  true`, with `retain_pair_matches: true`). It samples the baseline first and
+  leaves deformation fields unchanged; CPU cost and new-vector accuracy still
+  need assessment before enabling it by default.
 
 ### P1 — required before full global trajectory acceptance
 

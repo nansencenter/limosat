@@ -69,9 +69,13 @@ class FieldConfig:
     maximum_neighbour_distance_m: float = 6_000.0
     agreement_distance_m: float = 1_000.0
     maximum_triangle_edge_m: float = 6_400.0
+    missing_node_fallback: bool = False
 
     def __post_init__(self) -> None:
-        _require_positive(asdict(self))
+        _require_positive({key: value for key, value in asdict(self).items()
+                           if key != "missing_node_fallback"})
+        if not isinstance(self.missing_node_fallback, bool):
+            raise ValueError("missing_node_fallback must be a boolean")
         if self.minimum_agreeing_matches > self.neighbour_count:
             raise ValueError("minimum_agreeing_matches exceeds neighbour_count")
 
@@ -235,9 +239,15 @@ class RunConfig:
             )
         if not self.catalogue or not self.database or not self.output_directory:
             raise ValueError("catalogue, database, and output_directory are required")
+        if self.field.missing_node_fallback and not self.retain_pair_matches:
+            raise ValueError("missing_node_fallback requires retain_pair_matches")
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        values = asdict(self)
+        if not self.field.missing_node_fallback:
+            # Keep existing run/product identities unchanged when this is off.
+            values["field"].pop("missing_node_fallback")
+        return values
 
     @property
     def pair_products(self) -> Path:

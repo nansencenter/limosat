@@ -30,6 +30,7 @@ field:
   maximum_neighbour_distance_m: 6000.0
   agreement_distance_m: 1000.0
   maximum_triangle_edge_m: 6400.0
+  missing_node_fallback: false  # opt in; requires retain_pair_matches: true
 
 routing:
   planning_grid_spacing_m: 4000.0

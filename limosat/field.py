@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import shapely
@@ -12,7 +12,7 @@ from shapely.geometry.base import BaseGeometry
 
 from .catalog import ImagePair
 from .config import FieldConfig
-from .models import DisplacementField, MotionMatches
+from .models import DisplacementField, FieldEdge, MotionMatches
 
 
 @dataclass(frozen=True)
@@ -93,6 +93,73 @@ def estimate_queries(
         residual[index] = np.linalg.norm(local[agreeing] - estimate, axis=1).max()
         available[index] = True
     return _estimates(displacement, available, selected, candidates, radius, residual)
+
+
+def missing_node_fallback_field(
+    baseline: DisplacementField, matches: MotionMatches, config: FieldConfig
+) -> DisplacementField:
+    """Add measured support only where the completed baseline field is missing."""
+    unresolved = np.flatnonzero(~baseline.available)
+    if not len(unresolved) or not len(matches):
+        return baseline
+    values = {
+        name: getattr(baseline, name).copy()
+        for name in (
+            "displacement_m", "available", "selected_matches", "candidate_matches",
+            "support_radius_m", "maximum_residual_m",
+        )
+    }
+    for neighbours, minimum, radius, agreement in (
+        (8, 6, 3_000.0, 750.0),
+        (16, 10, 8_000.0, 1_250.0),
+    ):
+        if not len(unresolved):
+            break
+        tier = replace(
+            config,
+            neighbour_count=neighbours,
+            minimum_agreeing_matches=minimum,
+            maximum_neighbour_distance_m=radius,
+            agreement_distance_m=agreement,
+        )
+        result = estimate_queries(matches, baseline.source_xy_m[unresolved], tier)
+        for name in values:
+            values[name][unresolved] = result[name]
+        unresolved = unresolved[~result["available"]]
+    if not np.any(values["available"] & ~baseline.available):
+        return baseline
+    trial = DisplacementField(**{**baseline.__dict__, **values})
+    available = trial.available.copy()
+    while True:
+        flipped = flipped_indices(trial.with_available(available),
+                                  config.maximum_triangle_edge_m)
+        if not len(flipped):
+            break
+        candidates = flipped[~baseline.available[flipped]]
+        if not len(candidates):
+            return baseline
+        available[candidates] = False
+    return trial.with_available(available) if np.any(
+        available & ~baseline.available
+    ) else baseline
+
+
+def field_edge_with_fallback(
+    baseline: DisplacementField,
+    matches: MotionMatches,
+    config: FieldConfig,
+    **edge_options,
+) -> FieldEdge:
+    """Attach an opt-in supplemental field without replacing the baseline."""
+    fallback = (
+        missing_node_fallback_field(baseline, matches, config)
+        if config.missing_node_fallback else baseline
+    )
+    return FieldEdge(
+        baseline,
+        fallback_field=fallback if fallback is not baseline else None,
+        **edge_options,
+    )
 
 
 def weighted_geometric_median(vectors: np.ndarray, weights: np.ndarray) -> np.ndarray:
@@ -205,6 +272,27 @@ def flipped_indices(field: DisplacementField, maximum_triangle_edge_m: float) ->
     local = _maximum_edge(source_triangles) <= maximum_triangle_edge_m
     flipped = _area(source_triangles[local]) * _area(target_triangles[local]) < 0
     return indices[np.unique(triangles[local][flipped].ravel())]
+
+
+def sample_field_with_fallback(
+    baseline: DisplacementField,
+    fallback: DisplacementField | None,
+    query_xy_m: np.ndarray,
+    maximum_triangle_edge_m: float,
+) -> FieldSamples:
+    """Preserve all supported baseline samples; use fallback only for gaps."""
+    original = sample_field(baseline, query_xy_m, maximum_triangle_edge_m)
+    if fallback is None or original.available.all():
+        return original
+    missing = np.flatnonzero(~original.available)
+    recovered = sample_field(fallback, np.asarray(query_xy_m)[missing],
+                             maximum_triangle_edge_m)
+    values = {}
+    for name in original.__dataclass_fields__:
+        value = getattr(original, name).copy()
+        value[missing] = getattr(recovered, name)
+        values[name] = value
+    return FieldSamples(**values)
 
 
 def sample_field(

@@ -13,7 +13,7 @@ from scipy.spatial import cKDTree
 
 from .catalog import ImageRecord
 from .config import FieldConfig, TrajectoryConfig
-from .field import sample_field
+from .field import sample_field_with_fallback
 from .models import FieldEdge
 
 
@@ -729,8 +729,9 @@ def _supported_continuations(
         if not eligible:
             continue
         queries = np.vstack([positions[source_step][identity] for identity in eligible])
-        sampled = sample_field(
-            edge.field, queries, field_config.maximum_triangle_edge_m
+        sampled = sample_field_with_fallback(
+            edge.field, edge.fallback_field, queries,
+            field_config.maximum_triangle_edge_m,
         )
         for local_index in np.flatnonzero(sampled.available):
             identity = eligible[local_index]

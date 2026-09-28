@@ -153,6 +153,7 @@ class FieldEdge:
     pair_kind: Literal["primary", "recovery"] = "primary"
     skipped_images: int = 0
     eligible_trajectory_ids: frozenset[str] | None = None
+    fallback_field: DisplacementField | None = None
 
     def __post_init__(self) -> None:
         if self.pair_kind not in {"primary", "recovery"}:
@@ -165,6 +166,19 @@ class FieldEdge:
             object.__setattr__(
                 self, "eligible_trajectory_ids", frozenset(self.eligible_trajectory_ids)
             )
+        if self.fallback_field is not None:
+            fallback = self.fallback_field
+            baseline = self.field
+            if (
+                fallback.pair_id != baseline.pair_id
+                or not np.array_equal(fallback.source_xy_m, baseline.source_xy_m)
+                or not np.all(fallback.available[baseline.available])
+                or not np.array_equal(
+                    fallback.displacement_m[baseline.available],
+                    baseline.displacement_m[baseline.available],
+                )
+            ):
+                raise ValueError("fallback field must preserve baseline support")
 
     @property
     def source_image_id(self) -> str:
