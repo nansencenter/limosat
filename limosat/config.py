@@ -63,12 +63,12 @@ class MatcherConfig:
 class FieldConfig:
     """Pair-field consensus settings; every distance is in metres."""
 
-    grid_spacing_m: float = 2_000.0
+    grid_spacing_m: float = 4_000.0
     neighbour_count: int = 12
     minimum_agreeing_matches: int = 8
     maximum_neighbour_distance_m: float = 6_000.0
     agreement_distance_m: float = 1_000.0
-    maximum_triangle_edge_m: float = 3_200.0
+    maximum_triangle_edge_m: float = 6_400.0
 
     def __post_init__(self) -> None:
         _require_positive(asdict(self))

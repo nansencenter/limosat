@@ -84,8 +84,8 @@ def test_matcher_defaults_retain_selected_scientific_values():
 def test_global_planning_defaults_are_explicit():
     routing = RoutingConfig()
     field = FieldConfig()
-    assert field.grid_spacing_m == 2_000.0
-    assert field.maximum_triangle_edge_m == 3_200.0
+    assert field.grid_spacing_m == 4_000.0
+    assert field.maximum_triangle_edge_m == 6_400.0
     assert routing.planning_grid_spacing_m == 4_000.0
     assert routing.candidate_minimum_elapsed_hours == 1.0
     assert routing.candidate_maximum_elapsed_hours == 96.0

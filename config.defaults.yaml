@@ -24,12 +24,12 @@ matcher:
   cuda_graph_warmup_batches: 3
 
 field:
-  grid_spacing_m: 2000.0
+  grid_spacing_m: 4000.0
   neighbour_count: 12
   minimum_agreeing_matches: 8
   maximum_neighbour_distance_m: 6000.0
   agreement_distance_m: 1000.0
-  maximum_triangle_edge_m: 3200.0
+  maximum_triangle_edge_m: 6400.0
 
 routing:
   planning_grid_spacing_m: 4000.0
