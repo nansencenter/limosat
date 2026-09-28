@@ -35,7 +35,7 @@ def plan_candidate_pairs(
     catalogue: ImageCatalogue,
     config: RoutingConfig,
     grid_spacing_m: float = 4_000.0,
-    maximum_speed_m_per_day: float = 30_000.0,
+    maximum_speed_m_per_day: float = 43_200.0,
 ) -> tuple[PlannedPair, ...]:
     """Plan overlap-qualified candidates and a deterministic primary subset."""
     return build_candidate_plan(
@@ -50,7 +50,7 @@ def build_candidate_plan(
     catalogue: ImageCatalogue,
     config: RoutingConfig,
     grid_spacing_m: float = 4_000.0,
-    maximum_speed_m_per_day: float = 30_000.0,
+    maximum_speed_m_per_day: float = 43_200.0,
 ) -> CandidatePlan:
     """Plan image pairs and retain deterministic exclusion diagnostics."""
     if grid_spacing_m <= 0:

@@ -23,7 +23,7 @@ class MatcherConfig:
     endpoint_support_radius_px: int = 16
     transform_grid_spacing_px: int = 32
     tile_grid_origin_m: float = 0.0
-    maximum_speed_m_per_day: float = 30_000.0
+    maximum_speed_m_per_day: float = 43_200.0
     tile_batch_size: int = 4
     prefix_cuda_graph: bool = True
     cuda_graph_warmup_batches: int = 3

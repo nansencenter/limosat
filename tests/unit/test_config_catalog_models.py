@@ -72,7 +72,7 @@ def test_unavailable_field_support_is_explicitly_nan():
 def test_matcher_defaults_retain_selected_scientific_values():
     config = MatcherConfig()
     assert config.pixel_size_m == 80.0
-    assert config.maximum_speed_m_per_day == 30_000.0
+    assert config.maximum_speed_m_per_day == 43_200.0
     assert config.tile_size_px == 512
     assert config.tile_batch_size == 4
     assert config.prefix_cuda_graph is True
