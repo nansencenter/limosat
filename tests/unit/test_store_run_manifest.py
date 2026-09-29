@@ -463,7 +463,11 @@ def test_retained_pair_matches_round_trip_exactly_and_are_immutable(tmp_path):
 
 
 def test_pair_matches_are_not_archived_when_retention_is_disabled(tmp_path):
-    config = replace(_config(tmp_path), retain_pair_matches=False)
+    base = _config(tmp_path)
+    config = replace(
+        base, retain_pair_matches=False,
+        field=replace(base.field, missing_node_fallback=False),
+    )
     catalogue = _catalogue(tmp_path)
     pair = catalogue.adjacent_pairs("component")[0]
     store = RunStore(config)

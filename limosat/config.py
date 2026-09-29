@@ -69,7 +69,7 @@ class FieldConfig:
     maximum_neighbour_distance_m: float = 6_000.0
     agreement_distance_m: float = 1_000.0
     maximum_triangle_edge_m: float = 6_400.0
-    missing_node_fallback: bool = False
+    missing_node_fallback: bool = True
 
     def __post_init__(self) -> None:
         _require_positive({key: value for key, value in asdict(self).items()
@@ -223,7 +223,7 @@ class RunConfig:
     trajectories: TrajectoryConfig = dataclass_field(
         default_factory=TrajectoryConfig
     )
-    retain_pair_matches: bool = False
+    retain_pair_matches: bool = True
 
     def __post_init__(self) -> None:
         if not self.run_id.strip():
@@ -245,7 +245,7 @@ class RunConfig:
     def to_dict(self) -> dict[str, Any]:
         values = asdict(self)
         if not self.field.missing_node_fallback:
-            # Keep existing run/product identities unchanged when this is off.
+            # Preserve the identity of existing configurations with fallback off.
             values["field"].pop("missing_node_fallback")
         return values
 
@@ -297,7 +297,15 @@ def load_config(path: str | Path) -> RunConfig:
         if matcher_values.get(name):
             matcher_values[name] = str(_resolve_path(base, matcher_values[name]))
     resolved["matcher"] = _construct(MatcherConfig, matcher_values)
-    resolved["field"] = _construct(FieldConfig, resolved.get("field", {}))
+    field_values = dict(resolved.get("field", {}))
+    legacy_field_keys = {item.name for item in fields(FieldConfig)} - {
+        "missing_node_fallback"
+    }
+    if ("missing_node_fallback" not in field_values
+            and legacy_field_keys <= field_values.keys()):
+        # Older fully resolved configs omitted the former opt-in when it was off.
+        field_values["missing_node_fallback"] = False
+    resolved["field"] = _construct(FieldConfig, field_values)
     resolved["routing"] = _construct(RoutingConfig, resolved.get("routing", {}))
     open_water_values = dict(resolved.get("open_water", {}))
     if open_water_values.get("sic_root"):

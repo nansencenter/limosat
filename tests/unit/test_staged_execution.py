@@ -45,6 +45,7 @@ def config(tmp_path, *, retain_matches=True):
             maximum_neighbour_distance_m=2_000.0,
             agreement_distance_m=100.0,
             maximum_triangle_edge_m=1_500.0,
+            missing_node_fallback=retain_matches,
         ),
         routing=RoutingConfig(coarse_matching=False, initial="same_center"),
     )

@@ -210,9 +210,9 @@ pair-product files are intermediate compute-resume state.
 
 The output directory contains `run-manifest-v5.json`. Scientific arrays and
 tables live in SQLite; no result products belong in Git. `limosat status`
-reports the run and pair status counts. Assessment runs should set
-`retain_pair_matches: true`; production runs may disable it after the field
-policy is frozen.
+reports the run and pair status counts. Pair matches are retained by default
+for trajectory missing-node support. To disable match retention, also set
+`field.missing_node_fallback: false`.
 
 Once `limosat status` reports `complete`, run `limosat finalize CONFIG` to
 write the compact global trajectory Parquet catalogue and a checksummed

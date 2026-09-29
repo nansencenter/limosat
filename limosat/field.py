@@ -150,7 +150,7 @@ def field_edge_with_fallback(
     config: FieldConfig,
     **edge_options,
 ) -> FieldEdge:
-    """Attach an opt-in supplemental field without replacing the baseline."""
+    """Attach supplemental support without replacing the baseline field."""
     fallback = (
         missing_node_fallback_field(baseline, matches, config)
         if config.missing_node_fallback else baseline

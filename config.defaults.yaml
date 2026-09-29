@@ -5,7 +5,7 @@ output_directory: ./outputs
 pair_product_directory: ./outputs/pair-products
 analysis_epsg: 3413
 pair_workers: 1
-retain_pair_matches: false
+retain_pair_matches: true
 
 matcher:
   repository: /path/to/EfficientLoFTR
@@ -30,7 +30,7 @@ field:
   maximum_neighbour_distance_m: 6000.0
   agreement_distance_m: 1000.0
   maximum_triangle_edge_m: 6400.0
-  missing_node_fallback: false  # opt in; requires retain_pair_matches: true
+  missing_node_fallback: true  # requires retain_pair_matches: true
 
 routing:
   planning_grid_spacing_m: 4000.0

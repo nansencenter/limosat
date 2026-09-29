@@ -35,10 +35,12 @@ The run command uses component labels only to plan compute, resumes completed
 image pairs without overwriting them, composes and freezes one primary global
 parcel catalogue, schedules non-consecutive reappearance pairs only after
 measured trajectory loss, sparsely augments frozen dormant entries, writes
-deformation from primary pair fields, and emits `run-manifest-v5.json`. Set
-`retain_pair_matches: true` for assessment runs to
-keep the selected post-gate, pre-consensus EfficientLoFTR matches as one
-compressed, checksummed SQLite record per completed image pair.
+deformation from primary pair fields, and emits `run-manifest-v5.json`. By
+default, missing-node support extends trajectories from retained matches while
+leaving the primary deformation fields unchanged. The selected post-gate,
+pre-consensus EfficientLoFTR matches are kept as one compressed, checksummed
+SQLite record per completed image pair. To turn this off, set both
+`field.missing_node_fallback: false` and `retain_pair_matches: false`.
 
 Candidate image pairs are registered before inference. By default they span
 1--96 hours, overlap at least 5% of the smaller footprint, and have at least
