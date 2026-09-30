@@ -493,10 +493,11 @@ class RunStages:
             yield from (PairWork(item) for item in assigned)
             return
         by_id = {item.pair.pair_id: item for item in assigned}
+        # Nominate unscheduled losses over every candidate so each batch agrees.
         for pair, positions in store.iter_targeted_recovery_positions(
-            item.pair for item in assigned
+            item.pair for item in candidates
         ):
-            if len(positions):
+            if pair.pair_id in by_id and len(positions):
                 yield PairWork(by_id[pair.pair_id], positions)
 
     @staticmethod

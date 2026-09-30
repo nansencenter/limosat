@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 import numpy as np
+import shapely
 
 from .catalog import ImageCatalogue, ImagePair, ImageRecord
 from .config import RunConfig
@@ -584,12 +585,21 @@ class RunStore:
             rows = self._targeted_recovery_rows(
                 connection, source_image_id, target_image_id
             )
-        return np.asarray(rows, dtype=np.float64).reshape(-1, 2)
+        return np.asarray(
+            [(x, y) for _identity, x, y in rows], dtype=np.float64
+        ).reshape(-1, 2)
 
     def iter_targeted_recovery_positions(
         self, pairs: Iterable[ImagePair]
     ):
-        """Yield measured-loss positions using one bounded read transaction."""
+        """Yield measured-loss positions using one bounded read transaction.
+
+        Pairs must be in chronological target order. Besides dormant rows, each
+        pair targets unscheduled losses: identities last measured on its source
+        image with no frozen-primary row on its target, nominated once for the
+        earliest pair whose target footprint contains the source position.
+        """
+        nominated: set[str] = set()
         with closing(self._connect()) as connection:
             for pair in pairs:
                 rows = self._targeted_recovery_rows(
@@ -597,7 +607,73 @@ class RunStore:
                     pair.source.image_id,
                     pair.target.image_id,
                 )
-                yield pair, np.asarray(rows, dtype=np.float64).reshape(-1, 2)
+                lost = [
+                    row for row in self._unscheduled_loss_rows(
+                        connection, pair.source, pair.target
+                    )
+                    if row[0] not in nominated
+                ]
+                if lost and pair.target.footprint is not None:
+                    inside = shapely.contains_xy(
+                        pair.target.footprint,
+                        np.asarray([row[1] for row in lost], dtype=np.float64),
+                        np.asarray([row[2] for row in lost], dtype=np.float64),
+                    )
+                    lost = [row for row, keep in zip(lost, inside) if keep]
+                nominated.update(row[0] for row in rows)
+                nominated.update(row[0] for row in lost)
+                merged = {identity: (x, y) for identity, x, y in rows}
+                merged.update({identity: (x, y) for identity, x, y in lost})
+                positions = [merged[identity] for identity in sorted(merged)]
+                yield pair, np.asarray(positions, dtype=np.float64).reshape(-1, 2)
+
+    def _unscheduled_loss_rows(
+        self,
+        connection: sqlite3.Connection,
+        source: ImageRecord,
+        target: ImageRecord,
+    ):
+        return connection.execute(
+            """
+            SELECT source.trajectory_id,source.x_m,source.y_m
+            FROM trajectory_points source
+            LEFT JOIN trajectory_augmentations source_augmentation
+              ON source_augmentation.run_id=source.run_id
+             AND source_augmentation.trajectory_id=source.trajectory_id
+             AND source_augmentation.image_id=source.image_id
+            WHERE source.run_id=? AND source.image_id=?
+              AND source.x_m IS NOT NULL
+              AND source_augmentation.image_id IS NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM trajectory_points target
+                LEFT JOIN trajectory_augmentations target_augmentation
+                  ON target_augmentation.run_id=target.run_id
+                 AND target_augmentation.trajectory_id=target.trajectory_id
+                 AND target_augmentation.image_id=target.image_id
+                WHERE target.run_id=source.run_id
+                  AND target.trajectory_id=source.trajectory_id
+                  AND target.image_id=?
+                  AND target_augmentation.image_id IS NULL)
+              AND NOT EXISTS (
+                SELECT 1 FROM trajectory_points later
+                LEFT JOIN trajectory_augmentations later_augmentation
+                  ON later_augmentation.run_id=later.run_id
+                 AND later_augmentation.trajectory_id=later.trajectory_id
+                 AND later_augmentation.image_id=later.image_id
+                WHERE later.run_id=source.run_id
+                  AND later.trajectory_id=source.trajectory_id
+                  AND later.time_utc>source.time_utc AND later.time_utc<?
+                  AND later.x_m IS NOT NULL
+                  AND later_augmentation.image_id IS NULL)
+            ORDER BY source.trajectory_id
+            """,
+            (
+                self.config.run_id,
+                source.image_id,
+                target.image_id,
+                target.time_utc.isoformat(),
+            ),
+        ).fetchall()
 
     def _targeted_recovery_rows(
         self,
@@ -607,7 +683,7 @@ class RunStore:
     ):
         return connection.execute(
             """
-            SELECT source.x_m,source.y_m
+            SELECT target.trajectory_id,source.x_m,source.y_m
             FROM trajectory_points target
             JOIN trajectory_points source
               ON source.run_id=target.run_id

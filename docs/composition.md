@@ -54,7 +54,17 @@ exporters can select `accepted`, while validation can examine the review rows.
 Recovery uses the completed primary composition as an immutable reference. It
 does not rewrite primary trajectory identities or fields.
 
-The default target preparation preserves the earlier dormant-row policy.
+Default target preparation selects two kinds of measured loss for each
+eligible recovery pair. A dormant row is an identity that a primary pair from
+its source image tried and failed to continue. An unscheduled loss is an
+identity last measured on the pair's source image that has no row on the target
+image because no primary pair from its last image reached that target. Each
+unscheduled loss is nominated once, for the earliest eligible pair whose target
+footprint contains its frozen source position. Identities already targeted as
+dormant are not nominated again. The SQLite and Parquet recovery paths apply
+the same rule; nothing is predicted, and the recovery field must still measure
+the motion. In the March 2020 capped-plan archive this class was 26% of
+uncensored endings, and 78% of a held-out sample gained a QC-accepted link.
 For adaptive rounds, pass a frozen JSON request plan with
 `pair_request_schema_version: 1`, `run_id`,
 `config_sha256`, `primary_composition_manifest_sha256`, and a `pairs` list of

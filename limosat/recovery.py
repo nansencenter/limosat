@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 import numpy as np
+import shapely
 
 from .catalog import ImagePair, ImageRecord, load_catalogue
 from .config import RunConfig
@@ -245,7 +246,10 @@ def prepare_recovery_targets(
     if manifest_path.exists():
         raise FileExistsError(manifest_path)
     store = RecoveryTargetStore(config, output / "pairs")
-    targeted = _write_recovery_targets(store, eligible, images, batches, requests)
+    counts = {"unscheduled_loss_positions": 0}
+    targeted = _write_recovery_targets(
+        store, eligible, images, batches, requests, counts=counts
+    )
     product_set = hashlib.sha256()
     target_count = 0
     records = []
@@ -272,6 +276,7 @@ def prepare_recovery_targets(
         "primary_composition_manifest": str(primary_manifest_path),
         "primary_composition_manifest_sha256": file_sha256(primary_manifest_path),
         "request_plan_sha256": request_plan_sha256,
+        "unscheduled_loss_positions": counts["unscheduled_loss_positions"],
         "eligible_recovery_pairs": len(eligible),
         "targeted_recovery_pairs": len(targeted),
         "targeted_positions": target_count,
@@ -286,7 +291,8 @@ def prepare_recovery_targets(
     )
     os.replace(temporary, manifest_path)
     return {"manifest": str(manifest_path), **{k: manifest[k] for k in (
-        "eligible_recovery_pairs", "targeted_recovery_pairs", "targeted_positions"
+        "eligible_recovery_pairs", "targeted_recovery_pairs", "targeted_positions",
+        "unscheduled_loss_positions",
     )}}
 
 
@@ -344,8 +350,20 @@ def _write_recovery_targets(
     images: Sequence[ImageRecord],
     primary_points_by_image: Iterable[Sequence[TrajectoryPoint]],
     requests: Mapping[str, frozenset[str]] | None = None,
+    *,
+    counts: dict[str, int] | None = None,
 ) -> tuple[PlannedPair, ...]:
+    """Write recovery targets for dormant rows and unscheduled losses.
+
+    An unscheduled loss is an identity whose last measurement is on the pair's
+    source image and which has no row at all on the target image, because no
+    primary pair from its last image reached that target. Each such identity is
+    nominated once, for the earliest eligible target whose footprint contains its
+    frozen source position. Nothing is predicted: the recovery field measures it.
+    """
     index = {image.image_id: step for step, image in enumerate(images)}
+    last_measured: dict[str, int] = {}
+    nominated: set[str] = set()
     by_target: dict[int, list[PlannedPair]] = {}
     last_use: dict[int, int] = {}
     source_requests: dict[int, set[str]] = {}
@@ -386,10 +404,21 @@ def _write_recovery_targets(
         measured = {
             point.trajectory_id for point in points if point.available
         }
+        present = {point.trajectory_id for point in points}
         for item in by_target.get(step, ()):
-            source = positions[index[item.pair.source.image_id]]
+            source_step = index[item.pair.source.image_id]
+            source = positions[source_step]
             if requests is None:
                 identities = sorted(dormant & source.keys())
+                nominated.update(identities)
+                lost = _unscheduled_losses(
+                    source, source_step, present, last_measured,
+                    nominated, image.footprint,
+                )
+                nominated.update(lost)
+                if counts is not None:
+                    counts["unscheduled_loss_positions"] += len(lost)
+                identities = sorted(set(identities).union(lost))
             else:
                 requested = requests[item.pair.pair_id]
                 if requested - source.keys():
@@ -411,6 +440,8 @@ def _write_recovery_targets(
                     trajectory_ids=identities,
                 )
                 targeted.append(item)
+        for identity in measured:
+            last_measured[identity] = step
         for source_step, target_step in tuple(last_use.items()):
             if target_step == step:
                 positions[source_step].clear()
@@ -419,6 +450,34 @@ def _write_recovery_targets(
     except StopIteration:
         return tuple(targeted)
     raise ValueError("primary point batches exceed the catalogue")
+
+
+def unscheduled_losses_in_footprint(identities, xy, footprint) -> list[str]:
+    """Keep identities whose frozen source position lies in a target footprint."""
+    if not identities or footprint is None:
+        return list(identities)
+    xy = np.asarray(xy, dtype=np.float64).reshape(-1, 2)
+    inside = shapely.contains_xy(footprint, xy[:, 0], xy[:, 1])
+    return [identity for identity, keep in zip(identities, inside) if keep]
+
+
+def _unscheduled_losses(
+    source: Mapping[str, tuple[float, float]],
+    source_step: int,
+    present: set[str],
+    last_measured: Mapping[str, int],
+    nominated: set[str],
+    footprint,
+) -> list[str]:
+    candidates = [
+        identity for identity in source
+        if identity not in present
+        and identity not in nominated
+        and last_measured.get(identity) == source_step
+    ]
+    return unscheduled_losses_in_footprint(
+        candidates, [source[identity] for identity in candidates], footprint
+    )
 
 
 def _positions(values: np.ndarray) -> np.ndarray:
