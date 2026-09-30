@@ -25,6 +25,7 @@ from limosat import (
     load_production_field_replay,
 )
 from limosat.replay import replay_field_set_sha256
+from limosat.imagery import pass_pixel_validity_factory
 from limosat.store import file_sha256
 
 
@@ -82,6 +83,9 @@ def main() -> int:
             replay.images,
             FieldConfig(),
             TrajectoryConfig(),
+            target_validity_factory=pass_pixel_validity_factory(
+                replay.images, config.analysis_epsg
+            ),
         )
         for image_index, batch in enumerate(batches, start=1):
             state_counts.update(point.state for point in batch)

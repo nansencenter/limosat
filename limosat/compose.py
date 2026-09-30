@@ -12,6 +12,7 @@ from pathlib import Path
 from .catalog import load_catalogue
 from .config import RunConfig
 from .field import field_edge_with_fallback
+from .imagery import pass_pixel_validity_factory
 from .models import FieldEdge
 from .pair_products import PAIR_PRODUCT_SCHEMA_VERSION, PairProductStore
 from .planning import build_candidate_plan, recovery_candidates
@@ -33,6 +34,7 @@ COMPOSITION_SCHEMA_VERSION = 1
 TRAJECTORY_POINT_SCHEMA_VERSION = 1
 TRAJECTORY_EXTENSION_SCHEMA_VERSION = 1
 TRAJECTORY_AUGMENTATION_SCHEMA_VERSION = 1
+TARGET_PIXEL_VALIDITY_POLICY = "same_pass_raster_bounds_and_band2_lt2"
 
 
 def compose_primary_parquet(
@@ -116,6 +118,9 @@ def compose_primary_parquet(
             catalogue.chronological(),
             config.field,
             config.trajectories,
+            target_validity_factory=pass_pixel_validity_factory(
+                catalogue.chronological(), config.analysis_epsg
+            ),
         ):
             if batch.points:
                 point_writer.write_table(
@@ -155,6 +160,7 @@ def compose_primary_parquet(
         "trajectory_point_schema_version": TRAJECTORY_POINT_SCHEMA_VERSION,
         "trajectory_extension_schema_version": TRAJECTORY_EXTENSION_SCHEMA_VERSION,
         "qc_protocol_id": QC_PROTOCOL_ID,
+        "target_pixel_validity": TARGET_PIXEL_VALIDITY_POLICY,
         "run_id": config.run_id,
         "config_sha256": config.sha256,
         "producer_implementation_sha256": next(iter(producer_hashes)),
@@ -221,6 +227,8 @@ def compose_recovery_parquet(
     primary_manifest = json.loads(primary_manifest_path.read_text(encoding="utf-8"))
     if primary_manifest.get("config_sha256") != config.sha256:
         raise ValueError("primary composition configuration differs from recovery")
+    if primary_manifest.get("target_pixel_validity") != TARGET_PIXEL_VALIDITY_POLICY:
+        raise ValueError("primary composition lacks target-pixel validity checking")
     primary_points = primary_root / "trajectory-points-v1.parquet"
     primary_extensions = primary_root / "trajectory-extensions-qc-v1.parquet"
     for name, path in (
@@ -352,6 +360,9 @@ def compose_recovery_parquet(
             (*primary_edges, *recovery_edges),
             catalogue.chronological(),
             config.field,
+            target_validity_factory=pass_pixel_validity_factory(
+                catalogue.chronological(), config.analysis_epsg
+            ),
         ):
             if batch.points:
                 point_writer.write_table(
@@ -395,6 +406,7 @@ def compose_recovery_parquet(
         ),
         "trajectory_extension_schema_version": TRAJECTORY_EXTENSION_SCHEMA_VERSION,
         "qc_protocol_id": QC_PROTOCOL_ID,
+        "target_pixel_validity": TARGET_PIXEL_VALIDITY_POLICY,
         "run_id": config.run_id,
         "config_sha256": config.sha256,
         "semantics": "frozen primary rows plus recovery and post-reappearance deltas",

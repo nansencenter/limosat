@@ -4,6 +4,8 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
+import rasterio
+from rasterio.transform import from_origin
 import pytest
 
 from limosat import (
@@ -55,7 +57,13 @@ def catalogue(tmp_path):
     records = []
     for index, name in enumerate(("a", "b", "c")):
         path = tmp_path / f"{name}.tif"
-        path.write_bytes(name.encode())
+        with rasterio.open(
+            path, "w", driver="GTiff", width=40, height=40, count=2,
+            dtype="uint8", crs="EPSG:3413",
+            transform=from_origin(-1_000, 39_000, 1_000, 1_000),
+        ) as dataset:
+            dataset.write(np.full((40, 40), 100, dtype=np.uint8), 1)
+            dataset.write(np.ones((40, 40), dtype=np.uint8), 2)
         records.append(
             ImageRecord(name, path, START + timedelta(days=index), "component")
         )

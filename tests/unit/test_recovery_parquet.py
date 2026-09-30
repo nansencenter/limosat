@@ -166,6 +166,18 @@ def test_saved_recovery_pair_fills_absent_row_then_primary_continues(tmp_path):
         "post_reappearance_primary_field"
     }
 
+    blocked = tuple(
+        point
+        for batch in iter_frozen_primary_augmentation_batches(
+            batches, edges, images, cfg.field,
+            target_validity_factory=lambda _image: (
+                lambda xy: np.zeros(len(xy), dtype=bool)
+            ),
+        )
+        for point in batch.points
+    )
+    assert blocked == ()
+
 
 def test_recovery_workers_can_use_parquet_targets_without_sqlite(tmp_path):
     from test_staged_execution import Processor, catalogue, config

@@ -27,6 +27,16 @@ The command writes these files atomically:
   source-to-target extensions; and
 - `composition-manifest-v1.json`, written last as the completion marker.
 
+Before choosing an incoming pair, composition checks each inferred endpoint
+against that target image's raster bounds and invalid-pixel band. An endpoint
+outside the raster or on a pixel with mask value at least 2 cannot become an
+observed point; another valid incoming pair may still continue the trajectory.
+If none does, the target row is dormant. An endpoint that is invalid on the
+target frame but valid on another frame of the same acquisition pass (same
+platform and absolute orbit, seconds apart) is accepted: in the March 2020
+archive about a quarter of gate rejections were such frame-seam positions. The same rule applies to recovery
+augmentation. Pair matches and fields remain reusable for recomposition.
+
 ## Initial QC policy
 
 This branch does not import the ORB production QC protocol wholesale. Its first

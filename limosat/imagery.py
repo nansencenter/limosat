@@ -11,6 +11,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import rasterio
+import shapely
 from pyproj import Transformer
 from rasterio.transform import AffineTransformer, GCPTransformer
 from shapely.geometry import Polygon
@@ -89,6 +90,90 @@ def scene_transform(path: str | Path, analysis_epsg: int = 3413) -> _SceneTransf
 
 
 atexit.register(scene_transform.cache_clear)
+
+
+class TargetPixelValidity:
+    """Check composed EPSG:3413 endpoints against one target scene's mask."""
+
+    def __init__(self, path: str | Path, analysis_epsg: int = 3413) -> None:
+        self.transform = scene_transform(path, analysis_epsg)
+        with rasterio.open(path) as dataset:
+            self.mask = dataset.read(2) < 2 if dataset.count >= 2 else None
+
+    def __call__(self, xy_m: np.ndarray) -> np.ndarray:
+        xy = np.asarray(xy_m, dtype=np.float64)
+        if xy.ndim != 2 or xy.shape[1] != 2:
+            raise ValueError("target positions must have shape (N, 2)")
+        columns, rows = self.transform.analysis_to_pixels(xy[:, 0], xy[:, 1])
+        inside = (
+            np.isfinite(columns) & np.isfinite(rows)
+            & (columns >= 0) & (columns <= self.transform.width - 1)
+            & (rows >= 0) & (rows <= self.transform.height - 1)
+        )
+        if self.mask is not None and np.any(inside):
+            indices = np.flatnonzero(inside)
+            inside[indices] = self.mask[
+                np.rint(rows[indices]).astype(np.int64),
+                np.rint(columns[indices]).astype(np.int64),
+            ]
+        return inside
+
+
+# Sibling frames are read only near their catalogue footprint, which traces the
+# raster border approximately; the exact check is always the raster itself.
+_SIBLING_FOOTPRINT_BUFFER_M = 5_000.0
+
+
+class PassPixelValidity:
+    """Check endpoints against the target frame, then its same-pass frames.
+
+    Frames cut from one acquisition pass are seconds apart, so a position that
+    falls outside the target frame but on a valid pixel of an adjacent frame of
+    the same pass was imaged at effectively the same time.
+    """
+
+    def __init__(self, image, siblings=(), analysis_epsg: int = 3413) -> None:
+        self.target = TargetPixelValidity(image.path, analysis_epsg)
+        self.siblings = tuple(siblings)
+        self.analysis_epsg = analysis_epsg
+
+    def __call__(self, xy_m: np.ndarray) -> np.ndarray:
+        xy = np.asarray(xy_m, dtype=np.float64)
+        valid = np.array(self.target(xy), dtype=bool)
+        for sibling in self.siblings:
+            missing = np.flatnonzero(~valid & np.isfinite(xy).all(axis=1))
+            if not len(missing):
+                break
+            if sibling.footprint is not None:
+                near = shapely.contains_xy(
+                    sibling.footprint.buffer(_SIBLING_FOOTPRINT_BUFFER_M),
+                    xy[missing, 0], xy[missing, 1],
+                )
+                missing = missing[near]
+                if not len(missing):
+                    continue
+            valid[missing] = TargetPixelValidity(
+                sibling.path, self.analysis_epsg
+            )(xy[missing])
+        return valid
+
+
+def pass_pixel_validity_factory(images, analysis_epsg: int = 3413):
+    """Return ``image -> PassPixelValidity`` using catalogue acquisition passes."""
+    passes: dict[tuple[str, int], list] = {}
+    for image in images:
+        if image.platform is not None and image.absolute_orbit is not None:
+            passes.setdefault((image.platform, image.absolute_orbit), []).append(image)
+
+    def factory(image) -> PassPixelValidity:
+        siblings = [
+            other
+            for other in passes.get((image.platform, image.absolute_orbit), ())
+            if other.image_id != image.image_id
+        ]
+        return PassPixelValidity(image, siblings, analysis_epsg)
+
+    return factory
 
 
 def projected_footprint(path: str | Path, analysis_epsg: int = 3413) -> BaseGeometry:

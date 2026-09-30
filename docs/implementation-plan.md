@@ -141,6 +141,11 @@ builder before a production rebuild.
   occupancy with bounded exclusion around a dormant parcel's last measured
   position. Do not predict an unmeasured target coordinate. Report duplicate
   parcel creation and later measured convergence before choosing a policy.
+  Status (2026-09-29, experiment notes outside the repository): a larger
+  exclusion radius reduces redundant seeds and storage but does not lengthen
+  trajectories. Recovery now targets unscheduled losses from their last
+  measured image; adaptive longer-lag pairs where revisit is sparse and
+  coverage-driven primary selection remain open.
 - [x] **Converging-identity audit.** Production LiMOSAT deterministically kept
   the longest, highest-quality trajectory when tracked positions converged.
   For the global catalogue, first report persistent measured convergence; do
@@ -188,6 +193,13 @@ builder before a production rebuild.
    otherwise reuse immutable fields and rebuild the frozen primary catalogue.
 7. Run elapsed-time-bounded reappearance pairs, augment the frozen catalogue,
    compare manifests, and render final pan-Arctic outputs.
+
+Before accepting a trajectory-length or coverage change, render baseline,
+candidate, and difference maps at pan-Arctic and hotspot scales with common
+colour scales. Inspect where gains and losses fall relative to coastlines,
+image-footprint edges, and valid target pixels; report these spatial results
+alongside pooled counts and duration statistics. A gain in geometric occupancy
+alone is not evidence of valid image-supported coverage.
 
 The configured candidate and recovery horizons remain separate policy choices,
 not established physical constants or part of the continuation contract.

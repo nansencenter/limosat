@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Iterable, Sequence
 
 import numpy as np
@@ -15,6 +15,10 @@ from .catalog import ImageRecord
 from .config import FieldConfig, TrajectoryConfig
 from .field import sample_field_with_fallback
 from .models import FieldEdge
+
+
+TargetValidity = Callable[[np.ndarray], np.ndarray]
+TargetValidityFactory = Callable[[ImageRecord], TargetValidity]
 
 
 @dataclass(frozen=True)
@@ -133,12 +137,15 @@ def compose_global_trajectories(
     images: Sequence[ImageRecord],
     field_config: FieldConfig,
     trajectory_config: TrajectoryConfig,
+    *,
+    target_validity_factory: TargetValidityFactory | None = None,
 ) -> tuple[TrajectoryPoint, ...]:
     """Recompose the catalogue without treating compute labels as boundaries."""
     return tuple(
         point
         for batch in iter_global_trajectory_points(
-            edges, images, field_config, trajectory_config
+            edges, images, field_config, trajectory_config,
+            target_validity_factory=target_validity_factory,
         )
         for point in batch
     )
@@ -149,6 +156,8 @@ def iter_global_trajectory_batches(
     images: Sequence[ImageRecord],
     field_config: FieldConfig,
     trajectory_config: TrajectoryConfig,
+    *,
+    target_validity_factory: TargetValidityFactory | None = None,
 ) -> Iterator[TrajectoryBatch]:
     """Yield deterministic points and direct extensions for each image."""
     ordered_images = tuple(
@@ -197,8 +206,13 @@ def iter_global_trajectory_batches(
                     for identity in positions[source_step]
                 }
             )
+            target_validity = (
+                target_validity_factory(image)
+                if target_validity_factory is not None and eligible else None
+            )
             chosen = _choose_continuations(
-                incoming, positions, eligible, field_config
+                incoming, positions, eligible, field_config,
+                target_validity=target_validity,
             )
             for identity in eligible:
                 continuation = chosen.get(identity)
@@ -292,10 +306,13 @@ def iter_global_trajectory_points(
     images: Sequence[ImageRecord],
     field_config: FieldConfig,
     trajectory_config: TrajectoryConfig,
+    *,
+    target_validity_factory: TargetValidityFactory | None = None,
 ) -> Iterator[tuple[TrajectoryPoint, ...]]:
     """Yield deterministic per-image rows while retaining only needed positions."""
     for batch in iter_global_trajectory_batches(
-        edges, images, field_config, trajectory_config
+        edges, images, field_config, trajectory_config,
+        target_validity_factory=target_validity_factory,
     ):
         yield batch.points
 
@@ -305,10 +322,13 @@ def build_trajectories(
     images: Sequence[ImageRecord],
     field_config: FieldConfig,
     trajectory_config: TrajectoryConfig,
+    *,
+    target_validity_factory: TargetValidityFactory | None = None,
 ) -> tuple[TrajectoryPoint, ...]:
     """Compatibility name for the global catalogue composer."""
     return compose_global_trajectories(
-        edges, images, field_config, trajectory_config
+        edges, images, field_config, trajectory_config,
+        target_validity_factory=target_validity_factory,
     )
 
 
@@ -341,6 +361,8 @@ def iter_frozen_primary_augmentation_batches(
     edges: Sequence[FieldEdge],
     images: Sequence[ImageRecord],
     field_config: FieldConfig,
+    *,
+    target_validity_factory: TargetValidityFactory | None = None,
 ) -> Iterator[TrajectoryBatch]:
     """Yield measured point and extension deltas over frozen primary rows.
 
@@ -430,11 +452,16 @@ def iter_frozen_primary_augmentation_batches(
             for source_step, _target_step, _edge in primary_by_target.get(step, ())
             for identity in augmented_positions[source_step]
         } - measured)
+        target_validity = (
+            target_validity_factory(image)
+            if target_validity_factory is not None and primary_eligible else None
+        )
         primary = _supported_continuations(
             primary_by_target.get(step, ()),
             augmented_positions,
             primary_eligible,
             field_config,
+            target_validity=target_validity,
         )
         for identity, continuation in primary.items():
             source_xy = augmented_positions[continuation.source_step][identity]
@@ -469,11 +496,18 @@ def iter_frozen_primary_augmentation_batches(
             for source_step, _target_step, _edge in recovery_by_target.get(step, ())
             for identity in frozen_positions[source_step]
         } - measured - updates.keys())
+        if (
+            target_validity is None
+            and target_validity_factory is not None
+            and recovery_eligible
+        ):
+            target_validity = target_validity_factory(image)
         recovery = _supported_continuations(
             recovery_by_target.get(step, ()),
             frozen_positions,
             recovery_eligible,
             field_config,
+            target_validity=target_validity,
         )
         for identity, continuation in recovery.items():
             source_xy = frozen_positions[continuation.source_step][identity]
@@ -539,10 +573,13 @@ def iter_frozen_primary_augmentations(
     edges: Sequence[FieldEdge],
     images: Sequence[ImageRecord],
     field_config: FieldConfig,
+    *,
+    target_validity_factory: TargetValidityFactory | None = None,
 ) -> Iterator[tuple[TrajectoryPoint, ...]]:
     """Compatibility iterator yielding only frozen-primary point updates."""
     for batch in iter_frozen_primary_augmentation_batches(
-        primary_points_by_image, edges, images, field_config
+        primary_points_by_image, edges, images, field_config,
+        target_validity_factory=target_validity_factory,
     ):
         yield batch.points
 
@@ -696,12 +733,15 @@ def _choose_continuations(
     positions: Sequence[dict[str, np.ndarray]],
     identities: Sequence[str],
     field_config: FieldConfig,
+    *,
+    target_validity: TargetValidity | None = None,
 ) -> dict[str, _Continuation]:
     primary = _supported_continuations(
         [item for item in incoming if item[2].pair_kind == "primary"],
         positions,
         identities,
         field_config,
+        target_validity=target_validity,
     )
     remaining = [identity for identity in identities if identity not in primary]
     recovery = _supported_continuations(
@@ -709,6 +749,7 @@ def _choose_continuations(
         positions,
         remaining,
         field_config,
+        target_validity=target_validity,
     )
     return {**primary, **recovery}
 
@@ -718,6 +759,8 @@ def _supported_continuations(
     positions: Sequence[dict[str, np.ndarray]],
     identities: Sequence[str],
     field_config: FieldConfig,
+    *,
+    target_validity: TargetValidity | None = None,
 ) -> dict[str, _Continuation]:
     chosen: dict[str, _Continuation] = {}
     identity_set = set(identities)
@@ -733,7 +776,14 @@ def _supported_continuations(
             edge.field, edge.fallback_field, queries,
             field_config.maximum_triangle_edge_m,
         )
-        for local_index in np.flatnonzero(sampled.available):
+        candidate_indices = np.flatnonzero(sampled.available)
+        if target_validity is not None and len(candidate_indices):
+            target_xy = queries[candidate_indices] + sampled.displacement_m[candidate_indices]
+            valid = np.asarray(target_validity(target_xy), dtype=bool)
+            if valid.shape != (len(candidate_indices),):
+                raise ValueError("target validity must return one flag per endpoint")
+            candidate_indices = candidate_indices[valid]
+        for local_index in candidate_indices:
             identity = eligible[local_index]
             candidate = _Continuation(
                 source_step,

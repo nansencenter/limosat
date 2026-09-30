@@ -1,8 +1,12 @@
+import json
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 import pytest
+import rasterio
+from rasterio.transform import from_origin
 
 from limosat import (
     DisplacementField,
@@ -18,7 +22,8 @@ from limosat import (
     TrajectoryConfig,
 )
 from limosat.compose import compose_primary_parquet
-from limosat.trajectory import iter_global_trajectory_batches
+from limosat.imagery import TargetPixelValidity
+from limosat.trajectory import _supported_continuations, iter_global_trajectory_batches
 
 
 START = datetime(2020, 1, 1, tzinfo=timezone.utc)
@@ -57,6 +62,99 @@ def _field_config():
     )
 
 
+def test_target_pixel_validity_checks_actual_mask_and_raster_bounds(tmp_path):
+    path = tmp_path / "target.tif"
+    mask = np.ones((4, 4), dtype=np.uint8)
+    mask[1, 1] = 2
+    with rasterio.open(
+        path, "w", driver="GTiff", width=4, height=4, count=2,
+        dtype="uint8", crs="EPSG:3413",
+        transform=from_origin(0, 4_000, 1_000, 1_000),
+    ) as dataset:
+        dataset.write(np.full((4, 4), 100, dtype=np.uint8), 1)
+        dataset.write(mask, 2)
+
+    validity = TargetPixelValidity(path)
+    np.testing.assert_array_equal(
+        validity(np.array([
+            [500.0, 3_500.0], [1_250.0, 2_750.0],
+            [-100.0, 2_500.0], [np.nan, 2_500.0],
+        ])),
+        [True, False, False, False],
+    )
+
+
+def _validity_raster(path, west, mask):
+    with rasterio.open(
+        path, "w", driver="GTiff", width=4, height=4, count=2,
+        dtype="uint8", crs="EPSG:3413",
+        transform=from_origin(west, 4_000, 1_000, 1_000),
+    ) as dataset:
+        dataset.write(np.full((4, 4), 100, dtype=np.uint8), 1)
+        dataset.write(mask, 2)
+
+
+def test_pass_pixel_validity_accepts_valid_same_pass_frame(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    from shapely.geometry import box
+
+    from limosat import ImageRecord
+    from limosat.imagery import pass_pixel_validity_factory
+
+    good = np.ones((4, 4), dtype=np.uint8)
+    masked = good.copy()
+    masked[1, 1] = 2
+    for name, west, mask in (
+        ("target", 0, good), ("sibling", 4_000, masked), ("other", 8_000, good)
+    ):
+        _validity_raster(tmp_path / f"{name}.tif", west, mask)
+    start = datetime(2020, 3, 1, tzinfo=timezone.utc)
+
+    def image(name, west, orbit, seconds):
+        return ImageRecord(
+            name, tmp_path / f"{name}.tif", start + timedelta(seconds=seconds),
+            footprint=box(west, 0, west + 4_000, 4_000),
+            platform="S1A", absolute_orbit=orbit,
+        )
+
+    target = image("target", 0, 100, 0)
+    images = (target, image("sibling", 4_000, 100, 60), image("other", 8_000, 101, 0))
+    validity = pass_pixel_validity_factory(images)(target)
+
+    np.testing.assert_array_equal(
+        validity(np.array([
+            [500.0, 3_500.0],    # valid on the target frame
+            [4_500.0, 3_500.0],  # outside the target, valid on the same-pass frame
+            [5_250.0, 2_750.0],  # outside the target, masked on the same-pass frame
+            [8_500.0, 3_500.0],  # valid only on a frame of a different pass
+        ])),
+        [True, True, False, False],
+    )
+
+
+def test_invalid_preferred_endpoint_does_not_hide_valid_pair():
+    valid_field = _field((100.0, 0.0))
+    preferred_field = replace(
+        _field((200.0, 0.0)), pair_id="alternate__b",
+        selected_matches=np.full(4, 20),
+    )
+    incoming = [
+        (0, 1, FieldEdge(valid_field)),
+        (0, 1, FieldEdge(preferred_field)),
+    ]
+    positions = [{"parcel": np.array([0.0, 0.0])}, {}]
+    chosen = _supported_continuations(
+        incoming, positions, ["parcel"], _field_config(),
+        target_validity=lambda xy: xy[:, 0] < 150.0,
+    )
+    np.testing.assert_allclose(chosen["parcel"].displacement_m, [100.0, 0.0])
+    assert _supported_continuations(
+        incoming, positions, ["parcel"], _field_config(),
+        target_validity=lambda xy: np.zeros(len(xy), dtype=bool),
+    ) == {}
+
+
 def test_trajectory_batches_expose_direct_extensions_without_a_second_scan():
     images = [
         ImageRecord("a", Path("/tmp/a.tif"), START),
@@ -84,8 +182,17 @@ def test_compose_uses_pair_products_without_creating_sqlite(tmp_path):
     pq = pytest.importorskip("pyarrow.parquet")
     source = tmp_path / "a.tif"
     target = tmp_path / "b.tif"
-    source.write_bytes(b"source")
-    target.write_bytes(b"target")
+    for path in (source, target):
+        mask = np.ones((40, 40), dtype=np.uint8)
+        if path == target:
+            mask[39, 1] = 2  # Predicted endpoint from the (0, 0) seed.
+        with rasterio.open(
+            path, "w", driver="GTiff", width=40, height=40, count=2,
+            dtype="uint8", crs="EPSG:3413",
+            transform=from_origin(-1_000, 39_000, 1_000, 1_000),
+        ) as dataset:
+            dataset.write(np.full((40, 40), 100, dtype=np.uint8), 1)
+            dataset.write(mask, 2)
     catalogue_path = tmp_path / "catalogue.csv"
     catalogue_path.write_text(
         "image_id,path,time_utc,footprint_wkt\n"
@@ -130,8 +237,12 @@ def test_compose_uses_pair_products_without_creating_sqlite(tmp_path):
 
     assert not Path(config.database).exists()
     assert composed["counts"]["trajectory_points"] == 8
-    assert composed["counts"]["trajectory_extensions"] == 4
+    assert composed["counts"]["trajectory_extensions"] == 3
+    assert composed["counts"]["trajectory_point_states"]["dormant"] == 1
     extensions = pq.read_table(composed["trajectory_extensions"])
-    assert extensions.num_rows == 4
-    assert extensions.column("qc_status").to_pylist() == ["accept"] * 4
-    assert extensions.column("accepted").to_pylist() == [True] * 4
+    assert extensions.num_rows == 3
+    assert extensions.column("qc_status").to_pylist() == ["accept"] * 3
+    assert extensions.column("accepted").to_pylist() == [True] * 3
+    assert json.loads(Path(composed["manifest"]).read_text())[
+        "target_pixel_validity"
+    ] == "same_pass_raster_bounds_and_band2_lt2"

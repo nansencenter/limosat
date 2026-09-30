@@ -18,6 +18,7 @@ from .config import RunConfig
 from .deformation import deformation_from_field
 from .efficientloftr import EfficientLoFTR
 from .field import field_edge_with_fallback
+from .imagery import pass_pixel_validity_factory
 from .manifest import write_manifest
 from .models import FieldEdge
 from .pair_products import PAIR_PRODUCT_SCHEMA_VERSION, PairProductStore
@@ -349,6 +350,9 @@ class RunStages:
                     images,
                     self.config.field,
                     self.config.trajectories,
+                    target_validity_factory=pass_pixel_validity_factory(
+                        images, self.config.analysis_epsg
+                    ),
                 ):
                     if retained_points is not None:
                         retained_points.extend(batch)
@@ -363,6 +367,9 @@ class RunStages:
                     (*primary_edges, *recovery_edges),
                     images,
                     self.config.field,
+                    target_validity_factory=pass_pixel_validity_factory(
+                        images, self.config.analysis_epsg
+                    ),
                 )
             )
             if self.config.trajectories.convergence_audit_radius_m is not None:

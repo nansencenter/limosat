@@ -7,6 +7,8 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import rasterio
+from rasterio.transform import from_origin
 
 from limosat import load_production_field_replay
 from limosat.replay import replay_field_set_sha256
@@ -17,6 +19,14 @@ def _production_fixture(root: Path) -> tuple[Path, Path]:
     field_directory = root / "shards" / "chain-000001" / "raw" / "learned_output"
     control.mkdir(parents=True)
     field_directory.mkdir(parents=True)
+    for name in ("a", "b"):
+        with rasterio.open(
+            root / f"{name}.tif", "w", driver="GTiff", width=4, height=4,
+            count=2, dtype="uint8", crs="EPSG:3413",
+            transform=from_origin(-1_000, 3_000, 1_000, 1_000),
+        ) as dataset:
+            dataset.write(np.full((4, 4), 100, dtype=np.uint8), 1)
+            dataset.write(np.ones((4, 4), dtype=np.uint8), 2)
     field_path = field_directory / "field_4km.csv"
     field_path.write_text(
         "grid_row,grid_column,source_x,source_y,available,selected_vectors,"
@@ -56,8 +66,12 @@ def _production_fixture(root: Path) -> tuple[Path, Path]:
         connection.executemany(
             "INSERT INTO scenes VALUES (?,?,?,?,?,?,?)",
             [
-                ("scene-a", 1, "2020-04-01T00:00:00Z", "a.tif", 1, "a", 1),
-                ("scene-b", 2, "2020-04-02T00:00:00Z", "b.tif", 1, "b", 2),
+                ("scene-a", 1, "2020-04-01T00:00:00Z", "a.tif",
+                 (root / "a.tif").stat().st_size,
+                 hashlib.sha256((root / "a.tif").read_bytes()).hexdigest(), 1),
+                ("scene-b", 2, "2020-04-02T00:00:00Z", "b.tif",
+                 (root / "b.tif").stat().st_size,
+                 hashlib.sha256((root / "b.tif").read_bytes()).hexdigest(), 2),
             ],
         )
         connection.execute(
