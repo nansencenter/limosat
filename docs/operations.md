@@ -140,6 +140,21 @@ calls and both candidate-support counts are recorded. With
 `phase_correlation_failure: same_center`, insufficient coarse support falls
 back to zero initial shift; `error` instead fails the image pair.
 
+Coarse routing places a 320 m/pixel window (163.84 km) on each 35.84 km fine
+tile by default (`coarse_window_stride: 1`). With `coarse_window_stride: 3`,
+one coarse window serves the 3 x 3 fine tiles nearest its centre: each tile
+takes the local median of that window's matches within its own support radius,
+which stays inside the window core. A tile without local support in a window
+that did measure motion is retried with its own centred window, because an
+off-centre tile tolerates less shift error. On 30 random March 2020 primary
+pairs this used 3.1x fewer coarse matcher tiles and ran 1.5x faster per pair
+(shared GPU), with 0.2% fewer field nodes and a refined-tile share of 0.430
+versus 0.427. Field differences (median 13 m at common nodes) were about twice
+those from a small change of the per-tile shift (34 km instead of 35.84 km
+support radius, 5 m), so the setting changes results slightly and is opt-in.
+Stride 1 reproduces earlier products exactly and keeps their configuration
+identity.
+
 Inference tiles cover the source footprint intersected with the target
 footprint buffered by the elapsed-time physical displacement limit. A validity
 gate avoids inference only where source-core and target support cannot contain

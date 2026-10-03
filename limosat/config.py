@@ -107,6 +107,7 @@ class RoutingConfig:
     coarse_pixel_size_m: float = 320.0
     coarse_minimum_matches: int = 12
     coarse_support_radius_m: float = 35_840.0
+    coarse_window_stride: int = 1
 
     def __post_init__(self) -> None:
         if not 0 < self.planning_grid_spacing_m < float("inf"):
@@ -123,6 +124,13 @@ class RoutingConfig:
             or self.coarse_minimum_matches < 1
         ):
             raise ValueError("coarse_minimum_matches must be a positive integer")
+        if (
+            isinstance(self.coarse_window_stride, bool)
+            or not isinstance(self.coarse_window_stride, int)
+            or self.coarse_window_stride < 1
+            or self.coarse_window_stride % 2 == 0
+        ):
+            raise ValueError("coarse_window_stride must be a positive odd integer")
         if not 0 <= self.phase_correlation_minimum_response <= 1:
             raise ValueError(
                 "phase_correlation_minimum_response must be in [0, 1]"
@@ -247,6 +255,9 @@ class RunConfig:
         if not self.field.missing_node_fallback:
             # Preserve the identity of existing configurations with fallback off.
             values["field"].pop("missing_node_fallback")
+        if self.routing.coarse_window_stride == 1:
+            # Preserve the identity of configurations with one coarse window per tile.
+            values["routing"].pop("coarse_window_stride")
         return values
 
     @property

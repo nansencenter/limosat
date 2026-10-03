@@ -427,6 +427,23 @@ class PairProcessor:
         target_sic,
     ) -> _CoarseRoutingResult:
         """Run one bounded coarse pass with the same model before fine sampling."""
+        if self.config.routing.coarse_window_stride > 1:
+            return self._refine_tile_shifts_shared(
+                pair, regions, shifts, source_sic, target_sic
+            )
+        return self._refine_tile_shifts_per_tile(
+            pair, regions, shifts, source_sic, target_sic
+        )
+
+    def _refine_tile_shifts_per_tile(
+        self,
+        pair: ImagePair,
+        regions: tuple[TileRegion, ...],
+        shifts: np.ndarray,
+        source_sic,
+        target_sic,
+    ) -> _CoarseRoutingResult:
+        """Centre one coarse window on each fine tile."""
         settings = self.config.routing
         coarse_config = replace(
             self.config,
@@ -491,6 +508,140 @@ class PairProcessor:
                 match_pending()
         if pending:
             match_pending()
+        counts["coarse_matcher_tile_evaluations"] = evaluations
+        return _CoarseRoutingResult(
+            refined, sampling_seconds, matching_seconds, calls, evaluations, counts
+        )
+
+    def _refine_tile_shifts_shared(
+        self,
+        pair: ImagePair,
+        regions: tuple[TileRegion, ...],
+        shifts: np.ndarray,
+        source_sic,
+        target_sic,
+    ) -> _CoarseRoutingResult:
+        """Share each coarse window among the fine tiles nearest its centre.
+
+        Windows sit on every ``coarse_window_stride``-th fine tile of the fixed
+        tile grid. Each fine tile uses only the window nearest to it, so its
+        support circle stays inside that window's core (stride 3 offsets a
+        tile centre by at most one tile per axis). The window's target crop is
+        placed with the median prior shift of its member tiles. A member without
+        local support in a window that did measure motion is retried with its
+        own centred window, which tolerates a larger shift error.
+        """
+        settings = self.config.routing
+        stride = settings.coarse_window_stride
+        core_size = self.config.matcher.tile_core_size_m
+        origin = self.config.matcher.tile_grid_origin_m
+        half = stride // 2
+        coarse_config = replace(
+            self.config,
+            matcher=replace(
+                self.config.matcher, pixel_size_m=settings.coarse_pixel_size_m
+            ),
+        )
+        coarse = PairProcessor(coarse_config, self.matcher, self.sic_index)
+        refined = shifts.copy()
+        counts = {
+            "coarse_tiles_refined": 0,
+            "coarse_fallback_insufficient_support": 0,
+            "coarse_fallback_invalid_shift": 0,
+            "coarse_fallback_no_source_core_support": 0,
+            "coarse_fallback_no_target_support": 0,
+            "coarse_fallback_no_physics_reachable_valid_overlap": 0,
+            "coarse_skipped_open_water_both_dates": 0,
+        }
+        members: dict[tuple[int, int], list[int]] = {}
+        for index, region in enumerate(regions):
+            key = (
+                math.floor((region.row + half) / stride) * stride,
+                math.floor((region.column + half) / stride) * stride,
+            )
+            members.setdefault(key, []).append(index)
+        sampling_seconds = matching_seconds = 0.0
+        calls = evaluations = 0
+        pending: list[_PreparedTile] = []
+        pending_members: list[list[int]] = []
+        retry: list[int] = []
+        maximum = self.config.matcher.maximum_displacement_m(pair.elapsed_seconds)
+
+        def match_pending():
+            nonlocal matching_seconds, calls, evaluations
+            results, elapsed, batch_calls = coarse._match_prepared_tiles(pair, pending)
+            matching_seconds += elapsed
+            calls += batch_calls
+            evaluations += len(pending)
+            for indices, (matches, _target_px) in zip(
+                pending_members, results, strict=True
+            ):
+                for index in indices:
+                    shift, reason = coarse_match_shift(
+                        matches,
+                        regions[index].center_xy_m,
+                        settings.coarse_support_radius_m,
+                        settings.coarse_minimum_matches,
+                        maximum,
+                    )
+                    if shift is not None:
+                        refined[index] = shift
+                        counts["coarse_tiles_refined"] += 1
+                    elif len(matches) >= settings.coarse_minimum_matches:
+                        # The window measured motion elsewhere; this tile may sit
+                        # beyond its shift tolerance, so give it its own window.
+                        retry.append(index)
+                    else:
+                        counts[f"coarse_fallback_{reason}"] += 1
+            pending.clear()
+            pending_members.clear()
+
+        for (row, column), indices in sorted(members.items()):
+            center = (
+                origin + (column + 0.5) * core_size,
+                origin + (row + 0.5) * core_size,
+            )
+            shift = np.median(shifts[indices], axis=0)
+            target_center = tuple(np.asarray(center) + shift)
+            if coarse._both_dates_open_water(
+                source_sic, target_sic, center, target_center
+            ):
+                counts["coarse_skipped_open_water_both_dates"] += len(indices)
+                continue
+            started = time.perf_counter()
+            sampled, reason = coarse._sample_pair(pair, center, shift)
+            sampling_seconds += time.perf_counter() - started
+            if sampled is None:
+                counts[f"coarse_fallback_{reason}"] += len(indices)
+                continue
+            window = TileRegion(-1, row, column, center, box(
+                center[0] - core_size / 2, center[1] - core_size / 2,
+                center[0] + core_size / 2, center[1] + core_size / 2,
+            ))
+            pending.append(_PreparedTile(window, shift, *sampled))
+            pending_members.append(indices)
+            if len(pending) == self.config.matcher.tile_batch_size:
+                match_pending()
+        if pending:
+            match_pending()
+        counts["coarse_shared_windows"] = len(members)
+        counts["coarse_per_tile_retries"] = len(retry)
+        if retry:
+            single = self._refine_tile_shifts_per_tile(
+                pair,
+                tuple(regions[index] for index in retry),
+                shifts[retry],
+                source_sic,
+                target_sic,
+            )
+            refined[retry] = single.shifts
+            sampling_seconds += single.sampling_seconds
+            matching_seconds += single.matching_seconds
+            calls += single.matcher_calls
+            evaluations += single.matcher_tiles
+            for key, value in single.counts.items():
+                if key != "coarse_matcher_tile_evaluations":
+                    counts[key] += value
         counts["coarse_matcher_tile_evaluations"] = evaluations
         return _CoarseRoutingResult(
             refined, sampling_seconds, matching_seconds, calls, evaluations, counts
