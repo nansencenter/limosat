@@ -22,6 +22,7 @@ from .imagery import pass_pixel_validity_factory
 from .manifest import write_manifest
 from .models import FieldEdge
 from .pair_products import PAIR_PRODUCT_SCHEMA_VERSION, PairProductStore
+from .pair_queue import loss_targeted_pairs
 from .pairs import PairProcessor
 from .planning import PlannedPair, build_candidate_plan, recovery_candidates
 from .recovery import RecoveryTargetStore, load_recovery_target_manifest
@@ -501,10 +502,26 @@ class RunStages:
             return
         by_id = {item.pair.pair_id: item for item in assigned}
         # Nominate unscheduled losses over every candidate so each batch agrees.
-        for pair, positions in store.iter_targeted_recovery_positions(
-            item.pair for item in candidates
-        ):
-            if pair.pair_id in by_id and len(positions):
+        if self.config.routing.recovery_target_policy == "all_losses":
+            for pair, positions, _identities in store.iter_targeted_recovery_positions(
+                item.pair for item in candidates
+            ):
+                if pair.pair_id in by_id and len(positions):
+                    yield PairWork(by_id[pair.pair_id], positions)
+            return
+        found = [
+            (pair, positions, identities)
+            for pair, positions, identities in store.iter_targeted_recovery_positions(
+                item.pair for item in candidates
+            )
+            if len(positions)
+        ]
+        selected = loss_targeted_pairs(
+            (pair.pair_id, pair.elapsed_seconds, identities)
+            for pair, _positions, identities in found
+        )
+        for pair, positions, _identities in found:
+            if pair.pair_id in selected and pair.pair_id in by_id:
                 yield PairWork(by_id[pair.pair_id], positions)
 
     @staticmethod

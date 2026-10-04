@@ -75,6 +75,16 @@ dormant are not nominated again. The SQLite and Parquet recovery paths apply
 the same rule; nothing is predicted, and the recovery field must still measure
 the motion. In the March 2020 capped-plan archive this class was 26% of
 uncensored endings, and 78% of a held-out sample gained a QC-accepted link.
+
+By default (`routing.recovery_target_policy: loss_targeted`) only the pairs
+that some loss needs are run: every lost identity nominates its shortest
+eligible pair, and each selected pair carries all losses eligible for it, so
+its field is reused. Pairs that would only repeat losses already nominated for
+a shorter pair are not run. In the 2015 N-ICE run (168 h horizon) this kept
+2,478 of 11,802 candidate pairs and 15.1M of 81.5M positions for the same
+671k losses. `all_losses` restores the previous behaviour, which targets every
+dormant row on every eligible pair. The manifest records the policy. Both the
+SQLite and Parquet paths apply it.
 For adaptive rounds, pass a frozen JSON request plan with
 `pair_request_schema_version: 1`, `run_id`,
 `config_sha256`, `primary_composition_manifest_sha256`, and a `pairs` list of

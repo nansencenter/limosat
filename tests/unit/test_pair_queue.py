@@ -47,3 +47,25 @@ def test_pair_batch_serializes_as_frozen_target_request():
         "pair_id": "a__b", "trajectory_ids": ["parcel-1", "parcel-2"]
     }]
     assert requests["primary_composition_manifest_sha256"] == "primary"
+
+
+def test_loss_targeted_pairs_nominate_shortest_and_drop_redundant_pairs():
+    from limosat.pair_queue import loss_targeted_pairs
+
+    selected = loss_targeted_pairs([
+        ("long", 72 * 3600.0, ["a", "b"]),
+        ("short", 12 * 3600.0, ["a"]),
+        ("middle", 24 * 3600.0, ["a", "b"]),
+        ("only_c", 96 * 3600.0, ["c"]),
+    ])
+    # a -> short, b -> middle, c -> only_c; long adds no new loss.
+    assert selected == frozenset({"short", "middle", "only_c"})
+
+
+def test_loss_targeted_pairs_break_ties_by_pair_id_and_reject_bad_elapsed():
+    import pytest
+    from limosat.pair_queue import loss_targeted_pairs
+
+    assert loss_targeted_pairs([("b", 1.0, ["x"]), ("a", 1.0, ["x"])]) == frozenset({"a"})
+    with pytest.raises(ValueError):
+        loss_targeted_pairs([("a", 0.0, ["x"])])

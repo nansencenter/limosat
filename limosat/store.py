@@ -624,8 +624,13 @@ class RunStore:
                 nominated.update(row[0] for row in lost)
                 merged = {identity: (x, y) for identity, x, y in rows}
                 merged.update({identity: (x, y) for identity, x, y in lost})
-                positions = [merged[identity] for identity in sorted(merged)]
-                yield pair, np.asarray(positions, dtype=np.float64).reshape(-1, 2)
+                identities = sorted(merged)
+                positions = [merged[identity] for identity in identities]
+                yield (
+                    pair,
+                    np.asarray(positions, dtype=np.float64).reshape(-1, 2),
+                    tuple(identities),
+                )
 
     def _unscheduled_loss_rows(
         self,

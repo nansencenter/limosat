@@ -108,6 +108,7 @@ class RoutingConfig:
     coarse_minimum_matches: int = 12
     coarse_support_radius_m: float = 35_840.0
     coarse_window_stride: int = 1
+    recovery_target_policy: Literal["loss_targeted", "all_losses"] = "loss_targeted"
 
     def __post_init__(self) -> None:
         if not 0 < self.planning_grid_spacing_m < float("inf"):
@@ -124,6 +125,8 @@ class RoutingConfig:
             or self.coarse_minimum_matches < 1
         ):
             raise ValueError("coarse_minimum_matches must be a positive integer")
+        if self.recovery_target_policy not in ("loss_targeted", "all_losses"):
+            raise ValueError("recovery_target_policy must be loss_targeted or all_losses")
         if (
             isinstance(self.coarse_window_stride, bool)
             or not isinstance(self.coarse_window_stride, int)
@@ -258,6 +261,10 @@ class RunConfig:
         if self.routing.coarse_window_stride == 1:
             # Preserve the identity of configurations with one coarse window per tile.
             values["routing"].pop("coarse_window_stride")
+        if self.routing.recovery_target_policy == "loss_targeted":
+            # Target selection does not change pair measurements, so the default
+            # policy keeps the identity of existing configurations.
+            values["routing"].pop("recovery_target_policy")
         return values
 
     @property

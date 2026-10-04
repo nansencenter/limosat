@@ -146,10 +146,44 @@ def test_sqlite_recovery_targets_unscheduled_losses_once(tmp_path):
 
     yielded = dict(
         (pair.target.image_id, positions)
-        for pair, positions in store.iter_targeted_recovery_positions(
+        for pair, positions, _identities in store.iter_targeted_recovery_positions(
             (ImagePair(images[0], images[2]), ImagePair(images[0], images[3]))
         )
     )
 
     np.testing.assert_array_equal(yielded["c"], [[10.0, 20.0], [30.0, 40.0]])
     assert yielded["d"].shape == (0, 2)
+
+
+def test_collect_mode_records_candidates_without_writing(tmp_path):
+    cfg = _config(tmp_path)
+    images = _images(("a", "b", "c"))
+    to_b, to_c = _planned(images[0], images[1], 0), _planned(images[0], images[2], 1)
+    batches = (
+        (_point("lost", "a", 0, "created", (10.0, 20.0)),),
+        (_point("lost", "b", 1, "dormant"),),
+        (_point("lost", "c", 2, "dormant"),),
+    )
+    store = RecoveryTargetStore(cfg, tmp_path / "targets")
+    collected = {}
+    selected = _write_recovery_targets(
+        store, (to_b, to_c), images, batches, collect=collected,
+    )
+    assert selected == (to_b, to_c)
+    assert collected == {to_b.pair.pair_id: ("lost",), to_c.pair.pair_id: ("lost",)}
+    assert store.count() == 0
+
+
+def test_recovery_target_policy_defaults_to_loss_targeted_and_keeps_identity(tmp_path):
+    from dataclasses import replace
+
+    import pytest
+    from limosat import RoutingConfig
+
+    cfg = _config(tmp_path)
+    assert cfg.routing.recovery_target_policy == "loss_targeted"
+    assert "recovery_target_policy" not in cfg.to_dict()["routing"]
+    legacy = replace(cfg, routing=replace(cfg.routing, recovery_target_policy="all_losses"))
+    assert legacy.to_dict()["routing"]["recovery_target_policy"] == "all_losses"
+    with pytest.raises(ValueError):
+        RoutingConfig(recovery_target_policy="everything")

@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Mapping, Sequence
+from typing import Iterable, Mapping, Sequence
 
 
 @dataclass(frozen=True)
@@ -90,3 +90,34 @@ def build_pair_request_plan(
             for pair_id, identities in batch
         ],
     }
+
+
+def loss_targeted_pairs(
+    candidates: Iterable[tuple[str, float, Sequence[str]]],
+) -> frozenset[str]:
+    """Select the pairs that some loss nominates as its shortest option.
+
+    Each candidate is ``(pair_id, elapsed_seconds, trajectory_ids)``. Every
+    lost identity nominates its shortest eligible pair (ties by pair id). A
+    selected pair keeps all identities eligible for it, so its field is reused
+    for losses that nominated a longer pair. Outcome-blind and deterministic.
+    """
+    codes: dict[str, int] = {}
+    ordered = []
+    for pair_id, elapsed, identities in candidates:
+        if not math.isfinite(elapsed) or elapsed <= 0:
+            raise ValueError(f"pair option needs positive elapsed time: {pair_id}")
+        ordered.append((
+            float(elapsed), pair_id,
+            [codes.setdefault(identity, len(codes)) for identity in identities],
+        ))
+    ordered.sort(key=lambda item: (item[0], item[1]))
+    nominated = bytearray(len(codes))
+    selected = set()
+    for _elapsed, pair_id, identities in ordered:
+        fresh = [code for code in identities if not nominated[code]]
+        if fresh:
+            selected.add(pair_id)
+            for code in fresh:
+                nominated[code] = 1
+    return frozenset(selected)

@@ -13,6 +13,7 @@ import shapely
 
 from .catalog import ImagePair, ImageRecord, load_catalogue
 from .config import RunConfig
+from .pair_queue import loss_targeted_pairs
 from .planning import PlannedPair, build_candidate_plan, recovery_candidates
 from .store import file_sha256
 from .trajectory import TrajectoryPoint
@@ -240,15 +241,38 @@ def prepare_recovery_targets(
             requests[pair_id] = frozenset(identities)
         request_plan_sha256 = file_sha256(request_path)
     images = catalogue.chronological()
-    batches = iter_primary_point_batches(points_path, images)
     output = Path(destination)
     manifest_path = output / "recovery-targets-manifest-v1.json"
     if manifest_path.exists():
         raise FileExistsError(manifest_path)
     store = RecoveryTargetStore(config, output / "pairs")
     counts = {"unscheduled_loss_positions": 0}
+    policy = (
+        "request_plan" if requests is not None
+        else config.routing.recovery_target_policy
+    )
+    loss_candidates = None
+    if policy == "loss_targeted":
+        collected: dict[str, tuple[str, ...]] = {}
+        _write_recovery_targets(
+            store, eligible, images,
+            iter_primary_point_batches(points_path, images),
+            counts=counts, collect=collected,
+        )
+        loss_candidates = len(collected)
+        elapsed = {item.pair.pair_id: item.pair.elapsed_seconds for item in eligible}
+        selected = loss_targeted_pairs(
+            (pair_id, elapsed[pair_id], identities)
+            for pair_id, identities in collected.items()
+        )
+        requests = {
+            pair_id: frozenset(collected[pair_id]) for pair_id in selected
+        }
+        del collected
     targeted = _write_recovery_targets(
-        store, eligible, images, batches, requests, counts=counts
+        store, eligible, images,
+        iter_primary_point_batches(points_path, images),
+        requests, counts=counts,
     )
     product_set = hashlib.sha256()
     target_count = 0
@@ -276,6 +300,8 @@ def prepare_recovery_targets(
         "primary_composition_manifest": str(primary_manifest_path),
         "primary_composition_manifest_sha256": file_sha256(primary_manifest_path),
         "request_plan_sha256": request_plan_sha256,
+        "target_policy": policy,
+        "loss_candidate_pairs": loss_candidates,
         "unscheduled_loss_positions": counts["unscheduled_loss_positions"],
         "eligible_recovery_pairs": len(eligible),
         "targeted_recovery_pairs": len(targeted),
@@ -292,7 +318,7 @@ def prepare_recovery_targets(
     os.replace(temporary, manifest_path)
     return {"manifest": str(manifest_path), **{k: manifest[k] for k in (
         "eligible_recovery_pairs", "targeted_recovery_pairs", "targeted_positions",
-        "unscheduled_loss_positions",
+        "unscheduled_loss_positions", "target_policy", "loss_candidate_pairs",
     )}}
 
 
@@ -352,8 +378,12 @@ def _write_recovery_targets(
     requests: Mapping[str, frozenset[str]] | None = None,
     *,
     counts: dict[str, int] | None = None,
+    collect: dict[str, tuple[str, ...]] | None = None,
 ) -> tuple[PlannedPair, ...]:
     """Write recovery targets for dormant rows and unscheduled losses.
+
+    With ``collect``, nothing is written: each candidate pair's identities are
+    recorded instead, for loss-targeted selection.
 
     An unscheduled loss is an identity whose last measurement is on the pair's
     source image and which has no row at all on the target image, because no
@@ -430,7 +460,10 @@ def _write_recovery_targets(
                         f"requested recovery target is already measured: {item.pair.pair_id}"
                     )
                 identities = sorted(requested)
-            if identities:
+            if identities and collect is not None:
+                collect[item.pair.pair_id] = tuple(identities)
+                targeted.append(item)
+            elif identities:
                 store.save(
                     item.pair,
                     np.asarray(
