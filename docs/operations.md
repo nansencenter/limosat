@@ -155,6 +155,42 @@ support radius, 5 m), so the setting changes results slightly and is opt-in.
 Stride 1 reproduces earlier products exactly and keeps their configuration
 identity.
 
+Fine tile cores do not overlap by default, so each location is matched in one
+tile per pair. Most failed tiles are partial target windows: a textured source
+facing a mostly invalid target returns no confident matches (October 2026 tile
+census, March 2020). Three opt-in settings address this, independent of tile size:
+
+- `tile_grid_offsets: [[0, 0], [0.5, 0.5]]` adds a grid shifted by half a core
+  diagonally. Coarse windows follow the primary grid; the extra tiles take
+  their shift from the pooled coarse matches, so no coarse matching is added.
+- `masked_rematch_target_valid_fraction: 0.5` re-matches a tile whose target
+  window is under 50% valid with the source blanked where the aligned target
+  is invalid, and keeps both results.
+- Overlapping matches keep one match per `layout_dedup_m` (160 m) source bin
+  before the field, so duplicates cannot inflate the agreement rule. The
+  displacement difference between co-located matches is recorded as
+  `layout_colocated_difference_*` (median 15 m, 0.3-0.5% over 1 km).
+  `layout_field_merge: primary_first` keeps every primary-grid node and fills
+  only its gaps; folds created by added nodes remove added nodes first.
+
+On 30 random and 20 Chukchi/ESS stress primary pairs (A100) the first two
+settings added 4.6% and 24.5% field nodes (3.7% and 17.9% after the
+missing-node fallback) at 1.65-1.9x matcher tiles and 1.6x pair time, and
+recovered 48% of ORB-consistent no-measurement endings on the stress pairs.
+In the preceding experiment IABP buoy medians at common nodes were unchanged
+(44 versus 45 m). Changing
+the tile size alone (384 or 640 px) changed nodes by -2.4 to +2.9%, while the
+layered layout gained 18.6-20.3% on the stress pairs at all three sizes.
+
+`tile_sampling: pair_cache` resamples each scene once per 1024-pixel lattice
+block and crops tiles from the blocks; target windows snap to the pixel lattice
+(at most half a pixel). It cut sampling time by 30-48% and layered pair time
+from 1.6x to 1.3x, but moves about 2% of nodes (median 32 m at common nodes)
+because the matcher sees slightly shifted windows, so it is a separate opt-in.
+Masking in the coarse pass is not implemented and needs its own test. Matcher
+timings above are A100; on newer GPUs sampling and field estimation take a
+larger share, which favours `pair_cache` and fewer, larger tiles.
+
 Inference tiles cover the source footprint intersected with the target
 footprint buffered by the elapsed-time physical displacement limit. A validity
 gate avoids inference only where source-core and target support cannot contain
