@@ -248,6 +248,87 @@ def north_up_patch(
     return patch, valid
 
 
+class ProjectedPatchCache:
+    """Resample each scene once per fixed lattice block and crop tiles from it.
+
+    Pixel centres of every block and every lattice-aligned tile sit at
+    ``(i + 0.5) * pixel_size`` in x and ``-(j + 0.5) * pixel_size`` in y, so an
+    even-sized tile whose centre lies on a pixel corner is an exact crop of the
+    blocks. Only the transform-grid interpolation differs from a direct
+    ``north_up_patch`` call (sub-pixel). Other windows are sampled directly.
+    """
+
+    def __init__(
+        self,
+        analysis_epsg: int = 3413,
+        transform_grid_spacing_px: int = 32,
+        block_px: int = 1024,
+    ) -> None:
+        self.analysis_epsg = analysis_epsg
+        self.transform_grid_spacing_px = transform_grid_spacing_px
+        self.block_px = block_px
+        self._blocks: dict[tuple, tuple[np.ndarray, np.ndarray]] = {}
+
+    def clear(self) -> None:
+        self._blocks.clear()
+
+    @staticmethod
+    def aligned(center_xy_m: tuple[float, float], pixels: int, pixel_size_m: float) -> bool:
+        if pixels % 2:
+            return False
+        return all(
+            abs(value / pixel_size_m - round(value / pixel_size_m)) < 1.0e-6
+            for value in center_xy_m
+        )
+
+    def patch(
+        self,
+        path: str | Path,
+        center_xy_m: tuple[float, float],
+        pixels: int,
+        pixel_size_m: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if not self.aligned(center_xy_m, pixels, pixel_size_m):
+            return north_up_patch(
+                path, center_xy_m, pixels, pixel_size_m,
+                self.analysis_epsg, self.transform_grid_spacing_px,
+            )
+        column0 = round(center_xy_m[0] / pixel_size_m) - pixels // 2
+        row0 = -round(center_xy_m[1] / pixel_size_m) - pixels // 2
+        patch = np.zeros((pixels, pixels), dtype=np.uint8)
+        valid = np.zeros((pixels, pixels), dtype=bool)
+        size = self.block_px
+        for block_row in range(row0 // size, (row0 + pixels - 1) // size + 1):
+            for block_column in range(column0 // size, (column0 + pixels - 1) // size + 1):
+                image, mask = self._block(path, pixel_size_m, block_row, block_column)
+                r0 = max(row0, block_row * size)
+                r1 = min(row0 + pixels, (block_row + 1) * size)
+                c0 = max(column0, block_column * size)
+                c1 = min(column0 + pixels, (block_column + 1) * size)
+                target = (slice(r0 - row0, r1 - row0), slice(c0 - column0, c1 - column0))
+                source = (
+                    slice(r0 - block_row * size, r1 - block_row * size),
+                    slice(c0 - block_column * size, c1 - block_column * size),
+                )
+                patch[target] = image[source]
+                valid[target] = mask[source]
+        return patch, valid
+
+    def _block(self, path, pixel_size_m, block_row, block_column):
+        key = (str(path), float(pixel_size_m), block_row, block_column)
+        if key not in self._blocks:
+            size = self.block_px
+            center = (
+                (block_column * size + size / 2) * pixel_size_m,
+                -(block_row * size + size / 2) * pixel_size_m,
+            )
+            self._blocks[key] = north_up_patch(
+                path, center, size, pixel_size_m,
+                self.analysis_epsg, self.transform_grid_spacing_px,
+            )
+        return self._blocks[key]
+
+
 def projected_coordinates(
     points_px: np.ndarray,
     center_xy_m: tuple[float, float],

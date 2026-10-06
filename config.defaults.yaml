@@ -22,6 +22,13 @@ matcher:
   tile_batch_size: 4
   prefix_cuda_graph: true
   cuda_graph_warmup_batches: 3
+  # Opt-in layered layout (docs/operations.md): [[0, 0], [0.5, 0.5]] adds the
+  # diagonal half-offset grid; offsets are fractions of the tile core.
+  tile_grid_offsets: [[0.0, 0.0]]
+  masked_rematch_target_valid_fraction: 0.0  # 0.5 re-matches partial tiles masked
+  layout_dedup_m: 160.0
+  layout_field_merge: primary_first  # or union
+  tile_sampling: per_tile  # pair_cache resamples each scene once per block
 
 field:
   grid_spacing_m: 4000.0

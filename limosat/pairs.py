@@ -5,9 +5,10 @@ from __future__ import annotations
 import math
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field as dataclass_field, replace
 from typing import Protocol
 
+import cv2
 import numpy as np
 from shapely import box
 from shapely.geometry.base import BaseGeometry
@@ -20,8 +21,13 @@ from .efficientloftr import (
     valid_endpoints,
     valid_support,
 )
-from .field import estimate_field, reject_folds
-from .imagery import north_up_patch, projected_coordinates, projected_footprint
+from .field import estimate_field, flipped_indices, reject_folds
+from .imagery import (
+    ProjectedPatchCache,
+    north_up_patch,
+    projected_coordinates,
+    projected_footprint,
+)
 from .models import DisplacementField, MotionMatches, PairResult
 from .routing import (
     CoarseTranslationUnavailable,
@@ -53,6 +59,7 @@ class TileRegion:
     column: int
     center_xy_m: tuple[float, float]
     core: BaseGeometry
+    grid: int = 0
 
 
 @dataclass(frozen=True)
@@ -63,6 +70,7 @@ class _PreparedTile:
     target: np.ndarray
     source_valid: np.ndarray
     target_valid: np.ndarray
+    masked: bool = False
 
 
 @dataclass(frozen=True)
@@ -86,6 +94,7 @@ class _CoarseRoutingResult:
     matcher_calls: int
     matcher_tiles: int
     counts: dict[str, int]
+    matches: MotionMatches = dataclass_field(default_factory=MotionMatches.empty)
 
 
 class PairProcessor:
@@ -100,6 +109,13 @@ class PairProcessor:
         self.sic_index = sic_index
         if self.sic_index is None and config.open_water.enabled:
             self.sic_index = SicFileIndex(config.open_water.sic_root)
+        self._patch_cache = (
+            ProjectedPatchCache(
+                config.analysis_epsg, config.matcher.transform_grid_spacing_px
+            )
+            if config.matcher.tile_sampling == "pair_cache"
+            else None
+        )
 
     def process(
         self,
@@ -109,6 +125,25 @@ class PairProcessor:
         targeted_positions_xy_m: np.ndarray | None = None,
     ) -> PairResult:
         started = time.perf_counter()
+        if self._patch_cache is not None:
+            self._patch_cache.clear()
+        try:
+            return self._process(
+                pair, started, previous_field, previous_elapsed_seconds,
+                targeted_positions_xy_m,
+            )
+        finally:
+            if self._patch_cache is not None:
+                self._patch_cache.clear()
+
+    def _process(
+        self,
+        pair: ImagePair,
+        started: float,
+        previous_field: DisplacementField | None,
+        previous_elapsed_seconds: float | None,
+        targeted_positions_xy_m: np.ndarray | None,
+    ) -> PairResult:
         overlap = self._overlap(pair)
         reachable_domain = self._motion_reachable_domain(pair)
         domain = reachable_domain
@@ -310,6 +345,7 @@ class PairProcessor:
             elapsed = 0.0
             skipped = {key: 0 for key in gate_counts}
             for region, shift in region_shifts:
+                shift = self._place(region.center_xy_m, shift)
                 target_center = tuple(
                     np.asarray(region.center_xy_m) + np.asarray(shift)
                 )
@@ -330,7 +366,15 @@ class PairProcessor:
                     skipped[f"skipped_{skip_reason}"] += 1
                     continue
                 pending.append(_PreparedTile(region, shift, *prepared))
-                if len(pending) == self.config.matcher.tile_batch_size:
+                if (
+                    0.0
+                    < prepared[3].mean()
+                    < self.config.matcher.masked_rematch_target_valid_fraction
+                ):
+                    pending.append(_masked_tile(
+                        pending[-1], self.config.matcher.endpoint_support_radius_px
+                    ))
+                if len(pending) >= self.config.matcher.tile_batch_size:
                     break
             return pending, elapsed, skipped
 
@@ -348,7 +392,7 @@ class PairProcessor:
                     pair, pending_tiles
                 )
                 matched_tiles.extend(
-                    (item.region, item.shift, result)
+                    (item.region, item.shift, result, item.masked)
                     for item, result in zip(pending_tiles, results, strict=True)
                 )
                 matching_seconds += elapsed
@@ -356,9 +400,12 @@ class PairProcessor:
                 matcher_tiles += len(pending_tiles)
 
         recovery_tiles: list[tuple[int, _PreparedTile]] = []
-        for index, (region, shift, (batch, target_px)) in enumerate(matched_tiles):
+        for index, (region, shift, (batch, target_px), masked) in enumerate(
+            matched_tiles
+        ):
             if (
                 self.config.routing.residual_edge_recovery
+                and not masked
                 and len(batch)
                 and (correction := residual_edge_correction(
                     batch.source_xy_m,
@@ -368,7 +415,7 @@ class PairProcessor:
                     self.config.matcher,
                 )) is not None
             ):
-                corrected_shift = shift + correction
+                corrected_shift = self._place(region.center_xy_m, shift + correction)
                 sampled_at = time.perf_counter()
                 recovered, _skip_reason = self._sample_pair(
                     pair, region.center_xy_m, corrected_shift
@@ -398,13 +445,45 @@ class PairProcessor:
             matcher_tiles += len(recovery_tiles)
         batches = [
             batch
-            for _region, _shift, (batch, _target_px) in matched_tiles
+            for _region, _shift, (batch, _target_px), _masked in matched_tiles
             if len(batch)
         ]
         matches = _combine(batches)
         field_at = time.perf_counter()
-        field = estimate_field(matches, pair, domain, self.config.field)
-        field, rejected = reject_folds(field, self.config.field.maximum_triangle_edge_m)
+        edge = self.config.field.maximum_triangle_edge_m
+        if self.config.matcher.layered_layout:
+            matches, layout_counts = _deduplicate(
+                matches, self.config.matcher.layout_dedup_m
+            )
+            gate_counts.update(layout_counts)
+            gate_counts["layout_secondary_tiles"] = sum(
+                1 for region, *_rest, masked in matched_tiles
+                if region.grid and not masked
+            )
+            gate_counts["layout_masked_rematches"] = sum(
+                1 for *_rest, masked in matched_tiles if masked
+            )
+            field, rejected = reject_folds(
+                estimate_field(matches, pair, domain, self.config.field), edge
+            )
+            if self.config.matcher.layout_field_merge == "primary_first":
+                primary = _combine([
+                    batch
+                    for region, _shift, (batch, _target_px), masked in matched_tiles
+                    if len(batch) and not region.grid and not masked
+                ])
+                primary_field, primary_rejected = reject_folds(
+                    estimate_field(primary, pair, domain, self.config.field), edge
+                )
+                gate_counts["layout_primary_nodes"] = int(primary_field.available.sum())
+                field, merge_rejected = _merge_primary_first(
+                    primary_field, field, edge
+                )
+                rejected = np.union1d(primary_rejected, merge_rejected)
+            gate_counts["layout_nodes"] = int(field.available.sum())
+        else:
+            field = estimate_field(matches, pair, domain, self.config.field)
+            field, rejected = reject_folds(field, edge)
         field_seconds = time.perf_counter() - field_at
         return _HypothesisResult(
             matches,
@@ -426,13 +505,48 @@ class PairProcessor:
         source_sic,
         target_sic,
     ) -> _CoarseRoutingResult:
-        """Run one bounded coarse pass with the same model before fine sampling."""
-        if self.config.routing.coarse_window_stride > 1:
-            return self._refine_tile_shifts_shared(
-                pair, regions, shifts, source_sic, target_sic
-            )
-        return self._refine_tile_shifts_per_tile(
-            pair, regions, shifts, source_sic, target_sic
+        """Run one bounded coarse pass with the same model before fine sampling.
+
+        Coarse windows follow the primary grid only. Tiles of the other grids take
+        their shift from the pooled coarse matches around their own centre, so
+        extra grids add no coarse matching.
+        """
+        refine = (
+            self._refine_tile_shifts_shared
+            if self.config.routing.coarse_window_stride > 1
+            else self._refine_tile_shifts_per_tile
+        )
+        primary = np.array([not region.grid for region in regions], dtype=bool)
+        if primary.all():
+            return refine(pair, regions, shifts, source_sic, target_sic)
+        indices = np.flatnonzero(primary)
+        result = refine(
+            pair, tuple(regions[index] for index in indices), shifts[indices],
+            source_sic, target_sic,
+        )
+        refined = shifts.copy()
+        refined[indices] = result.shifts
+        counts = dict(result.counts)
+        counts["coarse_secondary_refined"] = 0
+        counts["coarse_secondary_fallback"] = 0
+        settings = self.config.routing
+        maximum = self.config.matcher.maximum_displacement_m(pair.elapsed_seconds)
+        for index in np.flatnonzero(~primary):
+            shift, _reason = coarse_match_shift(
+                result.matches,
+                regions[index].center_xy_m,
+                settings.coarse_support_radius_m,
+                settings.coarse_minimum_matches,
+                maximum,
+            ) if len(result.matches) else (None, "insufficient_support")
+            if shift is None:
+                counts["coarse_secondary_fallback"] += 1
+            else:
+                refined[index] = shift
+                counts["coarse_secondary_refined"] += 1
+        return _CoarseRoutingResult(
+            refined, result.sampling_seconds, result.matching_seconds,
+            result.matcher_calls, result.matcher_tiles, counts, result.matches,
         )
 
     def _refine_tile_shifts_per_tile(
@@ -466,6 +580,7 @@ class PairProcessor:
         calls = evaluations = 0
         pending: list[_PreparedTile] = []
         indices: list[int] = []
+        collected: list[MotionMatches] = []
 
         def match_pending():
             nonlocal matching_seconds, calls, evaluations
@@ -474,6 +589,7 @@ class PairProcessor:
             calls += batch_calls
             evaluations += len(pending)
             for index, (matches, _target_px) in zip(indices, results, strict=True):
+                collected.append(matches)
                 shift, reason = coarse_match_shift(
                     matches,
                     regions[index].center_xy_m,
@@ -490,6 +606,7 @@ class PairProcessor:
             indices.clear()
 
         for index, (region, shift) in enumerate(zip(regions, shifts, strict=True)):
+            shift = coarse._place(region.center_xy_m, shift)
             target_center = tuple(np.asarray(region.center_xy_m) + shift)
             if coarse._both_dates_open_water(
                 source_sic, target_sic, region.center_xy_m, target_center
@@ -510,7 +627,8 @@ class PairProcessor:
             match_pending()
         counts["coarse_matcher_tile_evaluations"] = evaluations
         return _CoarseRoutingResult(
-            refined, sampling_seconds, matching_seconds, calls, evaluations, counts
+            refined, sampling_seconds, matching_seconds, calls, evaluations, counts,
+            _combine([item for item in collected if len(item)]),
         )
 
     def _refine_tile_shifts_shared(
@@ -565,6 +683,7 @@ class PairProcessor:
         pending: list[_PreparedTile] = []
         pending_members: list[list[int]] = []
         retry: list[int] = []
+        collected: list[MotionMatches] = []
         maximum = self.config.matcher.maximum_displacement_m(pair.elapsed_seconds)
 
         def match_pending():
@@ -576,6 +695,7 @@ class PairProcessor:
             for indices, (matches, _target_px) in zip(
                 pending_members, results, strict=True
             ):
+                collected.append(matches)
                 for index in indices:
                     shift, reason = coarse_match_shift(
                         matches,
@@ -601,7 +721,7 @@ class PairProcessor:
                 origin + (column + 0.5) * core_size,
                 origin + (row + 0.5) * core_size,
             )
-            shift = np.median(shifts[indices], axis=0)
+            shift = coarse._place(center, np.median(shifts[indices], axis=0))
             target_center = tuple(np.asarray(center) + shift)
             if coarse._both_dates_open_water(
                 source_sic, target_sic, center, target_center
@@ -635,6 +755,7 @@ class PairProcessor:
                 target_sic,
             )
             refined[retry] = single.shifts
+            collected.append(single.matches)
             sampling_seconds += single.sampling_seconds
             matching_seconds += single.matching_seconds
             calls += single.matcher_calls
@@ -644,7 +765,8 @@ class PairProcessor:
                     counts[key] += value
         counts["coarse_matcher_tile_evaluations"] = evaluations
         return _CoarseRoutingResult(
-            refined, sampling_seconds, matching_seconds, calls, evaluations, counts
+            refined, sampling_seconds, matching_seconds, calls, evaluations, counts,
+            _combine([item for item in collected if len(item)]),
         )
 
     def _overlap(self, pair: ImagePair) -> BaseGeometry:
@@ -702,25 +824,35 @@ class PairProcessor:
         )
         return source.confidently_open and target.confidently_open
 
-    def _sample_pair(self, pair: ImagePair, center, shift):
+    def _place(self, center, shift) -> np.ndarray:
+        """Snap the target window to the sampling lattice when tiles are cached."""
+        shift = np.asarray(shift, dtype=np.float64)
+        if self._patch_cache is None:
+            return shift
+        size = self.config.matcher.pixel_size_m
+        return np.round((np.asarray(center) + shift) / size) * size - np.asarray(center)
+
+    def _patch(self, path, center):
         settings = self.config.matcher
-        source, source_valid = north_up_patch(
-            pair.source.path,
+        if self._patch_cache is not None:
+            return self._patch_cache.patch(
+                path, center, settings.tile_size_px, settings.pixel_size_m
+            )
+        return north_up_patch(
+            path,
             center,
             settings.tile_size_px,
             settings.pixel_size_m,
             self.config.analysis_epsg,
             settings.transform_grid_spacing_px,
         )
+
+    def _sample_pair(self, pair: ImagePair, center, shift):
+        """Sample source and target windows; callers pass a ``_place``d shift."""
+        settings = self.config.matcher
+        source, source_valid = self._patch(pair.source.path, center)
         target_center = tuple(np.asarray(center) + np.asarray(shift))
-        target, target_valid = north_up_patch(
-            pair.target.path,
-            target_center,
-            settings.tile_size_px,
-            settings.pixel_size_m,
-            self.config.analysis_epsg,
-            settings.transform_grid_spacing_px,
-        )
+        target, target_valid = self._patch(pair.target.path, target_center)
         source_valid = valid_support(source_valid, settings.endpoint_support_radius_px)
         target_valid = valid_support(target_valid, settings.endpoint_support_radius_px)
         core = np.zeros_like(source_valid)
@@ -775,9 +907,9 @@ class PairProcessor:
         for (index, _prepared), candidate in zip(
             recovery_tiles, recovered_results, strict=True
         ):
-            region, shift, existing = matched_tiles[index]
+            region, shift, existing, masked = matched_tiles[index]
             if len(candidate[0]) > len(existing[0]):
-                matched_tiles[index] = (region, shift, candidate)
+                matched_tiles[index] = (region, shift, candidate, masked)
         return elapsed, calls
 
     def _filter_tile_matches(self, pair, tile, raw_matches):
@@ -824,27 +956,132 @@ def tile_layout(domain: BaseGeometry, config: RunConfig) -> tuple[TileRegion, ..
     if domain.is_empty:
         return ()
     core_size = config.matcher.tile_core_size_m
-    origin = config.matcher.tile_grid_origin_m
     minx, miny, maxx, maxy = domain.bounds
-    columns = range(math.floor((minx - origin) / core_size), math.ceil((maxx - origin) / core_size))
-    rows = range(math.floor((miny - origin) / core_size), math.ceil((maxy - origin) / core_size))
     regions = []
-    for row in rows:
-        for column in columns:
-            x0, y0 = origin + column * core_size, origin + row * core_size
-            core = box(x0, y0, x0 + core_size, y0 + core_size)
-            if not core.intersects(domain):
-                continue
-            regions.append(
-                TileRegion(
-                    len(regions),
-                    row,
-                    column,
-                    (x0 + core_size / 2, y0 + core_size / 2),
-                    core,
+    for grid, (offset_x, offset_y) in enumerate(config.matcher.tile_grid_offsets):
+        origin_x = config.matcher.tile_grid_origin_m + offset_x * core_size
+        origin_y = config.matcher.tile_grid_origin_m + offset_y * core_size
+        columns = range(
+            math.floor((minx - origin_x) / core_size),
+            math.ceil((maxx - origin_x) / core_size),
+        )
+        rows = range(
+            math.floor((miny - origin_y) / core_size),
+            math.ceil((maxy - origin_y) / core_size),
+        )
+        for row in rows:
+            for column in columns:
+                x0, y0 = origin_x + column * core_size, origin_y + row * core_size
+                core = box(x0, y0, x0 + core_size, y0 + core_size)
+                if not core.intersects(domain):
+                    continue
+                regions.append(
+                    TileRegion(
+                        len(regions),
+                        row,
+                        column,
+                        (x0 + core_size / 2, y0 + core_size / 2),
+                        core,
+                        grid,
+                    )
                 )
-            )
     return tuple(regions)
+
+
+def _masked_tile(tile: _PreparedTile, support_radius_px: int) -> _PreparedTile:
+    """Blank the source where the aligned target window has no valid support.
+
+    A textured source facing a mostly invalid target suppresses confident
+    matches; showing both images only the shared strip restores them. The
+    target support was eroded by ``support_radius_px``; dilating it back by the
+    same radius keeps source texture up to the target's valid edge.
+    """
+    kernel = np.ones((2 * support_radius_px + 1,) * 2, np.uint8)
+    support = cv2.dilate(tile.target_valid.astype(np.uint8), kernel).astype(bool)
+    source = tile.source.copy()
+    source[~(tile.source_valid & support)] = 0
+    target = tile.target.copy()
+    target[~tile.target_valid] = 0
+    return replace(tile, source=source, target=target, masked=True)
+
+
+def _deduplicate(
+    matches: MotionMatches, bin_m: float
+) -> tuple[MotionMatches, dict[str, int | float]]:
+    """Keep the highest-score match per source bin and report co-located agreement.
+
+    Overlapping tiles measure the same ice independently, so the displacement
+    difference between co-located matches is a truth-free consistency signal.
+    """
+    counts: dict[str, int | float] = {
+        "layout_dedup_removed": 0,
+        "layout_colocated_bins": 0,
+        "layout_colocated_difference_median_m": 0.0,
+        "layout_colocated_difference_gt_1km_share": 0.0,
+    }
+    if not len(matches):
+        return matches, counts
+    bins = np.floor(matches.source_xy_m / bin_m).astype(np.int64)
+    order = np.lexsort((-matches.score, bins[:, 1], bins[:, 0]))
+    sorted_bins = bins[order]
+    first = np.r_[True, np.any(sorted_bins[1:] != sorted_bins[:-1], axis=1)]
+    leader = order[np.maximum.accumulate(np.where(first, np.arange(len(order)), 0))]
+    duplicate = ~first
+    if duplicate.any():
+        displacement = matches.displacement_m
+        difference = np.linalg.norm(
+            displacement[order[duplicate]] - displacement[leader[duplicate]], axis=1
+        )
+        counts.update(
+            layout_dedup_removed=int(duplicate.sum()),
+            layout_colocated_bins=int(len(np.unique(leader[duplicate]))),
+            layout_colocated_difference_median_m=float(np.median(difference)),
+            layout_colocated_difference_gt_1km_share=float(np.mean(difference > 1_000.0)),
+        )
+    keep = np.sort(order[first])
+    return (
+        MotionMatches(
+            matches.source_xy_m[keep],
+            matches.target_xy_m[keep],
+            matches.score[keep],
+            matches.source_tile[keep],
+            matches.target_tile[keep],
+        ),
+        counts,
+    )
+
+
+def _merge_primary_first(
+    primary: DisplacementField, combined: DisplacementField, maximum_triangle_edge_m: float
+) -> tuple[DisplacementField, np.ndarray]:
+    """Keep every primary node; fill primary gaps from the combined field.
+
+    Folds created by added nodes remove added nodes first, so the overlap can
+    only add measurements to the primary-grid field.
+    """
+    added = combined.available & ~primary.available
+    values = dict(primary.__dict__)
+    for name in (
+        "displacement_m", "selected_matches", "candidate_matches",
+        "support_radius_m", "maximum_residual_m",
+    ):
+        mine, other = getattr(primary, name), getattr(combined, name)
+        mask = added[:, None] if mine.ndim == 2 else added
+        values[name] = np.where(mask, other, mine)
+    values["available"] = primary.available | added
+    merged = DisplacementField(**values)
+    available = merged.available.copy()
+    rejected: list[np.ndarray] = []
+    while True:
+        selected = flipped_indices(merged.with_available(available), maximum_triangle_edge_m)
+        if not len(selected):
+            break
+        drop = selected[added[selected]]
+        selected = drop if len(drop) else selected
+        available[selected] = False
+        rejected.append(selected)
+    indices = np.unique(np.concatenate(rejected)) if rejected else np.empty(0, dtype=int)
+    return merged.with_available(available), indices
 
 
 def _combine(batches: list[MotionMatches]) -> MotionMatches:

@@ -27,6 +27,19 @@ class MatcherConfig:
     tile_batch_size: int = 4
     prefix_cuda_graph: bool = True
     cuda_graph_warmup_batches: int = 3
+    # Extra tile grids, as (x, y) offsets in fractions of the tile core. The first
+    # entry is the primary grid; ((0, 0), (0.5, 0.5)) adds the diagonal half-offset grid.
+    tile_grid_offsets: tuple[tuple[float, float], ...] = ((0.0, 0.0),)
+    # Re-match a fine tile with its source blanked where the aligned target is
+    # invalid when the target window is less valid than this fraction (0 disables).
+    masked_rematch_target_valid_fraction: float = 0.0
+    # Overlapping layouts keep one match per source bin of this size.
+    layout_dedup_m: float = 160.0
+    # "primary_first" keeps primary-grid field nodes and adds the others only in
+    # its gaps; "union" estimates one field from all matches.
+    layout_field_merge: str = "primary_first"
+    # "pair_cache" resamples each scene once per lattice block and crops tiles.
+    tile_sampling: str = "per_tile"
 
     def __post_init__(self) -> None:
         _require_positive(
@@ -46,6 +59,35 @@ class MatcherConfig:
             or self.endpoint_support_radius_px * 2 >= self.tile_size_px
         ):
             raise ValueError("endpoint_support_radius_px leaves no valid tile")
+        offsets = tuple(
+            (float(item[0]), float(item[1])) for item in self.tile_grid_offsets
+        )
+        if (
+            not offsets
+            or any(len(item) != 2 for item in self.tile_grid_offsets)
+            or any(not 0.0 <= value < 1.0 for item in offsets for value in item)
+            or len(set(offsets)) != len(offsets)
+        ):
+            raise ValueError(
+                "tile_grid_offsets must be distinct (x, y) core fractions in [0, 1)"
+            )
+        object.__setattr__(self, "tile_grid_offsets", offsets)
+        if not 0.0 <= self.masked_rematch_target_valid_fraction <= 1.0:
+            raise ValueError("masked_rematch_target_valid_fraction must be in [0, 1]")
+        if self.layout_dedup_m <= 0:
+            raise ValueError("layout_dedup_m must be positive")
+        if self.layout_field_merge not in {"primary_first", "union"}:
+            raise ValueError("layout_field_merge must be 'primary_first' or 'union'")
+        if self.tile_sampling not in {"per_tile", "pair_cache"}:
+            raise ValueError("tile_sampling must be 'per_tile' or 'pair_cache'")
+
+    @property
+    def layered_layout(self) -> bool:
+        """Whether a location can be matched by more than one fine tile."""
+        return (
+            len(self.tile_grid_offsets) > 1
+            or self.masked_rematch_target_valid_fraction > 0
+        )
 
     @property
     def tile_core_size_m(self) -> float:
@@ -258,6 +300,17 @@ class RunConfig:
         if not self.field.missing_node_fallback:
             # Preserve the identity of existing configurations with fallback off.
             values["field"].pop("missing_node_fallback")
+        defaults = MatcherConfig()
+        for name in (
+            "tile_grid_offsets",
+            "masked_rematch_target_valid_fraction",
+            "layout_dedup_m",
+            "layout_field_merge",
+            "tile_sampling",
+        ):
+            if getattr(self.matcher, name) == getattr(defaults, name):
+                # Preserve the identity of configurations with one plain tile layout.
+                values["matcher"].pop(name)
         if self.routing.coarse_window_stride == 1:
             # Preserve the identity of configurations with one coarse window per tile.
             values["routing"].pop("coarse_window_stride")
