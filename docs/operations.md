@@ -155,6 +155,13 @@ support radius, 5 m), so the setting changes results slightly and is opt-in.
 Stride 1 reproduces earlier products exactly and keeps their configuration
 identity.
 
+The coarse pass is required. With it switched off (October 2026 test), field
+nodes fell 6.8-7.7% on 39 August 2026 pairs and 4.2% on 30 random March 2020
+pairs; 20-23 of the August pairs lost over 3%, some their whole field. Losses
+grow with elapsed time (August: 2% within 24 h, 13% at 24-48 h, 69% beyond
+48 h), where one pair-wide translation cannot place every tile, although it
+saves 35-57% of matcher tiles.
+
 Fine tile cores do not overlap by default, so each location is matched in one
 tile per pair. Most failed tiles are partial target windows: a textured source
 facing a mostly invalid target returns no confident matches (October 2026 tile
