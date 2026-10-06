@@ -187,7 +187,11 @@ block and crops tiles from the blocks; target windows snap to the pixel lattice
 (at most half a pixel). It cut sampling time by 30-48% and layered pair time
 from 1.6x to 1.3x, but moves about 2% of nodes (median 32 m at common nodes)
 because the matcher sees slightly shifted windows, so it is a separate opt-in.
-Masking in the coarse pass is not implemented and needs its own test. Matcher
+The primary-first merge re-estimates only the nodes the primary field lacks
+(identical values; under 0.1% of nodes differ through fold handling), which cut
+layered field time by 14-34%. Masking partial coarse windows was tested and not
+adopted: it raised the share of refined coarse windows (S 16% to 33%) but not
+field nodes (-0.5 to +0.9%), at 60-90% more coarse matcher tiles. Matcher
 timings above are A100; on newer GPUs sampling and field estimation take a
 larger share, which favours `pair_cache` and fewer, larger tiles.
 

@@ -21,7 +21,7 @@ from .efficientloftr import (
     valid_endpoints,
     valid_support,
 )
-from .field import estimate_field, flipped_indices, reject_folds
+from .field import estimate_field, estimate_queries, flipped_indices, reject_folds
 from .imagery import (
     ProjectedPatchCache,
     north_up_patch,
@@ -463,9 +463,6 @@ class PairProcessor:
             gate_counts["layout_masked_rematches"] = sum(
                 1 for *_rest, masked in matched_tiles if masked
             )
-            field, rejected = reject_folds(
-                estimate_field(matches, pair, domain, self.config.field), edge
-            )
             if self.config.matcher.layout_field_merge == "primary_first":
                 primary = _combine([
                     batch
@@ -476,10 +473,18 @@ class PairProcessor:
                     estimate_field(primary, pair, domain, self.config.field), edge
                 )
                 gate_counts["layout_primary_nodes"] = int(primary_field.available.sum())
+                # All matches are needed only where the primary field is missing;
+                # node estimates are independent, so estimate just those nodes.
                 field, merge_rejected = _merge_primary_first(
-                    primary_field, field, edge
+                    primary_field,
+                    _gap_estimates(primary_field, matches, self.config.field),
+                    edge,
                 )
                 rejected = np.union1d(primary_rejected, merge_rejected)
+            else:
+                field, rejected = reject_folds(
+                    estimate_field(matches, pair, domain, self.config.field), edge
+                )
             gate_counts["layout_nodes"] = int(field.available.sum())
         else:
             field = estimate_field(matches, pair, domain, self.config.field)
@@ -1049,6 +1054,21 @@ def _deduplicate(
         ),
         counts,
     )
+
+
+def _gap_estimates(
+    primary: DisplacementField, matches: MotionMatches, config
+) -> DisplacementField:
+    """Return ``primary`` with every missing node re-estimated from ``matches``."""
+    missing = np.flatnonzero(~primary.available)
+    values = dict(primary.__dict__)
+    if len(missing):
+        estimates = estimate_queries(matches, primary.source_xy_m[missing], config)
+        for name, estimate in estimates.items():
+            column = getattr(primary, name).copy()
+            column[missing] = estimate
+            values[name] = column
+    return DisplacementField(**values)
 
 
 def _merge_primary_first(
