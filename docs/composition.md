@@ -130,6 +130,26 @@ fields may continue a recovered coordinate through dormant or absent rows,
 but a recovery field never consumes an earlier augmentation. Recovery products
 remain trajectory-only and are not deformation inputs.
 
+Continuation can be chained over several passes. `merge-recovery-base` freezes a
+base composition plus one recovery composition as the next pass's base:
+recovered rows become measured rows (`reappeared` becomes `observed`, and the
+position basis gains a `pass<N>_` prefix) and the manifest records the lineage.
+`prepare-recovery-parquet` on that base plans the remaining losses. Pairs whose
+recovery product already exists are excluded, because a measured product is
+immutable and cannot take new targets.
+
+```bash
+limosat merge-recovery-base CONFIG BASE_DIR RECOVERY_COMPOSITION_DIR NEXT_BASE --pass-index 1
+limosat prepare-recovery-parquet CONFIG NEXT_BASE NEXT_TARGETS
+limosat pairs CONFIG --kind recovery --recovery-targets NEXT_TARGETS
+limosat compose-recovery-parquet CONFIG NEXT_BASE NEXT_TARGETS NEXT_RECOVERY_COMPOSITION
+```
+
+In the MOSAiC region (January–April 2020), passes 2 and 3 (2,103 and 2,315 pairs)
+raised the share of 5 km cell-days with a track at least 7 days old by 0.01–0.025
+per month over one pass. Median lifetime went from 6.0 to 7.1 days. Buoy errors
+of existing links were unchanged; new links had a median of 57–60 m.
+
 `limosat.pair_queue.choose_pair_batch` provides the provisional adaptive policy:
 each unresolved trajectory nominates its shortest unprocessed pair, pairs are
 ranked by how many trajectories nominated them, and every unresolved position

@@ -14,6 +14,7 @@ import shapely
 from .catalog import ImagePair, ImageRecord, load_catalogue
 from .config import RunConfig
 from .pair_queue import loss_targeted_pairs
+from .pair_products import PairProductStore
 from .planning import PlannedPair, build_candidate_plan, recovery_candidates
 from .store import file_sha256
 from .trajectory import TrajectoryPoint
@@ -252,10 +253,19 @@ def prepare_recovery_targets(
         else config.routing.recovery_target_policy
     )
     loss_candidates = None
+    excluded_completed = 0
     if policy == "loss_targeted":
+        # A pair already measured in an earlier pass cannot be re-measured with new
+        # targets (its product is immutable), so later passes use the remaining ones.
+        products = PairProductStore(config)
+        available = tuple(
+            item for item in eligible
+            if not products.has_product(item.pair.pair_id, "recovery")
+        )
+        excluded_completed = len(eligible) - len(available)
         collected: dict[str, tuple[str, ...]] = {}
         _write_recovery_targets(
-            store, eligible, images,
+            store, available, images,
             iter_primary_point_batches(points_path, images),
             counts=counts, collect=collected,
         )
@@ -302,6 +312,7 @@ def prepare_recovery_targets(
         "request_plan_sha256": request_plan_sha256,
         "target_policy": policy,
         "loss_candidate_pairs": loss_candidates,
+        "excluded_completed_recovery_pairs": excluded_completed,
         "unscheduled_loss_positions": counts["unscheduled_loss_positions"],
         "eligible_recovery_pairs": len(eligible),
         "targeted_recovery_pairs": len(targeted),
@@ -319,6 +330,7 @@ def prepare_recovery_targets(
     return {"manifest": str(manifest_path), **{k: manifest[k] for k in (
         "eligible_recovery_pairs", "targeted_recovery_pairs", "targeted_positions",
         "unscheduled_loss_positions", "target_policy", "loss_candidate_pairs",
+        "excluded_completed_recovery_pairs",
     )}}
 
 

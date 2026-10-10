@@ -267,6 +267,32 @@ def test_parquet_recovery_composes_deltas_without_rewriting_primary(tmp_path):
     assert set(extensions.column("pair_kind").to_pylist()) == {"recovery"}
     assert extensions.column("accepted").to_pylist() == [True] * 4
 
+    # Chained pass: the merged base carries the recovered rows as measured rows,
+    # and the next pass cannot reuse the already measured recovery pair.
+    from limosat.compose import merge_recovery_base
+
+    merged_root = tmp_path / "pass2-base"
+    merged = merge_recovery_base(
+        cfg, primary_root, tmp_path / "recovery-parquet", merged_root, pass_index=1
+    )
+    merged_points = pq.read_table(merged_root / "trajectory-points-v1.parquet")
+    recovered = [
+        basis for basis in merged_points.column("position_basis").to_pylist()
+        if basis.startswith("pass1_")
+    ]
+    assert recovered == ["pass1_recovery_pair_field"] * 4
+    assert "reappeared" not in set(merged_points.column("state").to_pylist())
+    assert merged["pass_index"] == 1
+    lineage = json.loads((merged_root / "composition-manifest-v1.json").read_text())
+    assert lineage["continuation_lineage"][0]["pass_index"] == 1
+    second = prepare_recovery_targets(cfg, merged_root, tmp_path / "pass2-targets")
+    assert second["excluded_completed_recovery_pairs"] == 1
+    assert second["targeted_recovery_pairs"] == 0
+    with pytest.raises(FileExistsError):
+        merge_recovery_base(
+            cfg, primary_root, tmp_path / "recovery-parquet", merged_root, pass_index=1
+        )
+
 
 def test_parquet_request_plan_can_fill_a_missing_target_row(tmp_path):
     pa = pytest.importorskip("pyarrow")

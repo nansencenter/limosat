@@ -603,6 +603,128 @@ def _metadata(
     return {key.encode(): value.encode() for key, value in values.items()}
 
 
+def merge_recovery_base(
+    config: RunConfig,
+    base_composition: str | Path,
+    recovery_composition: str | Path,
+    destination: str | Path,
+    *,
+    pass_index: int,
+) -> dict:
+    """Freeze a composed base plus one recovery composition as the next pass's base.
+
+    Augmentation rows replace base rows with the same (trajectory, image). They
+    become measured base rows: state ``reappeared`` is relabelled ``observed``
+    and the position basis gains a ``pass<N>_`` prefix, so the next recovery
+    pass may continue them but never mistakes them for its own deltas. Rows are
+    written one row group per image, and the manifest keeps the lineage. The
+    base extensions are carried over unchanged (hard link when possible).
+    """
+    pa, pq = _pyarrow()
+    import pyarrow.compute as pc
+    import numpy as np
+
+    if pass_index < 1:
+        raise ValueError("pass_index counts merged recovery passes from 1")
+    base = Path(base_composition)
+    recovery = Path(recovery_composition)
+    output = Path(destination)
+    base_manifest_path = base / "composition-manifest-v1.json"
+    base_manifest = json.loads(base_manifest_path.read_text(encoding="utf-8"))
+    recovery_manifest_path = recovery / "recovery-composition-manifest-v1.json"
+    recovery_manifest = json.loads(recovery_manifest_path.read_text(encoding="utf-8"))
+    if base_manifest.get("config_sha256") != config.sha256:
+        raise ValueError("base composition configuration differs")
+    if recovery_manifest.get("config_sha256") != config.sha256:
+        raise ValueError("recovery composition configuration differs")
+    if recovery_manifest.get("primary_composition_manifest_sha256") != file_sha256(
+        base_manifest_path
+    ):
+        raise ValueError("recovery composition was not composed on this base")
+    points_path = output / "trajectory-points-v1.parquet"
+    extensions_path = output / "trajectory-extensions-qc-v1.parquet"
+    manifest_path = output / "composition-manifest-v1.json"
+    for path in (points_path, extensions_path, manifest_path):
+        if path.exists():
+            raise FileExistsError(path)
+    output.mkdir(parents=True, exist_ok=True)
+
+    base_points = pq.read_table(base / "trajectory-points-v1.parquet")
+    schema = base_points.schema
+    augmentation = pq.read_table(
+        recovery / "trajectory-augmentations-v1.parquet"
+    ).select(schema.names).cast(schema.remove_metadata())
+    key = lambda table: pc.binary_join_element_wise(  # noqa: E731
+        table["trajectory_id"], table["image_id"], "|"
+    )
+    base_points = base_points.filter(
+        pc.invert(pc.is_in(key(base_points), value_set=key(augmentation)))
+    )
+    augmentation = augmentation.set_column(
+        augmentation.schema.get_field_index("state"), "state",
+        pc.if_else(pc.equal(augmentation["state"], "reappeared"), "observed",
+                   augmentation["state"]),
+    )
+    augmentation = augmentation.set_column(
+        augmentation.schema.get_field_index("position_basis"), "position_basis",
+        pc.binary_join_element_wise(
+            pa.scalar(f"pass{pass_index}"), augmentation["position_basis"], "_"
+        ),
+    )
+    merged = pa.concat_tables([base_points, augmentation.cast(base_points.schema)])
+    del base_points, augmentation
+    order = pc.sort_indices(
+        merged, [("image_id", "ascending"), ("trajectory_id", "ascending")]
+    ).to_numpy()
+    codes = pc.dictionary_encode(merged["image_id"]).combine_chunks().indices.to_numpy()[order]
+    cuts = np.r_[0, np.flatnonzero(np.diff(codes)) + 1, len(codes)]
+    merged = merged.take(order)
+    temporary = _temporary(points_path)
+    with pq.ParquetWriter(temporary, merged.schema, compression="zstd") as writer:
+        for start, stop in zip(cuts[:-1], cuts[1:]):
+            writer.write_table(merged.slice(start, stop - start), row_group_size=stop - start)
+    os.replace(temporary, points_path)
+    point_states = Counter(merged["state"].to_pylist())
+    row_count = merged.num_rows
+    del merged
+    source_extensions = base / "trajectory-extensions-qc-v1.parquet"
+    try:
+        os.link(source_extensions.resolve(), extensions_path)
+    except OSError:
+        import shutil
+
+        shutil.copyfile(source_extensions, extensions_path)
+    manifest = {
+        **{key_: value for key_, value in base_manifest.items()
+           if key_ not in ("products", "counts", "continuation_lineage")},
+        "counts": {
+            "trajectory_points": row_count,
+            "trajectory_point_states": dict(sorted(point_states.items())),
+        },
+        "continuation_lineage": [
+            *base_manifest.get("continuation_lineage", []),
+            {
+                "pass_index": pass_index,
+                "base_manifest_sha256": file_sha256(base_manifest_path),
+                "recovery_manifest": str(recovery_manifest_path),
+                "recovery_manifest_sha256": file_sha256(recovery_manifest_path),
+            },
+        ],
+        "products": {
+            "trajectory_points": _file_record(points_path),
+            "trajectory_extensions": _file_record(extensions_path),
+        },
+    }
+    temporary_manifest = _temporary(manifest_path)
+    temporary_manifest.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary_manifest, manifest_path)
+    return {"manifest": str(manifest_path), "trajectory_points": row_count,
+            "pass_index": pass_index}
+
+
 def _temporary(path: Path) -> Path:
     return path.with_name(f".{path.name}.writing.{os.getpid()}")
 

@@ -162,6 +162,10 @@ class PairProductStore:
             )
         return product
 
+    def has_product(self, pair_id: str, kind: str) -> bool:
+        """Whether a completed product marker exists for this pair and kind."""
+        return self._paths(pair_id, kind)[1].exists()
+
     def load(
         self,
         pair: ImagePair,

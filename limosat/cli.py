@@ -72,6 +72,15 @@ def build_parser() -> argparse.ArgumentParser:
     compose_recovery.add_argument("primary_composition_directory", type=Path)
     compose_recovery.add_argument("recovery_target_directory", type=Path)
     compose_recovery.add_argument("output_directory", type=Path)
+    merge_base = commands.add_parser(
+        "merge-recovery-base",
+        help="freeze a base plus one recovery composition as the next pass's base",
+    )
+    merge_base.add_argument("config", type=Path)
+    merge_base.add_argument("base_composition_directory", type=Path)
+    merge_base.add_argument("recovery_composition_directory", type=Path)
+    merge_base.add_argument("output_directory", type=Path)
+    merge_base.add_argument("--pass-index", type=int, required=True)
     status = commands.add_parser("status", help="show durable local run state")
     status.add_argument("config", type=Path)
     plan = commands.add_parser(
@@ -136,6 +145,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.primary_composition_directory,
             arguments.recovery_target_directory,
             request_plan=arguments.requests,
+        )
+    elif arguments.command == "merge-recovery-base":
+        from .compose import merge_recovery_base
+
+        result = merge_recovery_base(
+            config,
+            arguments.base_composition_directory,
+            arguments.recovery_composition_directory,
+            arguments.output_directory,
+            pass_index=arguments.pass_index,
         )
     elif arguments.command == "compose-recovery-parquet":
         result = compose_recovery_parquet(
