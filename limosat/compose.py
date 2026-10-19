@@ -650,25 +650,33 @@ def merge_recovery_base(
     output.mkdir(parents=True, exist_ok=True)
 
     base_points = pq.read_table(base / "trajectory-points-v1.parquet")
-    schema = base_points.schema
+    # Large runs exceed 2 GiB of string data, so concatenate with 64-bit offsets.
+    schema = pa.schema(
+        [field.with_type(pa.large_string()) if field.type == pa.string() else field
+         for field in base_points.schema],
+        metadata=base_points.schema.metadata,
+    )
+    base_points = base_points.cast(schema)
     augmentation = pq.read_table(
         recovery / "trajectory-augmentations-v1.parquet"
     ).select(schema.names).cast(schema.remove_metadata())
     key = lambda table: pc.binary_join_element_wise(  # noqa: E731
-        table["trajectory_id"], table["image_id"], "|"
+        table["trajectory_id"], table["image_id"], pa.scalar("|", pa.large_string())
     )
     base_points = base_points.filter(
         pc.invert(pc.is_in(key(base_points), value_set=key(augmentation)))
     )
     augmentation = augmentation.set_column(
         augmentation.schema.get_field_index("state"), "state",
-        pc.if_else(pc.equal(augmentation["state"], "reappeared"), "observed",
-                   augmentation["state"]),
+        pc.if_else(pc.equal(augmentation["state"], "reappeared"),
+                   pa.scalar("observed", pa.large_string()), augmentation["state"]),
     )
     augmentation = augmentation.set_column(
         augmentation.schema.get_field_index("position_basis"), "position_basis",
         pc.binary_join_element_wise(
-            pa.scalar(f"pass{pass_index}"), augmentation["position_basis"], "_"
+            pa.scalar(f"pass{pass_index}", pa.large_string()),
+            augmentation["position_basis"],
+            pa.scalar("_", pa.large_string()),
         ),
     )
     merged = pa.concat_tables([base_points, augmentation.cast(base_points.schema)])
