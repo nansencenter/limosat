@@ -126,7 +126,9 @@ class FieldConfig:
     maximum_neighbour_distance_m: float = 6_000.0
     agreement_distance_m: float = 1_000.0
     maximum_triangle_edge_m: float = 6_400.0
-    missing_node_fallback: bool = True
+    # Off by default since October 2026: at MOSAiC and Beaufort buoys the points it
+    # adds were 2-3x less accurate than measured nodes at the same lags.
+    missing_node_fallback: bool = False
 
     def __post_init__(self) -> None:
         _require_positive({key: value for key, value in asdict(self).items()

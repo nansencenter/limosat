@@ -87,7 +87,7 @@ def test_global_planning_defaults_are_explicit():
     field = FieldConfig()
     assert field.grid_spacing_m == 4_000.0
     assert field.maximum_triangle_edge_m == 6_400.0
-    assert field.missing_node_fallback is True
+    assert field.missing_node_fallback is False
     assert routing.planning_grid_spacing_m == 4_000.0
     assert routing.candidate_minimum_elapsed_hours == 1.0
     assert routing.candidate_maximum_elapsed_hours == 96.0
@@ -107,8 +107,12 @@ def test_global_planning_defaults_are_explicit():
             candidate_pair_ids=("a__b",),
         )
     assert RunConfig("run", "catalogue", "database", "output").retain_pair_matches is True
-    assert RunConfig(
+    assert "missing_node_fallback" not in RunConfig(
         "run", "catalogue", "database", "output"
+    ).to_dict()["field"]
+    assert RunConfig(
+        "run", "catalogue", "database", "output",
+        field=FieldConfig(missing_node_fallback=True),
     ).to_dict()["field"]["missing_node_fallback"] is True
     assert RunConfig(
         "run", "catalogue", "database", "output",
@@ -117,6 +121,7 @@ def test_global_planning_defaults_are_explicit():
     ).to_dict()["retain_pair_matches"] is False
     with pytest.raises(ValueError, match="requires retain_pair_matches"):
         RunConfig("run", "catalogue", "database", "output",
+                  field=FieldConfig(missing_node_fallback=True),
                   retain_pair_matches=False)
     with pytest.raises(ValueError, match="pair_workers"):
         RunConfig("run", "catalogue", "database", "output", pair_workers=0)
@@ -152,10 +157,10 @@ def test_legacy_config_without_fallback_flag_keeps_disabled_identity(
     assert loaded.sha256 == legacy.sha256
 
 
-def test_new_default_config_round_trips_with_fallback_enabled(tmp_path):
+def test_enabled_fallback_config_round_trips(tmp_path):
     config = RunConfig(
         "run", str(tmp_path / "catalogue"), str(tmp_path / "database"),
-        str(tmp_path / "output"),
+        str(tmp_path / "output"), field=FieldConfig(missing_node_fallback=True),
     )
     path = tmp_path / "config.json"
     path.write_text(json.dumps(config.to_dict()), encoding="utf-8")
@@ -167,7 +172,7 @@ def test_new_default_config_round_trips_with_fallback_enabled(tmp_path):
     assert loaded.sha256 == config.sha256
 
 
-def test_partial_field_config_uses_new_fallback_default(tmp_path):
+def test_partial_field_config_uses_fallback_default_off(tmp_path):
     path = tmp_path / "config.json"
     path.write_text(json.dumps({
         "run_id": "run", "catalogue": "catalogue", "database": "database",
@@ -176,7 +181,7 @@ def test_partial_field_config_uses_new_fallback_default(tmp_path):
 
     loaded = load_config(path)
 
-    assert loaded.field.missing_node_fallback is True
+    assert loaded.field.missing_node_fallback is False
     assert loaded.retain_pair_matches is True
 
 

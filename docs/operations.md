@@ -272,9 +272,11 @@ pair-product files are intermediate compute-resume state.
 
 The output directory contains `run-manifest-v5.json`. Scientific arrays and
 tables live in SQLite; no result products belong in Git. `limosat status`
-reports the run and pair status counts. Pair matches are retained by default
-for trajectory missing-node support. To disable match retention, also set
-`field.missing_node_fallback: false`.
+reports the run and pair status counts. Pair matches are retained by default,
+so field variants can be recomputed later. The missing-node fallback
+(`field.missing_node_fallback`) is off by default: at MOSAiC and Beaufort buoys
+(January–April 2020) the points it adds had median errors of 64–159 m, against
+28–52 m for measured nodes at the same lags. Enabling it requires retained matches.
 
 Once `limosat status` reports `complete`, run `limosat finalize CONFIG` to
 write the compact global trajectory Parquet catalogue and a checksummed
