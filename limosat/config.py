@@ -40,6 +40,11 @@ class MatcherConfig:
     layout_field_merge: str = "primary_first"
     # "pair_cache" resamples each scene once per lattice block and crops tiles.
     tile_sampling: str = "per_tile"
+    # Stricter agreement for field nodes that only the layered layout measures
+    # (primary_first gap nodes). None keeps the field settings. Buoy evaluation
+    # (October 2026, MOSAiC) favoured 10 agreeing matches within 500 m.
+    layout_gap_minimum_agreeing_matches: int | None = None
+    layout_gap_agreement_distance_m: float | None = None
 
     def __post_init__(self) -> None:
         _require_positive(
@@ -80,6 +85,16 @@ class MatcherConfig:
             raise ValueError("layout_field_merge must be 'primary_first' or 'union'")
         if self.tile_sampling not in {"per_tile", "pair_cache"}:
             raise ValueError("tile_sampling must be 'per_tile' or 'pair_cache'")
+        if self.layout_gap_minimum_agreeing_matches is not None and (
+            isinstance(self.layout_gap_minimum_agreeing_matches, bool)
+            or not isinstance(self.layout_gap_minimum_agreeing_matches, int)
+            or self.layout_gap_minimum_agreeing_matches < 1
+        ):
+            raise ValueError("layout_gap_minimum_agreeing_matches must be a positive integer")
+        if self.layout_gap_agreement_distance_m is not None and not (
+            0 < self.layout_gap_agreement_distance_m < float("inf")
+        ):
+            raise ValueError("layout_gap_agreement_distance_m must be finite and positive")
 
     @property
     def layered_layout(self) -> bool:
@@ -307,6 +322,8 @@ class RunConfig:
             "layout_dedup_m",
             "layout_field_merge",
             "tile_sampling",
+            "layout_gap_minimum_agreeing_matches",
+            "layout_gap_agreement_distance_m",
         ):
             if getattr(self.matcher, name) == getattr(defaults, name):
                 # Preserve the identity of configurations with one plain tile layout.

@@ -477,7 +477,7 @@ class PairProcessor:
                 # node estimates are independent, so estimate just those nodes.
                 field, merge_rejected = _merge_primary_first(
                     primary_field,
-                    _gap_estimates(primary_field, matches, self.config.field),
+                    _gap_estimates(primary_field, matches, _gap_field_config(self.config)),
                     edge,
                 )
                 rejected = np.union1d(primary_rejected, merge_rejected)
@@ -1054,6 +1054,21 @@ def _deduplicate(
         ),
         counts,
     )
+
+
+def _gap_field_config(config: RunConfig):
+    """Field settings for nodes that only the layered layout measures."""
+    field = config.field
+    matcher = config.matcher
+    changes = {}
+    if matcher.layout_gap_minimum_agreeing_matches is not None:
+        changes["minimum_agreeing_matches"] = matcher.layout_gap_minimum_agreeing_matches
+        changes["neighbour_count"] = max(
+            field.neighbour_count, matcher.layout_gap_minimum_agreeing_matches
+        )
+    if matcher.layout_gap_agreement_distance_m is not None:
+        changes["agreement_distance_m"] = matcher.layout_gap_agreement_distance_m
+    return replace(field, **changes) if changes else field
 
 
 def _gap_estimates(

@@ -168,3 +168,20 @@ def test_unsupported_member_of_measured_window_gets_its_own_window(tmp_path):
     assert result.counts['coarse_tiles_refined'] == 2
     assert result.matcher_tiles == 2
     np.testing.assert_allclose(result.shifts, [[100, 0], [100, 0]])
+
+
+def test_layout_gap_agreement_is_opt_in_and_keeps_identity(tmp_path):
+    from limosat.pairs import _gap_field_config
+
+    config = _config(tmp_path)
+    assert _gap_field_config(config) is config.field
+    assert 'layout_gap_minimum_agreeing_matches' not in config.to_dict()['matcher']
+    strict = replace(config, matcher=replace(
+        config.matcher, layout_gap_minimum_agreeing_matches=10,
+        layout_gap_agreement_distance_m=500.0))
+    gap = _gap_field_config(strict)
+    assert gap.minimum_agreeing_matches == 10 and gap.agreement_distance_m == 500.0
+    assert gap.neighbour_count >= 10
+    assert strict.to_dict()['matcher']['layout_gap_minimum_agreeing_matches'] == 10
+    with pytest.raises(ValueError):
+        replace(config.matcher, layout_gap_agreement_distance_m=0.0)
