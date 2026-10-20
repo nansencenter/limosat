@@ -293,6 +293,15 @@ def test_parquet_recovery_composes_deltas_without_rewriting_primary(tmp_path):
             cfg, primary_root, tmp_path / "recovery-parquet", merged_root, pass_index=1
         )
 
+    from limosat.annotate import annotate_links
+
+    annotated = annotate_links(cfg, merged_root, tmp_path / "annotated")
+    links = pq.read_table(tmp_path / "annotated" / "annotated-links-v1.parquet")
+    assert annotated["links_by_pass"]["1"] == 4
+    assert set(links.column("link_pass").to_pylist()) == {0, 1}
+    for name in ("track_neighbour_links", "track_predicted_dx_m", "track_deviation_m"):
+        assert name in links.column_names
+
 
 def test_parquet_request_plan_can_fill_a_missing_target_row(tmp_path):
     pa = pytest.importorskip("pyarrow")

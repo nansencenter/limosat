@@ -81,6 +81,18 @@ def build_parser() -> argparse.ArgumentParser:
     merge_base.add_argument("recovery_composition_directory", type=Path)
     merge_base.add_argument("output_directory", type=Path)
     merge_base.add_argument("--pass-index", type=int, required=True)
+    annotate = commands.add_parser(
+        "annotate-links",
+        help="write every link with its pass and an along-track consistency check",
+    )
+    annotate.add_argument("config", type=Path)
+    annotate.add_argument("final_base_directory", type=Path)
+    annotate.add_argument("output_directory", type=Path)
+    annotate.add_argument(
+        "--recovery", action="append", default=[], metavar="PASS=DIR",
+        help="recovery composition for a pass missing from the base lineage",
+    )
+    annotate.add_argument("--maximum-neighbour-gap-days", type=float, default=4.0)
     status = commands.add_parser("status", help="show durable local run state")
     status.add_argument("config", type=Path)
     plan = commands.add_parser(
@@ -155,6 +167,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.recovery_composition_directory,
             arguments.output_directory,
             pass_index=arguments.pass_index,
+        )
+    elif arguments.command == "annotate-links":
+        from .annotate import annotate_links
+
+        result = annotate_links(
+            config,
+            arguments.final_base_directory,
+            arguments.output_directory,
+            recovery_compositions=dict(
+                item.split("=", 1) for item in arguments.recovery
+            ),
+            maximum_neighbour_gap_days=arguments.maximum_neighbour_gap_days,
         )
     elif arguments.command == "compose-recovery-parquet":
         result = compose_recovery_parquet(
