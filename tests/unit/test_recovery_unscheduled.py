@@ -170,7 +170,11 @@ def test_collect_mode_records_candidates_without_writing(tmp_path):
         store, (to_b, to_c), images, batches, collect=collected,
     )
     assert selected == (to_b, to_c)
-    assert collected == {to_b.pair.pair_id: ("lost",), to_c.pair.pair_id: ("lost",)}
+    assert {k: v[0] for k, v in collected.items()} == {
+        to_b.pair.pair_id: ("lost",), to_c.pair.pair_id: ("lost",)}
+    np.testing.assert_array_equal(collected[to_b.pair.pair_id][1], [[10.0, 20.0]])
+    # A single measurement has no velocity, so the prediction is the source position.
+    np.testing.assert_array_equal(collected[to_b.pair.pair_id][2], [[10.0, 20.0]])
     assert store.count() == 0
 
 
@@ -184,6 +188,52 @@ def test_recovery_target_policy_defaults_to_loss_targeted_and_keeps_identity(tmp
     assert cfg.routing.recovery_target_policy == "loss_targeted"
     assert "recovery_target_policy" not in cfg.to_dict()["routing"]
     legacy = replace(cfg, routing=replace(cfg.routing, recovery_target_policy="all_losses"))
-    assert legacy.to_dict()["routing"]["recovery_target_policy"] == "all_losses"
+    assert "recovery_target_policy" not in legacy.to_dict()["routing"]
+    assert legacy.sha256 == cfg.sha256
     with pytest.raises(ValueError):
         RoutingConfig(recovery_target_policy="everything")
+
+
+def test_target_validity_filter_drops_options_on_no_data(tmp_path, monkeypatch):
+    from dataclasses import replace
+    from limosat import imagery
+    from limosat.recovery import _filter_by_target_validity
+
+    cfg = _config(tmp_path)
+    cfg = replace(cfg, routing=replace(cfg.routing, recovery_minimum_target_valid_fraction=0.5))
+    images = _images(("a", "b"))
+    pair = _planned(images[0], images[1])
+    monkeypatch.setattr(imagery, "valid_share_around",
+                        lambda path, x, y, *args, **kwargs: np.where(x > 0, 1.0, 0.2))
+    kept, counts = _filter_by_target_validity(
+        cfg, {pair.pair.pair_id: (("valid", "nodata"), np.zeros((2, 2)),
+                                  np.array([[5.0, 0.0], [-5.0, 0.0]]))},
+        {pair.pair.pair_id: pair},
+    )
+    assert kept == {pair.pair.pair_id: ("valid",)}
+    assert counts == {"validity_options_checked": 2, "validity_options_dropped": 1,
+                      "validity_pairs_without_valid_losses": 0}
+    # Selection settings never change the configuration identity.
+    assert "recovery_minimum_target_valid_fraction" not in cfg.to_dict()["routing"]
+    assert cfg.sha256 == _config(tmp_path).sha256
+
+
+def test_collected_prediction_moves_by_last_velocity(tmp_path):
+    cfg = _config(tmp_path)
+    images = _images(("a", "b", "c"))
+    planned = _planned(images[1], images[2], 0)
+    batches = (
+        (_point("moving", "a", 0, "created", (0.0, 0.0)),),
+        (_point("moving", "b", 1, "observed", (100.0, 0.0)),),
+        (_point("moving", "c", 2, "dormant"),),
+    )
+    collected = {}
+    _write_recovery_targets(
+        RecoveryTargetStore(cfg, tmp_path / "targets"), (planned,), images, batches,
+        collect=collected,
+    )
+    identities, frozen, predicted = collected[planned.pair.pair_id]
+    lag = planned.pair.elapsed_seconds / 86_400.0
+    gap = (images[1].time_utc - images[0].time_utc).total_seconds() / 86_400.0
+    np.testing.assert_allclose(frozen, [[100.0, 0.0]])
+    np.testing.assert_allclose(predicted, [[100.0 + 100.0 / gap * lag, 0.0]])

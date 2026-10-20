@@ -92,6 +92,51 @@ def scene_transform(path: str | Path, analysis_epsg: int = 3413) -> _SceneTransf
 atexit.register(scene_transform.cache_clear)
 
 
+@lru_cache(maxsize=2)
+def _valid_integral(path: str, decimation: int) -> tuple[np.ndarray, int, int]:
+    from rasterio.enums import Resampling
+
+    with rasterio.open(path) as dataset:
+        height, width = dataset.height // decimation, dataset.width // decimation
+        if dataset.count >= 2:
+            valid = dataset.read(
+                2, out_shape=(height, width), resampling=Resampling.nearest
+            ) < 2
+        else:
+            valid = np.ones((height, width), dtype=bool)
+    integral = np.zeros((height + 1, width + 1), dtype=np.int64)
+    integral[1:, 1:] = valid.astype(np.int64).cumsum(0).cumsum(1)
+    return integral, height, width
+
+
+def valid_share_around(
+    path: str | Path,
+    x_m: np.ndarray,
+    y_m: np.ndarray,
+    window_m: float,
+    pixel_size_m: float,
+    analysis_epsg: int = 3413,
+    decimation: int = 4,
+) -> np.ndarray:
+    """Share of valid pixels in a square window (side ``window_m``) around points.
+
+    Computed in raster geometry on a mask decimated by ``decimation``; pixels
+    outside the raster count as invalid.
+    """
+    integral, height, width = _valid_integral(str(path), decimation)
+    columns, rows = scene_transform(path, analysis_epsg).analysis_to_pixels(
+        np.asarray(x_m, dtype=np.float64), np.asarray(y_m, dtype=np.float64)
+    )
+    half = max(1, int(round(window_m / 2.0 / (pixel_size_m * decimation))))
+    finite = np.isfinite(columns) & np.isfinite(rows)
+    c = np.where(finite, np.rint(columns / decimation), -1e9).astype(np.int64)
+    r = np.where(finite, np.rint(rows / decimation), -1e9).astype(np.int64)
+    c0, c1 = np.clip(c - half, 0, width), np.clip(c + half + 1, 0, width)
+    r0, r1 = np.clip(r - half, 0, height), np.clip(r + half + 1, 0, height)
+    total = integral[r1, c1] - integral[r0, c1] - integral[r1, c0] + integral[r0, c0]
+    return total / float((2 * half + 1) ** 2)
+
+
 class TargetPixelValidity:
     """Check composed EPSG:3413 endpoints against one target scene's mask."""
 

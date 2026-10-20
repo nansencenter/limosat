@@ -168,6 +168,15 @@ class RoutingConfig:
     coarse_support_radius_m: float = 35_840.0
     coarse_window_stride: int = 1
     recovery_target_policy: Literal["loss_targeted", "all_losses"] = "loss_targeted"
+    # Loss-targeted nomination skips a pair for a loss when the target image is less
+    # valid than this share in a window of recovery_target_valid_window_m around the
+    # loss's predicted position (0 disables). On MOSAiC 2020, 88% of continuation
+    # attempts aimed at targets under 10% valid and almost never succeeded; 0.3 kept
+    # 97% of successful attempts while removing 93% of attempts, but each loss then
+    # nominates its nearest usable pair, which doubled one pass's fine tiles. Opt-in
+    # until a chained-pass comparison settles the whole-chain cost.
+    recovery_minimum_target_valid_fraction: float = 0.0
+    recovery_target_valid_window_m: float = 31_000.0
 
     def __post_init__(self) -> None:
         if not 0 < self.planning_grid_spacing_m < float("inf"):
@@ -184,6 +193,10 @@ class RoutingConfig:
             or self.coarse_minimum_matches < 1
         ):
             raise ValueError("coarse_minimum_matches must be a positive integer")
+        if not 0.0 <= self.recovery_minimum_target_valid_fraction <= 1.0:
+            raise ValueError("recovery_minimum_target_valid_fraction must be in [0, 1]")
+        if not 0 < self.recovery_target_valid_window_m < float("inf"):
+            raise ValueError("recovery_target_valid_window_m must be finite and positive")
         if self.recovery_target_policy not in ("loss_targeted", "all_losses"):
             raise ValueError("recovery_target_policy must be loss_targeted or all_losses")
         if (
@@ -333,10 +346,16 @@ class RunConfig:
         if self.routing.coarse_window_stride == 1:
             # Preserve the identity of configurations with one coarse window per tile.
             values["routing"].pop("coarse_window_stride")
-        if self.routing.recovery_target_policy == "loss_targeted":
-            # Target selection does not change pair measurements, so the default
-            # policy keeps the identity of existing configurations.
-            values["routing"].pop("recovery_target_policy")
+        # Recovery target selection decides which losses a recovery pair measures, not
+        # how any pair is measured, so it never enters the configuration identity
+        # (pair products stay valid when the selection changes). Target manifests
+        # record the selection settings instead.
+        for name in (
+            "recovery_target_policy",
+            "recovery_minimum_target_valid_fraction",
+            "recovery_target_valid_window_m",
+        ):
+            values["routing"].pop(name)
         return values
 
     @property

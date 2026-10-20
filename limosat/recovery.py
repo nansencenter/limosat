@@ -263,22 +263,27 @@ def prepare_recovery_targets(
             if not products.has_product(item.pair.pair_id, "recovery")
         )
         excluded_completed = len(eligible) - len(available)
-        collected: dict[str, tuple[str, ...]] = {}
+        collected: dict[str, tuple[tuple[str, ...], np.ndarray]] = {}
         _write_recovery_targets(
             store, available, images,
             iter_primary_point_batches(points_path, images),
             counts=counts, collect=collected,
         )
         loss_candidates = len(collected)
+        by_id = {item.pair.pair_id: item for item in available}
+        options = {pair_id: entry[0] for pair_id, entry in collected.items()}
+        if config.routing.recovery_minimum_target_valid_fraction > 0:
+            options, validity_counts = _filter_by_target_validity(
+                config, collected, by_id
+            )
+            counts.update(validity_counts)
         elapsed = {item.pair.pair_id: item.pair.elapsed_seconds for item in eligible}
         selected = loss_targeted_pairs(
             (pair_id, elapsed[pair_id], identities)
-            for pair_id, identities in collected.items()
+            for pair_id, identities in options.items() if identities
         )
-        requests = {
-            pair_id: frozenset(collected[pair_id]) for pair_id in selected
-        }
-        del collected
+        requests = {pair_id: frozenset(options[pair_id]) for pair_id in selected}
+        del collected, options
     targeted = _write_recovery_targets(
         store, eligible, images,
         iter_primary_point_batches(points_path, images),
@@ -311,8 +316,21 @@ def prepare_recovery_targets(
         "primary_composition_manifest_sha256": file_sha256(primary_manifest_path),
         "request_plan_sha256": request_plan_sha256,
         "target_policy": policy,
+        "target_selection": {
+            "recovery_target_policy": config.routing.recovery_target_policy,
+            "recovery_minimum_target_valid_fraction": (
+                config.routing.recovery_minimum_target_valid_fraction
+            ),
+            "recovery_target_valid_window_m": config.routing.recovery_target_valid_window_m,
+        },
         "loss_candidate_pairs": loss_candidates,
         "excluded_completed_recovery_pairs": excluded_completed,
+        "target_validity_filter": {
+            key: counts[key] for key in (
+                "validity_options_checked", "validity_options_dropped",
+                "validity_pairs_without_valid_losses",
+            ) if key in counts
+        },
         "unscheduled_loss_positions": counts["unscheduled_loss_positions"],
         "eligible_recovery_pairs": len(eligible),
         "targeted_recovery_pairs": len(targeted),
@@ -390,12 +408,15 @@ def _write_recovery_targets(
     requests: Mapping[str, frozenset[str]] | None = None,
     *,
     counts: dict[str, int] | None = None,
-    collect: dict[str, tuple[str, ...]] | None = None,
+    collect: dict[str, tuple[tuple[str, ...], np.ndarray, np.ndarray]] | None = None,
 ) -> tuple[PlannedPair, ...]:
     """Write recovery targets for dormant rows and unscheduled losses.
 
-    With ``collect``, nothing is written: each candidate pair's identities are
-    recorded instead, for loss-targeted selection.
+    With ``collect``, nothing is written: each candidate pair's identities,
+    frozen source positions and predicted target positions are recorded instead,
+    for loss-targeted selection. The prediction moves a source position by the
+    identity's last measured velocity (previous measurement 1 h to 4 days before
+    the source) times the pair's lag; without one it is the source position.
 
     An unscheduled loss is an identity whose last measurement is on the pair's
     source image and which has no row at all on the target image, because no
@@ -421,6 +442,8 @@ def _write_recovery_targets(
                 requests[item.pair.pair_id]
             )
     positions: list[dict[str, tuple[float, float]]] = [dict() for _ in images]
+    velocities: list[dict[str, tuple[float, float]]] = [dict() for _ in images]
+    latest: dict[str, tuple[float, float, float]] = {}
     targeted = []
     batches = iter(primary_points_by_image)
     for step, image in enumerate(images):
@@ -440,6 +463,15 @@ def _write_recovery_targets(
                 if point.available
                 and (needed is None or point.trajectory_id in needed)
             }
+            if collect is not None:
+                now = image.time_utc.timestamp() / 86_400.0
+                for identity, (x, y) in positions[step].items():
+                    previous = latest.get(identity)
+                    if previous is not None and 1.0 / 24.0 <= now - previous[0] <= 4.0:
+                        gap = now - previous[0]
+                        velocities[step][identity] = (
+                            (x - previous[1]) / gap, (y - previous[2]) / gap
+                        )
         dormant = {
             point.trajectory_id for point in points if point.state == "dormant"
         }
@@ -473,7 +505,14 @@ def _write_recovery_targets(
                     )
                 identities = sorted(requested)
             if identities and collect is not None:
-                collect[item.pair.pair_id] = tuple(identities)
+                frozen = np.asarray([source[identity] for identity in identities], dtype=np.float64)
+                lag_days = item.pair.elapsed_seconds / 86_400.0
+                velocity = velocities[source_step]
+                motion = np.asarray(
+                    [velocity.get(identity, (0.0, 0.0)) for identity in identities],
+                    dtype=np.float64,
+                ) * lag_days
+                collect[item.pair.pair_id] = (tuple(identities), frozen, frozen + motion)
                 targeted.append(item)
             elif identities:
                 store.save(
@@ -487,14 +526,59 @@ def _write_recovery_targets(
                 targeted.append(item)
         for identity in measured:
             last_measured[identity] = step
+        if collect is not None:
+            now = image.time_utc.timestamp() / 86_400.0
+            for point in points:
+                if point.available:
+                    latest[point.trajectory_id] = (now, float(point.x_m), float(point.y_m))
         for source_step, target_step in tuple(last_use.items()):
             if target_step == step:
                 positions[source_step].clear()
+                velocities[source_step].clear()
     try:
         next(batches)
     except StopIteration:
         return tuple(targeted)
     raise ValueError("primary point batches exceed the catalogue")
+
+
+def _filter_by_target_validity(config, collected, by_id):
+    """Drop (loss, pair) options whose target image is mostly invalid at the loss.
+
+    The share is measured in a window of ``recovery_target_valid_window_m`` on
+    the target image around the predicted target position (the source position
+    moved by the identity's last velocity times the lag). On 1M MOSAiC pass-1
+    attempts this separated successes slightly better than the undisplaced
+    position (AUC 0.983 vs 0.980); at 0.3 it kept 97% of successes with 7% of
+    attempts.
+    """
+    from .imagery import valid_share_around
+
+    routing = config.routing
+    by_target: dict[str, list[str]] = {}
+    for pair_id in collected:
+        by_target.setdefault(by_id[pair_id].pair.target.image_id, []).append(pair_id)
+    kept: dict[str, tuple[str, ...]] = {}
+    checked = dropped = empty = 0
+    for pair_ids in by_target.values():
+        target = by_id[pair_ids[0]].pair.target
+        for pair_id in pair_ids:
+            identities, _frozen, xy = collected[pair_id]
+            share = valid_share_around(
+                target.path, xy[:, 0], xy[:, 1],
+                routing.recovery_target_valid_window_m,
+                config.matcher.pixel_size_m, config.analysis_epsg,
+            )
+            keep = share >= routing.recovery_minimum_target_valid_fraction
+            checked += len(identities)
+            dropped += int((~keep).sum())
+            kept[pair_id] = tuple(i for i, k in zip(identities, keep) if k)
+            empty += not kept[pair_id]
+    return kept, {
+        "validity_options_checked": checked,
+        "validity_options_dropped": dropped,
+        "validity_pairs_without_valid_losses": empty,
+    }
 
 
 def unscheduled_losses_in_footprint(identities, xy, footprint) -> list[str]:

@@ -222,8 +222,11 @@ def test_parquet_recovery_composes_deltas_without_rewriting_primary(tmp_path):
     from limosat.compose import compose_primary_parquet, compose_recovery_parquet
     from limosat.recovery import prepare_recovery_targets
     from limosat.store import file_sha256
+    from dataclasses import replace
 
     cfg = config(tmp_path)
+    # The synthetic scenes are far smaller than the 31 km validity window.
+    cfg = replace(cfg, routing=replace(cfg.routing, recovery_minimum_target_valid_fraction=0.0))
     images = catalogue(tmp_path)
     catalogue_path = Path(cfg.catalogue)
     catalogue_path.write_text(
