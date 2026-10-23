@@ -1,0 +1,45 @@
+{
+  "protocol_id": "limosat_trajectory_link_qc_v3_20261024",
+  "status": "v3_candidate_pending_tile_label_miss_rate",
+  "applies_to": "accepted links of a limosat_trajectory_link_qc_v2_20260907 release (scientific edge Parquet)",
+  "decision_unit": "one drift vector between consecutive keypoints within a v2 QC trajectory",
+  "crs": "EPSG:3413",
+  "coordinate_units": "metres",
+  "parameters": {
+    "residual_floor_m": 2000.0,
+    "coherence_min": 5.0,
+    "spread_floor_m": 150.0,
+    "land_margin_km": 2.0,
+    "incoherent_min_links": 20,
+    "incoherent_fraction": 0.5,
+    "incoherent_residual_m": 2000.0,
+    "open_water_sic": 0.15
+  },
+  "neighbour_model": "v2 neighbour model unchanged: accepted links of the exact same source/target image pair, leave-one-out, up to 24 neighbours within 30 km, at least 8, robust distance-weighted local affine with the v2 prediction guard; single pass",
+  "diagnostics": {
+    "local_residual_m": "distance between the link displacement and the v2 local-affine prediction; evaluated wherever the residual bound (coarse residual + 2 x largest neighbour deviation) reaches residual_floor_m",
+    "coarse_residual_m": "distance from the median displacement of the same neighbours",
+    "neighbour_spread_m": "median distance of the neighbour displacements from their own median",
+    "coherence_ratio": "local_residual_m / max(neighbour_spread_m, spread_floor_m)",
+    "n_corroborating": "neighbours closer to the link displacement than to the neighbour median and closer than half the coarse residual"
+  },
+  "exclusions": {
+    "R1": "local fit supported, local_residual_m > residual_floor_m, coherence_ratio >= coherence_min, n_corroborating == 0, source and target directly matched",
+    "LAND": "start or end point >= land_margin_km inside land on the supplied inland-distance raster"
+  },
+  "flags": {
+    "bit_0_ISOLATED_INTERP": "R1 conditions with an interpolated endpoint",
+    "bit_1_INTERP_RESIDUAL": "an interpolated endpoint and local_residual_m > residual_floor_m",
+    "bit_2_PAIR_INCOHERENT": "image pair with >= incoherent_min_links links of which >= incoherent_fraction have coarse_residual_m > incoherent_residual_m",
+    "bit_3_OPEN_WATER": "SIC < open_water_sic at both endpoints (nearest daily NOAA/NSIDC CDR v6 cell on the start and end dates); 0 when no SIC root is given",
+    "bit_4_COASTAL": "start or end point inside land by less than land_margin_km"
+  },
+  "split_semantics": {
+    "rows_deleted": "excluded links are removed from the edge table and listed with reason codes in the exclusion table",
+    "rule": "a kept link starts a new segment after every excluded link of its v2 trajectory; flags never split",
+    "new_ids": "segment 0 keeps qc_trajectory_id; later segments get deterministic integers above the period's maximum qc_trajectory_id, ordered by (qc_trajectory_id, excluded-link start time)",
+    "unchanged_columns": "all v2 columns, including is_last, stopped and converged_to, are carried unchanged and describe the v2 trajectory"
+  },
+  "not_used_for_exclusion": ["correlation", "sea-ice concentration", "buoy truth", "OSI SAF drift", "ELoFTR", "reviewer labels"],
+  "checks": ["kept + excluded = input links", "edge_uid unique and disjoint between kept and excluded", "zero continuity violations within v3 trajectories"]
+}

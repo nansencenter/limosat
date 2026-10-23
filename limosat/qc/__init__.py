@@ -1,4 +1,7 @@
-"""Post-run trajectory quality control for LiMOSAT products."""
+"""Post-run trajectory quality control for LiMOSAT products.
+
+QC v3 (isolation and land exclusions on a v2 release) is in ``limosat.qc.v3``.
+"""
 
 from .core import (
     PROTOCOL_ID,
