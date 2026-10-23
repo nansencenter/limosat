@@ -150,6 +150,17 @@ raised the share of 5 km cell-days with a track at least 7 days old by 0.01–0.
 per month over one pass. Median lifetime went from 6.0 to 7.1 days. Buoy errors
 of existing links were unchanged; new links had a median of 57–60 m.
 
+Loss-targeted nomination also checks the target image. A (loss, pair) option is
+skipped when the target is less than 30% valid
+(`routing.recovery_minimum_target_valid_fraction`) in a 31 km window around the
+loss's predicted position: its last measured velocity times the pair's lag.
+Losses without a usable option are not attempted and remain open, rather than
+counting as failed continuations. Target selection settings are recorded in the
+target manifest and do not enter the configuration identity. On Fram Strait
+(February–March 2020) chained passes 2+, the check reached about 90% of the
+coverage gain of unchecked passes. It used 45% fewer matcher tiles
+(167k vs 307k) and 4,620 vs 5,024 pairs.
+
 `limosat.pair_queue.choose_pair_batch` provides the provisional adaptive policy:
 each unresolved trajectory nominates its shortest unprocessed pair, pairs are
 ranked by how many trajectories nominated them, and every unresolved position

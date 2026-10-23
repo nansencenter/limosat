@@ -171,11 +171,10 @@ class RoutingConfig:
     # Loss-targeted nomination skips a pair for a loss when the target image is less
     # valid than this share in a window of recovery_target_valid_window_m around the
     # loss's predicted position (0 disables). On MOSAiC 2020, 88% of continuation
-    # attempts aimed at targets under 10% valid and almost never succeeded; 0.3 kept
-    # 97% of successful attempts while removing 93% of attempts, but each loss then
-    # nominates its nearest usable pair, which doubled one pass's fine tiles. Opt-in
-    # until a chained-pass comparison settles the whole-chain cost.
-    recovery_minimum_target_valid_fraction: float = 0.0
+    # attempts aimed at targets under 10% valid and almost never succeeded. Over chained
+    # passes 2+ on Fram (Feb-Mar 2020), 0.3 reached about 90% of the coverage gain with
+    # 45% fewer matcher tiles than no check.
+    recovery_minimum_target_valid_fraction: float = 0.3
     recovery_target_valid_window_m: float = 31_000.0
 
     def __post_init__(self) -> None:
