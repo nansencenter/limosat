@@ -329,19 +329,20 @@ def assign_segments(kept: pd.DataFrame, excluded: pd.DataFrame, base_id: int) ->
     result = kept.copy()
     result["qc3_segment"] = 0
     result["qc3_trajectory_id"] = result["qc_trajectory_id"].astype(np.int64)
-    affected = result.qc_trajectory_id.isin(order.qc_trajectory_id)
-    if affected.any():
-        times = {t: g.start_time_utc.to_numpy() for t, g in order.groupby("qc_trajectory_id")}
-        ids = {t: g.new_id.to_numpy() for t, g in order.groupby("qc_trajectory_id")}
-        sub = result.loc[affected, ["qc_trajectory_id", "start_time_utc"]]
-        seg = np.zeros(len(sub), dtype=np.int64)
-        new = sub.qc_trajectory_id.to_numpy().copy()
-        for t, index in sub.groupby("qc_trajectory_id").indices.items():
-            k = np.searchsorted(times[t], sub.start_time_utc.to_numpy()[index], side="left")
-            seg[index] = k
-            new[index] = np.where(k > 0, ids[t][np.maximum(k - 1, 0)], t)
-        result.loc[affected, "qc3_segment"] = seg
-        result.loc[affected, "qc3_trajectory_id"] = new
+    affected = np.flatnonzero(result.qc_trajectory_id.isin(order.qc_trajectory_id).to_numpy())
+    if len(affected):
+        # the last excluded link of the same trajectory that starts strictly before each kept link
+        sub = pd.DataFrame({"row": affected, "qc_trajectory_id": result.qc_trajectory_id.to_numpy()[affected],
+                            "t": result.start_time_utc.to_numpy()[affected]}).sort_values("t", kind="mergesort")
+        ref = order.rename(columns={"start_time_utc": "t"}).sort_values("t", kind="mergesort")
+        hit = pd.merge_asof(sub, ref, on="t", by="qc_trajectory_id", direction="backward", allow_exact_matches=False)
+        seg = hit.k.fillna(0).to_numpy(np.int64)
+        new = np.where(seg > 0, hit.new_id.fillna(0).to_numpy(np.int64), hit.qc_trajectory_id.to_numpy(np.int64))
+        rows = hit.row.to_numpy()
+        segment = result.qc3_segment.to_numpy().copy()
+        ids = result.qc3_trajectory_id.to_numpy().copy()
+        segment[rows], ids[rows] = seg, new
+        result["qc3_segment"], result["qc3_trajectory_id"] = segment, ids
     return result
 
 
@@ -426,10 +427,11 @@ def run(input_path: Path, output_dir: Path, land_path: Path, sic_root: Path | No
     tmp_path.rename(out_path)
     for code in EXCLUSION_CODES:
         counts[code] = int(excluded.qc3_exclusion.str.contains(code).sum())
-    out = ds.dataset(out_path).to_table(columns=["edge_uid", "qc3_trajectory_id", "start_time_utc", "source_rowid",
+    out = ds.dataset(out_path).to_table(columns=["qc3_trajectory_id", "start_time_utc", "source_rowid",
                                                   "target_rowid"]).to_pandas()
     violations = continuity_violations(out)
-    unique = out.edge_uid.is_unique and not out.edge_uid.isin(excluded.edge_uid).any()
+    del out
+    unique = edge_uids_unique_and_disjoint(out_path, excluded.edge_uid)
     manifest = {
         "status": "complete" if (violations == 0 and unique and kept_total + len(excluded) == input_total) else "failed",
         "period": period, "protocol_id": PROTOCOL_V3_ID, "protocol_sha256": sha256(PROTOCOL_V3_PATH),
@@ -444,6 +446,16 @@ def run(input_path: Path, output_dir: Path, land_path: Path, sic_root: Path | No
     }
     (output_dir / f"{period}_qc3.manifest.json").write_text(json.dumps(manifest, indent=2))
     return manifest
+
+
+def edge_uids_unique_and_disjoint(path: Path, excluded_uids: pd.Series) -> bool:
+    """Hash-based check (64-bit) that output edge_uids are unique and none was excluded."""
+
+    hashes = [pd.util.hash_array(b.column("edge_uid").to_numpy(zero_copy_only=False))
+              for b in pq.ParquetFile(path).iter_batches(columns=["edge_uid"], batch_size=1_000_000)]
+    kept = np.concatenate(hashes) if hashes else np.empty(0, np.uint64)
+    return bool(len(np.unique(kept)) == len(kept)
+                and not np.isin(pd.util.hash_array(excluded_uids.to_numpy()), kept).any())
 
 
 def pc_max(path: Path, column: str) -> int:
