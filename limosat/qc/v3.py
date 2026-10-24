@@ -391,7 +391,8 @@ def run(input_path: Path, output_dir: Path, land_path: Path, sic_root: Path | No
                           "excluded": int((decided.qc3_exclusion != "").sum())}), flush=True)
 
     # finalise: exclusion table, segment ids, outputs, checks
-    parts = sorted(work.glob("*.scored.parquet"))
+    # skip AppleDouble "._" companions that macOS writes on non-native volumes
+    parts = sorted(p for p in work.glob("*.scored.parquet") if not p.name.startswith("._"))
     keep_cols = [f.name for f in schema]
     excluded = pd.concat([pd.read_parquet(p, filters=[("qc3_exclusion", "!=", "")]) for p in parts], ignore_index=True)
     excluded["reason_text"] = [reason_text(r) for r in excluded.itertuples(index=False)]
