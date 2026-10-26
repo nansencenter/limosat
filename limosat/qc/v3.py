@@ -1,15 +1,17 @@
-"""Trajectory-link QC v3: isolation (R1) and land exclusions plus quality flags on a v2 release.
+"""Trajectory-link QC v3.1: exclusions and quality flags applied on top of a v2 release.
 
-v3 keeps every v2 decision. It reads the v2 scientific edge Parquet (accepted links only), scores each
+v3.1 keeps every v2 decision. It reads the v2 scientific edge Parquet (accepted links only), scores each
 link against the other accepted links of the same exact image pair with the frozen v2 local-affine
-neighbour model, and then
+neighbour model (single pass), and excludes, splitting trajectories at every excluded link as v2 does:
 
-- excludes isolated direct-match outliers (reason ``R1``) and links with an endpoint on land
-  (reason ``LAND``), splitting trajectories at every excluded link as v2 does;
-- flags, without splitting, isolated interpolated links, interpolated links far from their neighbours,
-  links in incoherent image pairs, links over open water and links in the coastal band.
+- ``R1``: isolated outliers (direct or interpolated endpoints);
+- ``LAND``: an endpoint at least 2 km inside land;
+- ``COASTAL``: an endpoint 0-2 km inside land;
+- ``OPEN_WATER``: sea-ice concentration below 15% at both endpoints (links without a value are kept);
+- ``INTERP_UNSUPPORTED``: an interpolated endpoint without enough agreeing neighbours.
 
-Thresholds are in ``protocols/trajectory_link_qc_v3.json``. Coordinates are EPSG:3413 metres.
+Incoherent image pairs and links with fewer than two neighbours are flagged, not excluded. Thresholds are
+in ``protocols/trajectory_link_qc_v3_1.json``. Coordinates are EPSG:3413 metres.
 """
 
 from __future__ import annotations
@@ -32,17 +34,14 @@ from scipy.spatial import cKDTree
 from .core import QCConfig, _local_prediction, validate_frozen_protocol
 
 
-PROTOCOL_V3_ID = "limosat_trajectory_link_qc_v3_20261024"
-PROTOCOL_V3_PATH = Path(__file__).resolve().parent / "protocols" / "trajectory_link_qc_v3.json"
+PROTOCOL_V3_ID = "limosat_trajectory_link_qc_v3_1_20261026"
+PROTOCOL_V3_PATH = Path(__file__).resolve().parent / "protocols" / "trajectory_link_qc_v3_1.json"
 
 FLAG_BITS = {
-    "ISOLATED_INTERP": 0,
-    "INTERP_RESIDUAL": 1,
-    "PAIR_INCOHERENT": 2,
-    "OPEN_WATER": 3,
-    "COASTAL": 4,
+    "PAIR_INCOHERENT": 0,
+    "FEW_NEIGHBOURS": 1,
 }
-EXCLUSION_CODES = ("R1", "LAND")
+EXCLUSION_CODES = ("R1", "LAND", "COASTAL", "OPEN_WATER", "INTERP_UNSUPPORTED")
 
 
 @dataclass(frozen=True)
@@ -57,6 +56,12 @@ class V3Config:
     incoherent_fraction: float = 0.5
     incoherent_residual_m: float = 2_000.0
     open_water_sic: float = 0.15
+    support_radius_m: float = 50_000.0
+    support_nearest: int = 16
+    support_min: int = 3
+    support_tolerance_m: float = 1_000.0
+    few_neighbours_radius_m: float = 30_000.0
+    few_neighbours_min: int = 2
 
     def validate(self) -> None:
         for field, value in asdict(self).items():
@@ -177,9 +182,23 @@ def score_links(links: pd.DataFrame, qc_config: QCConfig, v3: V3Config) -> pd.Da
         & (result.coherence_ratio >= v3.coherence_min)
         & (result.n_corroborating == 0)
     )
-    result["r1"] = isolated & direct
+    result["direct"] = direct
+    result["r1"] = isolated
     result["r1_interpolated"] = isolated & ~direct
-    result["interp_residual"] = ~direct & (result.local_residual_m > v3.residual_floor_m)
+    support = np.zeros(len(result))
+    support_direct = np.zeros(len(result))
+    support_residual = np.full(len(result), np.nan)
+    neighbours = np.zeros(len(result))
+    for _, index in result.groupby(["source_image_id", "target_image_id"], sort=False).indices.items():
+        n, nd, r, few = pair_support(result[["x0_m", "y0_m"]].to_numpy(float)[index],
+                                     result[["dx_m", "dy_m"]].to_numpy(float)[index], direct.to_numpy()[index], v3)
+        support[index], support_direct[index], support_residual[index], neighbours[index] = n, nd, r, few
+    result["support_count"] = support
+    result["support_direct_count"] = support_direct
+    result["support_residual_m"] = support_residual
+    result["neighbours_30km"] = neighbours
+    supported = (support >= v3.support_min) & (support_residual <= v3.support_tolerance_m)
+    result["interp_unsupported"] = ~direct.to_numpy() & ~supported
     far = result.coarse_residual_m > v3.incoherent_residual_m
     pair = result.groupby(["source_image_id", "target_image_id"], sort=False)
     links_in_pair = pair.edge_uid.transform("size")
@@ -188,6 +207,34 @@ def score_links(links: pd.DataFrame, qc_config: QCConfig, v3: V3Config) -> pd.Da
     result["pair_far_fraction"] = far_fraction
     result["pair_incoherent"] = (links_in_pair >= v3.incoherent_min_links) & (far_fraction >= v3.incoherent_fraction)
     return result
+
+
+def pair_support(xy: np.ndarray, uv: np.ndarray, direct: np.ndarray, v3: "V3Config"):
+    """Support for each link of one pair from its nearest other links (direct or interpolated).
+
+    Returns the number of the ``support_nearest`` nearest other links within ``support_radius_m``, how
+    many of them are direct, the distance of the link displacement from their median, and the count
+    of other links within ``few_neighbours_radius_m``.
+    """
+    n = len(xy)
+    count, count_direct, residual = np.zeros(n), np.zeros(n), np.full(n, np.nan)
+    if n < 2:
+        return count, count_direct, residual, np.zeros(n)
+    tree = cKDTree(xy)
+    few = tree.query_ball_point(xy, v3.few_neighbours_radius_m, return_length=True) - 1
+    k = min(v3.support_nearest + 1, n)
+    dist, nb = tree.query(xy, k=k, distance_upper_bound=v3.support_radius_m)
+    valid = np.isfinite(dist) & (nb < n) & (nb != np.arange(n)[:, None])
+    safe = np.where(valid, nb, 0)
+    nuv = uv[safe].astype(float)
+    nuv[~valid] = np.nan
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        median = np.nanmedian(nuv, axis=1)
+    count = valid.sum(1).astype(float)
+    count_direct = (valid & direct[safe]).sum(1).astype(float)
+    residual = np.where(count > 0, np.hypot(*(uv - median).T), np.nan)
+    return count, count_direct, residual, few.astype(float)
 
 
 # --------------------------------------------------------------------------- external inputs
@@ -263,10 +310,60 @@ class SicSampler:
         return out
 
 
+class AsiSampler:
+    """Nearest-cell daily SIC (fraction) from University of Bremen AMSR2 ASI 3.125 km GeoTIFFs
+    (``<root>/<YYYY>/<mon>/asi-AMSR2-n3125-<YYYYMMDD>-v5.4.tif``, EPSG:3411, percent; values above 100
+    are land or missing)."""
+
+    def __init__(self, root: Path):
+        from pyproj import Transformer
+
+        self.root = Path(root)
+        self.transform = Transformer.from_crs("EPSG:3413", "EPSG:3411", always_xy=True).transform
+        self.cache: dict[str, tuple | None] = {}
+        self.files: dict[str, str] = {}
+
+    def _grid(self, day: pd.Timestamp):
+        key = day.strftime("%Y%m%d")
+        if key not in self.cache:
+            import rasterio
+
+            path = self.root / day.strftime("%Y") / day.strftime("%b").lower() / f"asi-AMSR2-n3125-{key}-v5.4.tif"
+            if not path.exists():
+                self.cache[key] = None
+            else:
+                with rasterio.open(path) as src:
+                    self.cache[key] = (src.transform, src.read(1))
+                self.files[key] = path.name
+            if len(self.cache) > 40:
+                self.cache.pop(next(iter(self.cache)))
+        return self.cache[key]
+
+    def sample(self, x: np.ndarray, y: np.ndarray, times: pd.Series) -> np.ndarray:
+        px, py = self.transform(np.asarray(x, float), np.asarray(y, float))
+        px, py = np.asarray(px), np.asarray(py)
+        out = np.full(len(px), np.nan, dtype="float32")
+        days = pd.to_datetime(times, utc=True).dt.floor("D")
+        for day, index in pd.Series(np.arange(len(px))).groupby(days.to_numpy()).groups.items():
+            grid = self._grid(pd.Timestamp(day))
+            if grid is None:
+                continue
+            transform, sic = grid
+            index = np.asarray(index)
+            col = np.floor((px[index] - transform.c) / transform.a).astype(int)
+            row = np.floor((py[index] - transform.f) / transform.e).astype(int)
+            ok = (col >= 0) & (col < sic.shape[1]) & (row >= 0) & (row < sic.shape[0])
+            values = np.full(len(index), np.nan, dtype="float32")
+            values[ok] = sic[row[ok], col[ok]]
+            values[values > 100] = np.nan
+            out[index] = values / 100.0
+        return out
+
+
 # --------------------------------------------------------------------------- decisions
 
 
-def decide(scored: pd.DataFrame, v3: V3Config, land: LandRaster, sic: SicSampler | None) -> pd.DataFrame:
+def decide(scored: pd.DataFrame, v3: V3Config, land: LandRaster, sic: "SicSampler | AsiSampler | None") -> pd.DataFrame:
     """Exclusion reasons and quality flags for scored links."""
 
     result = scored
@@ -284,15 +381,15 @@ def decide(scored: pd.DataFrame, v3: V3Config, land: LandRaster, sic: SicSampler
         result["sic_end"] = np.float32(np.nan)
         result["open_water"] = False
 
+    result["few_neighbours"] = result.neighbours_30km < v3.few_neighbours_min
     reason = pd.Series("", index=result.index, dtype="string")
-    reason += np.where(result.r1, "R1+", "")
-    reason += np.where(result.land, "LAND+", "")
+    for column, code in (("r1", "R1"), ("land", "LAND"), ("coastal", "COASTAL"), ("open_water", "OPEN_WATER"),
+                         ("interp_unsupported", "INTERP_UNSUPPORTED")):
+        reason += np.where(result[column], code + "+", "")
     result["qc3_exclusion"] = reason.str.rstrip("+")
     flags = np.zeros(len(result), dtype=np.uint16)
     names = pd.Series("", index=result.index, dtype="string")
-    for column, name in (("r1_interpolated", "ISOLATED_INTERP"), ("interp_residual", "INTERP_RESIDUAL"),
-                         ("pair_incoherent", "PAIR_INCOHERENT"), ("open_water", "OPEN_WATER"),
-                         ("coastal", "COASTAL")):
+    for column, name in (("pair_incoherent", "PAIR_INCOHERENT"), ("few_neighbours", "FEW_NEIGHBOURS")):
         hit = result[column].to_numpy(bool)
         flags |= (hit.astype(np.uint16) << FLAG_BITS[name])
         names += np.where(hit, name + ";", "")
@@ -303,13 +400,22 @@ def decide(scored: pd.DataFrame, v3: V3Config, land: LandRaster, sic: SicSampler
 
 def reason_text(row) -> str:
     parts = []
-    if "R1" in row.qc3_exclusion:
+    codes = row.qc3_exclusion.split("+")
+    if "R1" in codes:
+        kind = "direct-match" if row.direct else "interpolated"
         parts.append(
-            f"R1 isolated direct-match outlier: residual {row.local_residual_m:.0f} m vs neighbour spread "
+            f"R1 isolated {kind} outlier: residual {row.local_residual_m:.0f} m vs neighbour spread "
             f"{max(row.neighbour_spread_m, 150.0):.0f} m (ratio {row.coherence_ratio:.1f}), "
             f"0 corroborating neighbours of {int(row.n_neighbours)}")
-    if "LAND" in row.qc3_exclusion:
+    if "LAND" in codes:
         parts.append(f"LAND endpoint {max(row.inland_start_km, row.inland_end_km):.1f} km inside land")
+    if "COASTAL" in codes:
+        parts.append(f"COASTAL endpoint {max(row.inland_start_km, row.inland_end_km):.1f} km inside land")
+    if "OPEN_WATER" in codes:
+        parts.append(f"OPEN_WATER SIC {row.sic_start:.0%} at start, {row.sic_end:.0%} at end")
+    if "INTERP_UNSUPPORTED" in codes:
+        parts.append(f"INTERP_UNSUPPORTED interpolated link {row.support_residual_m:.0f} m from the median of "
+                     f"{int(row.support_count)} neighbours within 50 km")
     return "; ".join(parts)
 
 
@@ -360,7 +466,8 @@ def continuity_violations(links: pd.DataFrame) -> int:
 
 DIAGNOSTICS = ["coarse_residual_m", "neighbour_spread_m", "n_corroborating", "n_neighbours", "local_residual_m",
                "coherence_ratio", "local_supported", "pair_links", "pair_far_fraction", "inland_start_km",
-               "inland_end_km", "sic_start", "sic_end"]
+               "inland_end_km", "sic_start", "sic_end", "direct", "support_count", "support_direct_count",
+               "support_residual_m", "neighbours_30km"]
 
 
 def months_in(dataset: ds.Dataset) -> list[tuple[int, int]]:
@@ -368,14 +475,15 @@ def months_in(dataset: ds.Dataset) -> list[tuple[int, int]]:
     return sorted((int(y), int(m)) for y, m in table.itertuples(index=False))
 
 
-def run(input_path: Path, output_dir: Path, land_path: Path, sic_root: Path | None, period: str) -> dict:
+def run(input_path: Path, output_dir: Path, land_path: Path, sic_root: Path | None, period: str,
+        sic_product: str = "asi") -> dict:
     qc_config, v3 = QCConfig(), V3Config()
     qc_config.validate()
     v3.validate()
     validate_frozen_protocol(qc_config)
     validate_v3_protocol(v3)
     land = LandRaster(land_path)
-    sic = SicSampler(sic_root) if sic_root else None
+    sic = (AsiSampler(sic_root) if sic_product == "asi" else SicSampler(sic_root)) if sic_root else None
     work = output_dir / "work"
     work.mkdir(parents=True, exist_ok=True)
     dataset = ds.dataset(input_path)
@@ -415,7 +523,10 @@ def run(input_path: Path, output_dir: Path, land_path: Path, sic_root: Path | No
         kept = assign_segments(kept, excluded, base_id)
         for name, bit in FLAG_BITS.items():
             flag_counts[name] += int(((kept.qc3_flags.to_numpy() >> bit) & 1).sum())
-        table_df = kept[keep_cols + ["qc3_trajectory_id", "qc3_segment", "qc3_flags", "qc3_flag_reasons"]]
+        kept = kept.assign(qc3_neighbours_30km=kept.neighbours_30km.astype("int16"),
+                           qc3_sic_start=kept.sic_start.astype("float32"), qc3_sic_end=kept.sic_end.astype("float32"))
+        table_df = kept[keep_cols + ["qc3_trajectory_id", "qc3_segment", "qc3_flags", "qc3_flag_reasons",
+                                     "qc3_neighbours_30km", "qc3_sic_start", "qc3_sic_end"]]
         table = pa.Table.from_pandas(table_df, preserve_index=False)
         if writer is None:
             meta = dict(table.schema.metadata or {})
@@ -437,7 +548,8 @@ def run(input_path: Path, output_dir: Path, land_path: Path, sic_root: Path | No
         "period": period, "protocol_id": PROTOCOL_V3_ID, "protocol_sha256": sha256(PROTOCOL_V3_PATH),
         "input": str(input_path), "input_sha256": sha256(input_path),
         "land_raster": str(land_path), "land_raster_sha256": land.sha256,
-        "sic_root": str(sic_root) if sic_root else None, "sic_files_used": len(sic.files) if sic else 0,
+        "sic_root": str(sic_root) if sic_root else None, "sic_product": sic_product if sic_root else None,
+        "sic_files_used": len(sic.files) if sic else 0,
         "input_links": input_total, "kept_links": kept_total, "excluded_links": int(len(excluded)),
         "exclusions_by_reason": counts, "kept_links_by_flag": flag_counts,
         "new_trajectory_id_base": base_id, "continuity_violations": violations, "edge_uid_unique_and_disjoint": bool(unique),
@@ -465,15 +577,17 @@ def pc_max(path: Path, column: str) -> int:
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Apply trajectory-link QC v3 to a v2 scientific edge Parquet.")
+    parser = argparse.ArgumentParser(description="Apply trajectory-link QC v3.1 to a v2 scientific edge Parquet.")
     parser.add_argument("--input", required=True, type=Path, help="v2 edge Parquet for one period")
     parser.add_argument("--period", required=True, help="period label used in output names")
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--land-raster", required=True, type=Path, help=".npz inland-distance raster (EPSG:3413)")
-    parser.add_argument("--sic-root", type=Path, help="NOAA/NSIDC CDR v6 root for the open-water flag")
+    parser.add_argument("--sic-root", type=Path, help="SIC root for the open-water exclusion")
+    parser.add_argument("--sic-product", choices=["asi", "nsidc"], default="asi",
+                        help="asi: Bremen AMSR2 ASI 3.125 km GeoTIFF (default); nsidc: NOAA/NSIDC CDR v6 25 km")
     a = parser.parse_args(argv)
     a.output_dir.mkdir(parents=True, exist_ok=True)
-    manifest = run(a.input, a.output_dir, a.land_raster, a.sic_root, a.period)
+    manifest = run(a.input, a.output_dir, a.land_raster, a.sic_root, a.period, a.sic_product)
     print(json.dumps(manifest, indent=2))
     if manifest["status"] != "complete":
         raise SystemExit("v3 QC output failed its checks; see the manifest")

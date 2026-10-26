@@ -55,39 +55,46 @@ checkpoints cannot be reused after changing the code or protocol.
 To extend tracking, use the original database and template Zarr store, then run
 QC again. The QC database is an analysis output and cannot resume tracking.
 
-## QC v3 on a v2 release
+## QC v3.1 on a v2 release
 
-QC v3 keeps every v2 decision and is applied to the v2 scientific edge Parquet of one period. It
-excludes isolated direct-match outliers (`R1`) and links with an endpoint at least 2 km inside land
-(`LAND`), splitting trajectories at every excluded link, and adds quality flags that never split
-trajectories. Rules and thresholds are in the
-[v3 protocol](../limosat/qc/protocols/trajectory_link_qc_v3.json).
+QC v3.1 keeps every v2 decision and is applied to the v2 scientific edge Parquet of one period. It
+excludes links, splitting trajectories at every excluded link, for these reasons:
+
+| Reason | Condition |
+| --- | --- |
+| `R1` | Isolated outlier: > 2 km from the local prediction, ≥ 5× the neighbours' own spread, no corroborating neighbour (direct or interpolated) |
+| `LAND` | An endpoint at least 2 km inside land |
+| `COASTAL` | An endpoint 0–2 km inside land |
+| `OPEN_WATER` | Sea-ice concentration below 15% at both endpoints; links without a value are kept |
+| `INTERP_UNSUPPORTED` | An endpoint interpolated, and fewer than 3 of the 16 nearest other links within 50 km, or more than 1 km from their median displacement |
+
+Rules and thresholds are in the [v3.1 protocol](../limosat/qc/protocols/trajectory_link_qc_v3_1.json).
 
 ```bash
 python -m limosat.qc.v3 \
   --input 202405_202507.parquet \
   --period 202405_202507 \
   --land-raster land_3413_1km.npz \
-  --sic-root noaa_nsidc_cdr_v6 \
+  --sic-root uni_bremen_amsr2_asi_n3125 \
   --output-dir qc3_202405_202507
 ```
 
 - `--land-raster` is an `.npz` with `inland_km` (distance inside land, 0 at sea) on a regular
   EPSG:3413 grid, plus `x0` (west edge), `y1` (north edge) and `res` in metres.
-- `--sic-root` is optional and enables the open-water flag from NOAA/NSIDC CDR v6 daily files.
+- `--sic-root` points to University of Bremen AMSR2 ASI 3.125 km daily GeoTIFFs
+  (`<YYYY>/<mon>/asi-AMSR2-n3125-<YYYYMMDD>-v5.4.tif`); `--sic-product nsidc` uses NOAA/NSIDC CDR v6
+  25 km files instead. Without `--sic-root` no link is excluded as open water.
 - Interrupted runs resume from the per-month files in `<output-dir>/work`.
 
-Outputs are `<period>_qc3.parquet` (kept links with `qc3_trajectory_id`, `qc3_segment`, `qc3_flags`
-and `qc3_flag_reasons`), `<period>_qc3_exclusions.parquet` (excluded links with reason codes, reason
-text and diagnostics) and `<period>_qc3.manifest.json`. Use the output only when the manifest reports
-`status: complete`: kept plus excluded links equal the input, `edge_uid` is unique, and v3
-trajectories have no continuity gaps. v2 columns such as `is_last` and `converged_to` are carried
-unchanged and describe the v2 trajectory.
+Outputs are `<period>_qc3.parquet` (kept links with `qc3_trajectory_id`, `qc3_segment`, `qc3_flags`,
+`qc3_flag_reasons`, `qc3_neighbours_30km`, `qc3_sic_start` and `qc3_sic_end`),
+`<period>_qc3_exclusions.parquet` (excluded links with reason codes, reason text and diagnostics) and
+`<period>_qc3.manifest.json`. Use the output only when the manifest reports `status: complete`: kept
+plus excluded links equal the input, `edge_uid` is unique, and v3 trajectories have no continuity
+gaps. v2 columns such as `is_last` and `converged_to` are carried unchanged and describe the v2
+trajectory.
 
 | `qc3_flags` bit | Name | Meaning |
 | --- | --- | --- |
-| 0 | `ISOLATED_INTERP` | R1 conditions met, but an endpoint is interpolated |
-| 1 | `INTERP_RESIDUAL` | An endpoint is interpolated and the link is > 2 km from its local prediction |
-| 2 | `PAIR_INCOHERENT` | Image pair with ≥ 20 links, at least half > 2 km from their neighbour median |
-| 3 | `OPEN_WATER` | Sea-ice concentration < 15% at both endpoints |
-| 4 | `COASTAL` | An endpoint less than 2 km inside land |
+| 0 | `PAIR_INCOHERENT` | Image pair with ≥ 20 links, at least half > 2 km from their neighbour median |
+| 1 | `FEW_NEIGHBOURS` | Fewer than 2 other links of the pair within 30 km |

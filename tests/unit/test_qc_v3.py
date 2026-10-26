@@ -37,13 +37,32 @@ def shift(links, rows, du, dv):
     return links
 
 
-def test_isolated_direct_outlier_is_r1_and_interpolated_one_is_only_flagged():
+def test_isolated_outliers_are_r1_whether_direct_or_interpolated():
     links = shift(pair_links(), [40, 90], 3_500.0, -2_000.0)
     links.loc[90, "target_interpolated"] = 1
     scored = v3.score_links(links, QCConfig(), v3.V3Config())
-    assert set(scored.index[scored.r1]) == {40}
+    assert set(scored.index[scored.r1]) == {40, 90}
     assert set(scored.index[scored.r1_interpolated]) == {90}
-    assert scored.loc[90, "interp_residual"]
+
+
+def test_interpolated_link_needs_agreeing_neighbours():
+    links = shift(pair_links(), [70], 1_600.0, 0.0)  # 1.6 km off: beyond the 1 km tolerance, below R1's floor
+    links.loc[[50, 70], "target_interpolated"] = 1
+    scored = v3.score_links(links, QCConfig(), v3.V3Config())
+    assert not scored.loc[50, "interp_unsupported"]  # interpolated, agrees with its field
+    assert scored.loc[70, "interp_unsupported"]
+    assert not scored.loc[scored.direct, "interp_unsupported"].any()  # direct links are never affected
+
+
+def test_sparse_interpolated_link_is_unsupported_and_few_neighbours_flagged():
+    links = pair_links(size=12)
+    far = links.iloc[[0]].copy()
+    far["edge_uid"], far["x0_m"], far["target_interpolated"] = "far", 400_000.0, 1
+    far["x1_m"] = far.x0_m + far.dx_m
+    links = pd.concat([links, far], ignore_index=True)
+    scored = v3.score_links(links, QCConfig(), v3.V3Config())
+    row = scored[scored.edge_uid == "far"].iloc[0]
+    assert row.interp_unsupported and row.neighbours_30km == 0
 
 
 def test_residual_in_incoherent_field_is_not_r1():
@@ -69,8 +88,32 @@ def test_land_exclusion_coastal_flag_and_bitmask(tmp_path):
     assert decided.land.equals(decided.x0_m < 5_000)  # the x = 0 column starts on land
     assert decided.coastal.equals((decided.x0_m >= 5_000) & (decided.x0_m < 7_000))
     assert (decided.loc[decided.land, "qc3_exclusion"] == "LAND").all()
-    bit = 1 << v3.FLAG_BITS["COASTAL"]
-    assert ((decided.qc3_flags & bit) > 0).equals(decided.coastal)
+    assert (decided.loc[decided.coastal, "qc3_exclusion"] == "COASTAL").all()
+    assert (decided.loc[~decided.land & ~decided.coastal, "qc3_exclusion"] == "").all()
+
+
+def test_asi_open_water_keeps_links_without_sic(tmp_path):
+    import rasterio
+    from rasterio.transform import from_origin
+    from pyproj import Transformer
+
+    day = tmp_path / "2024" / "mar"
+    day.mkdir(parents=True)
+    links = pair_links()
+    x, y = Transformer.from_crs("EPSG:3413", "EPSG:3411", always_xy=True).transform(links.x0_m.mean(), links.y0_m.mean())
+    sic = np.full((400, 400), 10, dtype="uint8")  # open water everywhere ...
+    sic[:, 200:] = 120  # ... except a land / missing half
+    tf = from_origin(x - 200 * 3125, y + 200 * 3125, 3125, 3125)
+    for d in ("20240301", "20240302"):
+        with rasterio.open(day / f"asi-AMSR2-n3125-{d}-v5.4.tif", "w", driver="GTiff", height=400, width=400, count=1,
+                           dtype="uint8", crs="EPSG:3411", transform=tf) as dst:
+            dst.write(sic, 1)
+    np.savez(tmp_path / "land.npz", inland_km=np.zeros((10, 10), "float32"), x0=-1e7, y1=1e7, res=1e6)
+    decided = v3.decide(v3.score_links(links, QCConfig(), v3.V3Config()), v3.V3Config(),
+                        v3.LandRaster(tmp_path / "land.npz"), v3.AsiSampler(tmp_path))
+    both = decided.sic_start.notna() & decided.sic_end.notna()
+    assert both.any() and (~both).any()
+    assert decided.loc[both, "open_water"].all() and not decided.loc[~both, "open_water"].any()
 
 
 def test_assign_segments_splits_at_excluded_links_deterministically():
@@ -90,5 +133,5 @@ def test_assign_segments_splits_at_excluded_links_deterministically():
     assert v3.continuity_violations(unsplit.drop(index=[2])) == 1
 
 
-def test_bundled_v3_protocol_matches_code():
+def test_bundled_v3_1_protocol_matches_code():
     v3.validate_v3_protocol(v3.V3Config())
