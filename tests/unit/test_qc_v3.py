@@ -26,6 +26,7 @@ def pair_links(size=12, seed=3, noise=40.0, pair=(1, 2), id0=0):
         "end_time_utc": pd.Timestamp("2024-03-02", tz="UTC"),
         "x0_m": x, "y0_m": y, "dx_m": u, "dy_m": v, "x1_m": x + u, "y1_m": y + v,
         "source_interpolated": np.int8(0), "target_interpolated": np.int8(0),
+        "elapsed_seconds": 86_400.0, "speed_m_per_day": np.hypot(u, v),
     })
 
 
@@ -127,9 +128,9 @@ def test_asi_open_water_keeps_links_without_sic(tmp_path):
     np.savez(tmp_path / "land.npz", inland_km=np.zeros((10, 10), "float32"), x0=-1e7, y1=1e7, res=1e6)
     decided = v3.decide(v3.score_links(links, QCConfig(), v3.V3Config()), v3.V3Config(),
                         v3.LandRaster(tmp_path / "land.npz"), v3.AsiSampler(tmp_path))
-    both = decided.sic_start.notna() & decided.sic_end.notna()
-    assert both.any() and (~both).any()
-    assert decided.loc[both, "open_water"].all() and not decided.loc[~both, "open_water"].any()
+    some = decided.sic_start.notna() | decided.sic_end.notna()
+    assert some.any() and (~some).any()
+    assert decided.loc[some, "open_water"].all() and not decided.loc[~some, "open_water"].any()
 
 
 def test_assign_segments_splits_at_excluded_links_deterministically():
@@ -147,6 +148,23 @@ def test_assign_segments_splits_at_excluded_links_deterministically():
     assert v3.continuity_violations(kept) == 0
     unsplit = links.assign(qc3_trajectory_id=7)
     assert v3.continuity_violations(unsplit.drop(index=[2])) == 1
+
+
+def test_isolated_long_interval_or_fast_links_are_excluded(tmp_path):
+    links = pair_links(size=12)
+    far = links.iloc[[0, 1, 2]].copy()
+    far["edge_uid"] = ["slow_far", "long_far", "fast_far"]
+    far["x0_m"] = [400_000.0, 800_000.0, 1_200_000.0]
+    far["x1_m"] = far.x0_m + far.dx_m
+    far["elapsed_seconds"] = [86_400.0, 72 * 3600.0, 86_400.0]
+    far["speed_m_per_day"] = [6_000.0, 6_000.0, 30_000.0]
+    links = pd.concat([links, far], ignore_index=True)
+    np.savez(tmp_path / "land.npz", inland_km=np.zeros((10, 10), "float32"), x0=-1e7, y1=1e7, res=1e6)
+    decided = v3.decide(v3.score_links(links, QCConfig(), v3.V3Config()), v3.V3Config(),
+                        v3.LandRaster(tmp_path / "land.npz"), None)
+    flag = decided.set_index("edge_uid").isolated_unverified
+    assert not flag["slow_far"] and flag["long_far"] and flag["fast_far"]
+    assert not flag[[u for u in flag.index if u.startswith("e")]].any()
 
 
 def test_bundled_v3_1_protocol_matches_code():

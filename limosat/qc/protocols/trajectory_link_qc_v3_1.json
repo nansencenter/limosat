@@ -20,14 +20,17 @@
     "support_min": 3,
     "support_tolerance_m": 1000.0,
     "few_neighbours_radius_m": 30000.0,
-    "few_neighbours_min": 2
+    "few_neighbours_min": 2,
+    "isolated_max_hours": 54.0,
+    "isolated_max_speed_m_per_day": 25000.0
   },
   "neighbour_model": "v2 neighbour model unchanged for R1: accepted links of the exact same source/target image pair, leave-one-out, up to 24 neighbours within 30 km, at least 8, robust distance-weighted local affine with the v2 prediction guard; single pass. Support and neighbour counts use the same accepted links of the pair.",
   "exclusions": {
     "R1": "local fit supported, local_residual_m > residual_floor_m, coherence_ratio >= coherence_min, n_corroborating == 0 (direct or interpolated endpoints)",
     "LAND": "start or end point inside land: inland distance >= land_min_inland_km on the supplied 1 km inland-distance raster (any land cell)",
-    "OPEN_WATER": "SIC < open_water_sic at both endpoints (each endpoint on its own date, nearest cell); links with no SIC value at either endpoint are kept. Product per day: AMSR2 ASI 3.125 km, else AMSR2 ASI 6.25 km, else NOAA/NSIDC CDR v6 25 km",
-    "INTERP_UNSUPPORTED": "an endpoint interpolated, and fewer than support_min of the support_nearest nearest other links within support_radius_m, or the link more than support_tolerance_m from their median displacement"
+    "OPEN_WATER": "SIC < open_water_sic at either endpoint (each endpoint on its own date, nearest cell); links with no SIC value at both endpoints are kept. Product per day: AMSR2 ASI 3.125 km, else AMSR2 ASI 6.25 km, else NOAA/NSIDC CDR v6 25 km",
+    "INTERP_UNSUPPORTED": "an endpoint interpolated, and fewer than support_min of the support_nearest nearest other links within support_radius_m, or the link more than support_tolerance_m from their median displacement",
+    "ISOLATED_UNVERIFIED": "no other link of the pair within few_neighbours_radius_m, and an interval longer than isolated_max_hours or a speed above isolated_max_speed_m_per_day (unverifiable vectors from long-interval or fast pairs)"
   },
   "flags": {
     "bit_0_PAIR_INCOHERENT": "image pair with >= incoherent_min_links links of which >= incoherent_fraction have coarse_residual_m > incoherent_residual_m",
@@ -46,7 +49,8 @@
   "evidence": {
     "r1": "held-out reviewer labels, SAR image check 2015-2025, buoys, ELoFTR (limosat-papers rogue-vector review)",
     "interp_unsupported": "sensitivity sweep against ELoFTR (March 2020) and same-keypoint rerun disagreement (May-July 2024); chosen setting cuts links > 2 km off from 6.4% to 1.4% and 3.4% to 0.46%",
-    "filter_review": "reviewer verdicts on 24 SAR tiles: R1, land, coastal and open-water steps judged correct in 27 of 28 verdicts; 0-1 neighbour links judged valid in 7 of 7"
+    "filter_review": "reviewer verdicts on 24 SAR tiles: R1, land, coastal and open-water steps judged correct in 27 of 28 verdicts; 0-1 neighbour links judged valid in 7 of 7",
+    "isolated_and_open_water": "reviewer-circled remaining vectors in the January/July 2020 animation (Fram Strait) were all isolated, 60-95 h intervals or one endpoint in open water"
   },
   "not_used_for_exclusion": [
     "correlation",

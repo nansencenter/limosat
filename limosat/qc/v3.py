@@ -6,8 +6,9 @@ neighbour model (single pass), and excludes, splitting trajectories at every exc
 
 - ``R1``: isolated outliers (direct or interpolated endpoints);
 - ``LAND``: an endpoint inside land (any land cell of the inland-distance raster);
-- ``OPEN_WATER``: sea-ice concentration below 15% at both endpoints (links without a value are kept);
-- ``INTERP_UNSUPPORTED``: an interpolated endpoint without enough agreeing neighbours.
+- ``OPEN_WATER``: sea-ice concentration below 15% at either endpoint (links without any value are kept);
+- ``INTERP_UNSUPPORTED``: an interpolated endpoint without enough agreeing neighbours;
+- ``ISOLATED_UNVERIFIED``: no other link within 30 km and an interval over 54 h or a speed over 25 km/day.
 
 Incoherent image pairs and links with fewer than two neighbours are flagged, not excluded. Thresholds are
 in ``protocols/trajectory_link_qc_v3_1.json``. Coordinates are EPSG:3413 metres.
@@ -40,7 +41,7 @@ FLAG_BITS = {
     "PAIR_INCOHERENT": 0,
     "FEW_NEIGHBOURS": 1,
 }
-EXCLUSION_CODES = ("R1", "LAND", "OPEN_WATER", "INTERP_UNSUPPORTED")
+EXCLUSION_CODES = ("R1", "LAND", "OPEN_WATER", "INTERP_UNSUPPORTED", "ISOLATED_UNVERIFIED")
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,8 @@ class V3Config:
     support_tolerance_m: float = 1_000.0
     few_neighbours_radius_m: float = 30_000.0
     few_neighbours_min: int = 2
+    isolated_max_hours: float = 54.0
+    isolated_max_speed_m_per_day: float = 25_000.0
 
     def validate(self) -> None:
         for field, value in asdict(self).items():
@@ -399,16 +402,20 @@ def decide(scored: pd.DataFrame, v3: V3Config, land: LandRaster, sic: "SicSample
     if sic is not None:
         result["sic_start"] = sic.sample(result.x0_m, result.y0_m, result.start_time_utc)
         result["sic_end"] = sic.sample(result.x1_m, result.y1_m, result.end_time_utc)
-        result["open_water"] = (result.sic_start < v3.open_water_sic) & (result.sic_end < v3.open_water_sic)
+        # either endpoint below the threshold (a missing value at one endpoint does not protect the other)
+        result["open_water"] = np.fmin(result.sic_start, result.sic_end) < v3.open_water_sic
     else:
         result["sic_start"] = np.float32(np.nan)
         result["sic_end"] = np.float32(np.nan)
         result["open_water"] = False
 
     result["few_neighbours"] = result.neighbours_30km < v3.few_neighbours_min
+    result["isolated_unverified"] = (result.neighbours_30km == 0) & (
+        (result.elapsed_seconds > v3.isolated_max_hours * 3600)
+        | (result.speed_m_per_day > v3.isolated_max_speed_m_per_day))
     reason = pd.Series("", index=result.index, dtype="string")
     for column, code in (("r1", "R1"), ("land", "LAND"), ("open_water", "OPEN_WATER"),
-                         ("interp_unsupported", "INTERP_UNSUPPORTED")):
+                         ("interp_unsupported", "INTERP_UNSUPPORTED"), ("isolated_unverified", "ISOLATED_UNVERIFIED")):
         reason += np.where(result[column], code + "+", "")
     result["qc3_exclusion"] = reason.str.rstrip("+")
     flags = np.zeros(len(result), dtype=np.uint16)
@@ -435,6 +442,9 @@ def reason_text(row) -> str:
         parts.append(f"LAND endpoint {max(row.inland_start_km, row.inland_end_km):.1f} km inside land")
     if "OPEN_WATER" in codes:
         parts.append(f"OPEN_WATER SIC {row.sic_start:.0%} at start, {row.sic_end:.0%} at end")
+    if "ISOLATED_UNVERIFIED" in codes:
+        parts.append(f"ISOLATED_UNVERIFIED no other link within 30 km, {row.elapsed_seconds / 3600:.0f} h interval, "
+                     f"{row.speed_m_per_day / 1000:.1f} km/day")
     if "INTERP_UNSUPPORTED" in codes:
         parts.append(f"INTERP_UNSUPPORTED interpolated link {row.support_residual_m:.0f} m from the median of "
                      f"{int(row.support_count)} neighbours within 50 km")
@@ -486,7 +496,7 @@ def continuity_violations(links: pd.DataFrame) -> int:
 
 # --------------------------------------------------------------------------- archive runner
 
-DIAGNOSTICS = ["coarse_residual_m", "neighbour_spread_m", "n_corroborating", "n_neighbours", "local_residual_m",
+DIAGNOSTICS = ["elapsed_seconds", "speed_m_per_day", "coarse_residual_m", "neighbour_spread_m", "n_corroborating", "n_neighbours", "local_residual_m",
                "coherence_ratio", "local_supported", "pair_links", "pair_far_fraction", "inland_start_km",
                "inland_end_km", "sic_start", "sic_end", "direct", "support_count", "support_direct_count",
                "support_residual_m", "neighbours_30km"]
