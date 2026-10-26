@@ -21,7 +21,7 @@ import hashlib
 import json
 import math
 import warnings
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -82,14 +82,15 @@ def load_v3_protocol() -> dict:
     return protocol
 
 
-def validate_v3_protocol(config: V3Config) -> None:
-    """Fail if v3 code defaults and the bundled protocol have drifted apart."""
+def validate_v3_protocol(config: V3Config, overrides: frozenset = frozenset()) -> None:
+    """Fail if v3 code defaults and the bundled protocol have drifted apart (``overrides`` are declared
+    run-time departures, recorded in the manifest)."""
 
     parameters = load_v3_protocol()["parameters"]
     mismatches = {
         field: (value, parameters.get(field))
         for field, value in asdict(config).items()
-        if value != parameters.get(field)
+        if value != parameters.get(field) and field not in overrides
     }
     if mismatches:
         raise ValueError(f"v3 configuration does not match frozen protocol: {mismatches}")
@@ -409,6 +410,16 @@ def decide(scored: pd.DataFrame, v3: V3Config, land: LandRaster, sic: "SicSample
         result["sic_end"] = np.float32(np.nan)
         result["open_water"] = False
 
+    return apply_exclusions(result, v3)
+
+
+def apply_exclusions(result: pd.DataFrame, v3: V3Config) -> pd.DataFrame:
+    """Exclusion reasons and flags from stored diagnostics, so a finished scoring can be re-decided
+    with a different support tolerance without rescoring."""
+
+    direct = result.direct.to_numpy(bool)
+    supported = (result.support_count >= v3.support_min) & (result.support_residual_m <= v3.support_tolerance_m)
+    result["interp_unsupported"] = ~direct & ~supported.to_numpy()
     result["few_neighbours"] = result.neighbours_30km < v3.few_neighbours_min
     result["isolated_unverified"] = (result.neighbours_30km == 0) & (
         (result.elapsed_seconds > v3.isolated_max_hours * 3600)
@@ -508,12 +519,17 @@ def months_in(dataset: ds.Dataset) -> list[tuple[int, int]]:
 
 
 def run(input_path: Path, output_dir: Path, land_path: Path, sic_root: Path | None, period: str,
-        sic_product: str = "asi", sic_fallback_roots: list[tuple[str, Path]] | None = None) -> dict:
+        sic_product: str = "asi", sic_fallback_roots: list[tuple[str, Path]] | None = None,
+        support_tolerance_m: float | None = None, work_dir: Path | None = None) -> dict:
     qc_config, v3 = QCConfig(), V3Config()
+    overrides = {}
+    if support_tolerance_m is not None and support_tolerance_m != v3.support_tolerance_m:
+        v3 = replace(v3, support_tolerance_m=float(support_tolerance_m))
+        overrides["support_tolerance_m"] = float(support_tolerance_m)
     qc_config.validate()
     v3.validate()
     validate_frozen_protocol(qc_config)
-    validate_v3_protocol(v3)
+    validate_v3_protocol(v3, frozenset(overrides))
     land = LandRaster(land_path)
     sic = None
     if sic_root:
@@ -522,7 +538,7 @@ def run(input_path: Path, output_dir: Path, land_path: Path, sic_root: Path | No
         for name, root in sic_fallback_roots or []:
             chain.append((name, AsiSampler(root, grid="n6250") if name == "asi_n6250" else SicSampler(root)))
         sic = FallbackSicSampler(chain)
-    work = output_dir / "work"
+    work = Path(work_dir) if work_dir else output_dir / "work"
     work.mkdir(parents=True, exist_ok=True)
     dataset = ds.dataset(input_path)
     schema = dataset.schema
@@ -541,7 +557,10 @@ def run(input_path: Path, output_dir: Path, land_path: Path, sic_root: Path | No
     # skip AppleDouble "._" companions that macOS writes on non-native volumes
     parts = sorted(p for p in work.glob("*.scored.parquet") if not p.name.startswith("._"))
     keep_cols = [f.name for f in schema]
-    excluded = pd.concat([pd.read_parquet(p, filters=[("qc3_exclusion", "!=", "")]) for p in parts], ignore_index=True)
+    def decided_month(p: Path) -> pd.DataFrame:
+        return apply_exclusions(pd.read_parquet(p), v3)
+
+    excluded = pd.concat([m[m.qc3_exclusion != ""] for m in map(decided_month, parts)], ignore_index=True)
     excluded["reason_text"] = [reason_text(r) for r in excluded.itertuples(index=False)]
     excluded_out = excluded[["edge_uid", "qc_trajectory_id", "original_trajectory_id", "source_rowid", "target_rowid",
                              "source_image_id", "target_image_id", "start_time_utc", "end_time_utc", "x0_m", "y0_m",
@@ -555,7 +574,7 @@ def run(input_path: Path, output_dir: Path, land_path: Path, sic_root: Path | No
     out_path = output_dir / f"{period}_qc3.parquet"
     tmp_path = out_path.with_suffix(".parquet.part")
     for p in parts:
-        month = pd.read_parquet(p)
+        month = decided_month(p)
         input_total += len(month)
         kept = month[month.qc3_exclusion == ""]
         kept = assign_segments(kept, excluded, base_id)
@@ -584,6 +603,7 @@ def run(input_path: Path, output_dir: Path, land_path: Path, sic_root: Path | No
     manifest = {
         "status": "complete" if (violations == 0 and unique and kept_total + len(excluded) == input_total) else "failed",
         "period": period, "protocol_id": PROTOCOL_V3_ID, "protocol_sha256": sha256(PROTOCOL_V3_PATH),
+        "parameter_overrides": overrides, "work_dir": str(work),
         "input": str(input_path), "input_sha256": sha256(input_path),
         "land_raster": str(land_path), "land_raster_sha256": land.sha256,
         "sic_root": str(sic_root) if sic_root else None, "sic_product": sic_product if sic_root else None,
@@ -626,11 +646,15 @@ def main(argv: list[str] | None = None) -> None:
                         help="asi: Bremen AMSR2 ASI 3.125 km GeoTIFF (default); nsidc: NOAA/NSIDC CDR v6 25 km")
     parser.add_argument("--sic-fallback-asi6250", type=Path, help="Bremen AMSR2 ASI 6.25 km root for days missing at 3.125 km")
     parser.add_argument("--sic-fallback-nsidc", type=Path, help="NOAA/NSIDC CDR v6 root for days missing in the ASI products")
+    parser.add_argument("--support-tolerance-m", type=float,
+                        help="override the interpolated-support tolerance (recorded in the manifest)")
+    parser.add_argument("--work-dir", type=Path, help="per-month scoring directory (reuse one scoring for several tolerances)")
     a = parser.parse_args(argv)
     a.output_dir.mkdir(parents=True, exist_ok=True)
     fallbacks = ([("asi_n6250", a.sic_fallback_asi6250)] if a.sic_fallback_asi6250 else []) + \
         ([("nsidc", a.sic_fallback_nsidc)] if a.sic_fallback_nsidc else [])
-    manifest = run(a.input, a.output_dir, a.land_raster, a.sic_root, a.period, a.sic_product, fallbacks)
+    manifest = run(a.input, a.output_dir, a.land_raster, a.sic_root, a.period, a.sic_product, fallbacks,
+                   a.support_tolerance_m, a.work_dir)
     print(json.dumps(manifest, indent=2))
     if manifest["status"] != "complete":
         raise SystemExit("v3 QC output failed its checks; see the manifest")

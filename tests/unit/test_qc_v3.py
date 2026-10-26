@@ -167,5 +167,18 @@ def test_isolated_long_interval_or_fast_links_are_excluded(tmp_path):
     assert not flag[[u for u in flag.index if u.startswith("e")]].any()
 
 
+def test_stored_scoring_can_be_redecided_with_another_tolerance():
+    links = shift(pair_links(), [70], 1_600.0, 0.0)
+    links.loc[70, "target_interpolated"] = 1
+    scored = v3.score_links(links, QCConfig(), v3.V3Config())
+    scored["r1"] = False
+    scored["land"] = False
+    scored["open_water"] = False
+    strict = v3.apply_exclusions(scored.copy(), v3.V3Config())
+    loose = v3.apply_exclusions(scored.copy(), v3.V3Config(support_tolerance_m=2_000.0))
+    assert strict.loc[70, "qc3_exclusion"] == "INTERP_UNSUPPORTED"
+    assert loose.loc[70, "qc3_exclusion"] == ""
+
+
 def test_bundled_v3_1_protocol_matches_code():
     v3.validate_v3_protocol(v3.V3Config())
