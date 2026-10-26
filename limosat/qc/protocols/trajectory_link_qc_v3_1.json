@@ -19,6 +19,8 @@
     "support_nearest": 16,
     "support_min": 3,
     "support_tolerance_m": 1000.0,
+    "support_hard_tolerance_m": 3000.0,
+    "support_min_target_corr": 0.4,
     "few_neighbours_radius_m": 30000.0,
     "few_neighbours_min": 2,
     "isolated_max_hours": 54.0,
@@ -29,7 +31,7 @@
     "R1": "local fit supported, local_residual_m > residual_floor_m, coherence_ratio >= coherence_min, n_corroborating == 0 (direct or interpolated endpoints)",
     "LAND": "start or end point inside land: inland distance >= land_min_inland_km on the supplied 1 km inland-distance raster (any land cell)",
     "OPEN_WATER": "SIC < open_water_sic at either endpoint (each endpoint on its own date, nearest cell); links with no SIC value at both endpoints are kept. Product per day: AMSR2 ASI 3.125 km, else AMSR2 ASI 6.25 km, else NOAA/NSIDC CDR v6 25 km",
-    "INTERP_UNSUPPORTED": "an endpoint interpolated, and fewer than support_min of the support_nearest nearest other links within support_radius_m, or the link more than support_tolerance_m from their median displacement",
+    "INTERP_UNSUPPORTED": "an endpoint interpolated, and either fewer than support_min of the support_nearest nearest other links within support_radius_m, or more than support_hard_tolerance_m from their median displacement, or more than support_tolerance_m from it with target_corr < support_min_target_corr (a weak template match at the end)",
     "ISOLATED_UNVERIFIED": "no other link of the pair within few_neighbours_radius_m, and an interval longer than isolated_max_hours or a speed above isolated_max_speed_m_per_day (unverifiable vectors from long-interval or fast pairs)"
   },
   "flags": {
@@ -48,7 +50,7 @@
   },
   "evidence": {
     "r1": "held-out reviewer labels, SAR image check 2015-2025, buoys, ELoFTR (limosat-papers rogue-vector review)",
-    "interp_unsupported": "sensitivity sweep against ELoFTR (March 2020) and same-keypoint rerun disagreement (May-July 2024); chosen setting cuts links > 2 km off from 6.4% to 1.4% and 3.4% to 0.46%",
+    "interp_unsupported": "tested against ELoFTR (March 2020), reviewer labels and the SAR image check: '>3 km or (>1 km and target_corr < 0.40)' gave precision 0.75 / recall 0.77 against ELoFTR and 0.94 / 0.71 against reviewer labels, against 0.49 / 0.95 and 0.70 / 1.00 for the 1 km rule; thresholds set before testing, 0.35-0.45 sensitivity checked",
     "filter_review": "reviewer verdicts on 24 SAR tiles: R1, land, coastal and open-water steps judged correct in 27 of 28 verdicts; 0-1 neighbour links judged valid in 7 of 7",
     "isolated_and_open_water": "reviewer-circled remaining vectors in the January/July 2020 animation (Fram Strait) were all isolated, 60-95 h intervals or one endpoint in open water"
   },

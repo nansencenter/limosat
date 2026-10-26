@@ -26,7 +26,7 @@ def pair_links(size=12, seed=3, noise=40.0, pair=(1, 2), id0=0):
         "end_time_utc": pd.Timestamp("2024-03-02", tz="UTC"),
         "x0_m": x, "y0_m": y, "dx_m": u, "dy_m": v, "x1_m": x + u, "y1_m": y + v,
         "source_interpolated": np.int8(0), "target_interpolated": np.int8(0),
-        "elapsed_seconds": 86_400.0, "speed_m_per_day": np.hypot(u, v),
+        "elapsed_seconds": 86_400.0, "speed_m_per_day": np.hypot(u, v), "target_corr": 0.6,
     })
 
 
@@ -46,10 +46,19 @@ def test_isolated_outliers_are_r1_whether_direct_or_interpolated():
     assert set(scored.index[scored.r1_interpolated]) == {90}
 
 
+def decided(links):
+    """Score and decide without land or SIC inputs."""
+    scored = v3.score_links(links, QCConfig(), v3.V3Config())
+    for c in ("land", "open_water"):
+        scored[c] = False
+    return v3.apply_exclusions(scored, v3.V3Config())
+
+
 def test_interpolated_link_needs_agreeing_neighbours():
     links = shift(pair_links(), [70], 1_600.0, 0.0)  # 1.6 km off: beyond the 1 km tolerance, below R1's floor
     links.loc[[50, 70], "target_interpolated"] = 1
-    scored = v3.score_links(links, QCConfig(), v3.V3Config())
+    links.loc[70, "target_corr"] = 0.2  # weak template match, so the deviation is not accepted as deformation
+    scored = decided(links)
     assert not scored.loc[50, "interp_unsupported"]  # interpolated, agrees with its field
     assert scored.loc[70, "interp_unsupported"]
     assert not scored.loc[scored.direct, "interp_unsupported"].any()  # direct links are never affected
@@ -61,7 +70,7 @@ def test_sparse_interpolated_link_is_unsupported_and_few_neighbours_flagged():
     far["edge_uid"], far["x0_m"], far["target_interpolated"] = "far", 400_000.0, 1
     far["x1_m"] = far.x0_m + far.dx_m
     links = pd.concat([links, far], ignore_index=True)
-    scored = v3.score_links(links, QCConfig(), v3.V3Config())
+    scored = decided(links)
     row = scored[scored.edge_uid == "far"].iloc[0]
     assert row.interp_unsupported and row.neighbours_30km == 0
 
@@ -174,10 +183,26 @@ def test_stored_scoring_can_be_redecided_with_another_tolerance():
     scored["r1"] = False
     scored["land"] = False
     scored["open_water"] = False
+    scored["target_corr"] = 0.2
     strict = v3.apply_exclusions(scored.copy(), v3.V3Config())
     loose = v3.apply_exclusions(scored.copy(), v3.V3Config(support_tolerance_m=2_000.0))
     assert strict.loc[70, "qc3_exclusion"] == "INTERP_UNSUPPORTED"
     assert loose.loc[70, "qc3_exclusion"] == ""
+
+
+def test_strong_template_match_keeps_moderately_deviating_interpolated_link():
+    links = shift(pair_links(), [70, 71], 1_600.0, 0.0)
+    links.loc[[70, 71], "target_interpolated"] = 1
+    scored = v3.score_links(links, QCConfig(), v3.V3Config())
+    for c in ("r1", "land", "open_water"):
+        scored[c] = False
+    scored["target_corr"] = 0.7
+    scored.loc[71, "target_corr"] = 0.2
+    far = scored.copy()
+    far.loc[70, "support_residual_m"] = 3_500.0
+    out = v3.apply_exclusions(scored.copy(), v3.V3Config())
+    assert out.loc[70, "qc3_exclusion"] == "" and out.loc[71, "qc3_exclusion"] == "INTERP_UNSUPPORTED"
+    assert v3.apply_exclusions(far, v3.V3Config()).loc[70, "qc3_exclusion"] == "INTERP_UNSUPPORTED"
 
 
 def test_bundled_v3_1_protocol_matches_code():

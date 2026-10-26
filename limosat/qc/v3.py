@@ -7,7 +7,8 @@ neighbour model (single pass), and excludes, splitting trajectories at every exc
 - ``R1``: isolated outliers (direct or interpolated endpoints);
 - ``LAND``: an endpoint inside land (any land cell of the inland-distance raster);
 - ``OPEN_WATER``: sea-ice concentration below 15% at either endpoint (links without any value are kept);
-- ``INTERP_UNSUPPORTED``: an interpolated endpoint without enough agreeing neighbours;
+- ``INTERP_UNSUPPORTED``: an interpolated endpoint without enough neighbours, more than 3 km from their
+  median motion, or 1-3 km from it with a weak template match at the end (target correlation < 0.40);
 - ``ISOLATED_UNVERIFIED``: no other link within 30 km and an interval over 54 h or a speed over 25 km/day.
 
 Incoherent image pairs and links with fewer than two neighbours are flagged, not excluded. Thresholds are
@@ -60,6 +61,8 @@ class V3Config:
     support_nearest: int = 16
     support_min: int = 3
     support_tolerance_m: float = 1_000.0
+    support_hard_tolerance_m: float = 3_000.0
+    support_min_target_corr: float = 0.40
     few_neighbours_radius_m: float = 30_000.0
     few_neighbours_min: int = 2
     isolated_max_hours: float = 54.0
@@ -200,8 +203,6 @@ def score_links(links: pd.DataFrame, qc_config: QCConfig, v3: V3Config) -> pd.Da
     result["support_direct_count"] = support_direct
     result["support_residual_m"] = support_residual
     result["neighbours_30km"] = neighbours
-    supported = (support >= v3.support_min) & (support_residual <= v3.support_tolerance_m)
-    result["interp_unsupported"] = ~direct.to_numpy() & ~supported
     far = result.coarse_residual_m > v3.incoherent_residual_m
     pair = result.groupby(["source_image_id", "target_image_id"], sort=False)
     links_in_pair = pair.edge_uid.transform("size")
@@ -418,7 +419,13 @@ def apply_exclusions(result: pd.DataFrame, v3: V3Config) -> pd.DataFrame:
     with a different support tolerance without rescoring."""
 
     direct = result.direct.to_numpy(bool)
-    supported = (result.support_count >= v3.support_min) & (result.support_residual_m <= v3.support_tolerance_m)
+    # Within support_tolerance_m an interpolated link agrees with its neighbours. Between that and
+    # support_hard_tolerance_m it may be real deformation, so it is kept only if the template match that
+    # placed its end was convincing (target_corr); beyond the hard tolerance it is removed.
+    residual, corr = result.support_residual_m, result.target_corr
+    agrees = residual <= v3.support_tolerance_m
+    deformation_like = (residual <= v3.support_hard_tolerance_m) & (corr >= v3.support_min_target_corr)
+    supported = (result.support_count >= v3.support_min) & (agrees | deformation_like)
     result["interp_unsupported"] = ~direct & ~supported.to_numpy()
     result["few_neighbours"] = result.neighbours_30km < v3.few_neighbours_min
     result["isolated_unverified"] = (result.neighbours_30km == 0) & (
@@ -458,7 +465,7 @@ def reason_text(row) -> str:
                      f"{row.speed_m_per_day / 1000:.1f} km/day")
     if "INTERP_UNSUPPORTED" in codes:
         parts.append(f"INTERP_UNSUPPORTED interpolated link {row.support_residual_m:.0f} m from the median of "
-                     f"{int(row.support_count)} neighbours within 50 km")
+                     f"{int(row.support_count)} neighbours within 50 km, target correlation {row.target_corr:.2f}")
     return "; ".join(parts)
 
 
@@ -520,12 +527,15 @@ def months_in(dataset: ds.Dataset) -> list[tuple[int, int]]:
 
 def run(input_path: Path, output_dir: Path, land_path: Path, sic_root: Path | None, period: str,
         sic_product: str = "asi", sic_fallback_roots: list[tuple[str, Path]] | None = None,
-        support_tolerance_m: float | None = None, work_dir: Path | None = None) -> dict:
+        support_tolerance_m: float | None = None, work_dir: Path | None = None,
+        support_hard_tolerance_m: float | None = None, support_min_target_corr: float | None = None) -> dict:
     qc_config, v3 = QCConfig(), V3Config()
     overrides = {}
-    if support_tolerance_m is not None and support_tolerance_m != v3.support_tolerance_m:
-        v3 = replace(v3, support_tolerance_m=float(support_tolerance_m))
-        overrides["support_tolerance_m"] = float(support_tolerance_m)
+    for field, value in (("support_tolerance_m", support_tolerance_m), ("support_hard_tolerance_m", support_hard_tolerance_m),
+                         ("support_min_target_corr", support_min_target_corr)):
+        if value is not None and value != getattr(v3, field):
+            v3 = replace(v3, **{field: float(value)})
+            overrides[field] = float(value)
     qc_config.validate()
     v3.validate()
     validate_frozen_protocol(qc_config)
@@ -649,12 +659,15 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--support-tolerance-m", type=float,
                         help="override the interpolated-support tolerance (recorded in the manifest)")
     parser.add_argument("--work-dir", type=Path, help="per-month scoring directory (reuse one scoring for several tolerances)")
+    parser.add_argument("--support-hard-tolerance-m", type=float, help="override the hard interpolated-support tolerance")
+    parser.add_argument("--support-min-target-corr", type=float,
+                        help="override the target correlation needed between the two tolerances (0 keeps all)")
     a = parser.parse_args(argv)
     a.output_dir.mkdir(parents=True, exist_ok=True)
     fallbacks = ([("asi_n6250", a.sic_fallback_asi6250)] if a.sic_fallback_asi6250 else []) + \
         ([("nsidc", a.sic_fallback_nsidc)] if a.sic_fallback_nsidc else [])
     manifest = run(a.input, a.output_dir, a.land_raster, a.sic_root, a.period, a.sic_product, fallbacks,
-                   a.support_tolerance_m, a.work_dir)
+                   a.support_tolerance_m, a.work_dir, a.support_hard_tolerance_m, a.support_min_target_corr)
     print(json.dumps(manifest, indent=2))
     if manifest["status"] != "complete":
         raise SystemExit("v3 QC output failed its checks; see the manifest")
