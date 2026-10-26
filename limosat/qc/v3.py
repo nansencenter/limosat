@@ -5,8 +5,7 @@ link against the other accepted links of the same exact image pair with the froz
 neighbour model (single pass), and excludes, splitting trajectories at every excluded link as v2 does:
 
 - ``R1``: isolated outliers (direct or interpolated endpoints);
-- ``LAND``: an endpoint at least 2 km inside land;
-- ``COASTAL``: an endpoint 0-2 km inside land;
+- ``LAND``: an endpoint inside land (any land cell of the inland-distance raster);
 - ``OPEN_WATER``: sea-ice concentration below 15% at both endpoints (links without a value are kept);
 - ``INTERP_UNSUPPORTED``: an interpolated endpoint without enough agreeing neighbours.
 
@@ -41,7 +40,7 @@ FLAG_BITS = {
     "PAIR_INCOHERENT": 0,
     "FEW_NEIGHBOURS": 1,
 }
-EXCLUSION_CODES = ("R1", "LAND", "COASTAL", "OPEN_WATER", "INTERP_UNSUPPORTED")
+EXCLUSION_CODES = ("R1", "LAND", "OPEN_WATER", "INTERP_UNSUPPORTED")
 
 
 @dataclass(frozen=True)
@@ -51,7 +50,7 @@ class V3Config:
     residual_floor_m: float = 2_000.0
     coherence_min: float = 5.0
     spread_floor_m: float = 150.0
-    land_margin_km: float = 2.0
+    land_min_inland_km: float = 1.0
     incoherent_min_links: int = 20
     incoherent_fraction: float = 0.5
     incoherent_residual_m: float = 2_000.0
@@ -311,14 +310,15 @@ class SicSampler:
 
 
 class AsiSampler:
-    """Nearest-cell daily SIC (fraction) from University of Bremen AMSR2 ASI 3.125 km GeoTIFFs
-    (``<root>/<YYYY>/<mon>/asi-AMSR2-n3125-<YYYYMMDD>-v5.4.tif``, EPSG:3411, percent; values above 100
-    are land or missing)."""
+    """Nearest-cell daily SIC (fraction) from University of Bremen AMSR2 ASI GeoTIFFs
+    (``<root>/<YYYY>/<mon>/asi-AMSR2-<grid>-<YYYYMMDD>-v5.4.tif``, EPSG:3411, percent; values above 100
+    are land or missing). ``grid`` is ``n3125`` (3.125 km) or ``n6250`` (6.25 km)."""
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, grid: str = "n3125"):
         from pyproj import Transformer
 
         self.root = Path(root)
+        self.grid = grid
         self.transform = Transformer.from_crs("EPSG:3413", "EPSG:3411", always_xy=True).transform
         self.cache: dict[str, tuple | None] = {}
         self.files: dict[str, str] = {}
@@ -328,7 +328,7 @@ class AsiSampler:
         if key not in self.cache:
             import rasterio
 
-            path = self.root / day.strftime("%Y") / day.strftime("%b").lower() / f"asi-AMSR2-n3125-{key}-v5.4.tif"
+            path = self.root / day.strftime("%Y") / day.strftime("%b").lower() / f"asi-AMSR2-{self.grid}-{key}-v5.4.tif"
             if not path.exists():
                 self.cache[key] = None
             else:
@@ -360,6 +360,31 @@ class AsiSampler:
         return out
 
 
+class FallbackSicSampler:
+    """Use the first sampler that has a file for each day (e.g. ASI 3.125 km, then ASI 6.25 km, then
+    NOAA/NSIDC CDR); ``days_by_product`` records which product served each day."""
+
+    def __init__(self, samplers: list[tuple[str, object]]):
+        self.samplers = samplers
+        self.days_by_product: dict[str, set] = {name: set() for name, _ in samplers}
+
+    @property
+    def files(self) -> dict:
+        return {f"{name}:{k}": v for name, s in self.samplers for k, v in s.files.items()}
+
+    def sample(self, x: np.ndarray, y: np.ndarray, times: pd.Series) -> np.ndarray:
+        out = np.full(len(x), np.nan, dtype="float32")
+        days = pd.to_datetime(times, utc=True).dt.floor("D")
+        for day, index in pd.Series(np.arange(len(x))).groupby(days.to_numpy()).groups.items():
+            index = np.asarray(index)
+            for name, sampler in self.samplers:
+                if sampler._grid(pd.Timestamp(day)) is not None:
+                    out[index] = sampler.sample(np.asarray(x)[index], np.asarray(y)[index], times.iloc[index])
+                    self.days_by_product[name].add(pd.Timestamp(day).strftime("%Y-%m-%d"))
+                    break
+        return out
+
+
 # --------------------------------------------------------------------------- decisions
 
 
@@ -370,8 +395,7 @@ def decide(scored: pd.DataFrame, v3: V3Config, land: LandRaster, sic: "SicSample
     result["inland_start_km"] = land.lookup(result.x0_m.to_numpy(), result.y0_m.to_numpy())
     result["inland_end_km"] = land.lookup(result.x1_m.to_numpy(), result.y1_m.to_numpy())
     inland = np.fmax(result.inland_start_km, result.inland_end_km)
-    result["land"] = inland >= v3.land_margin_km
-    result["coastal"] = (inland > 0) & ~result.land
+    result["land"] = inland >= v3.land_min_inland_km
     if sic is not None:
         result["sic_start"] = sic.sample(result.x0_m, result.y0_m, result.start_time_utc)
         result["sic_end"] = sic.sample(result.x1_m, result.y1_m, result.end_time_utc)
@@ -383,7 +407,7 @@ def decide(scored: pd.DataFrame, v3: V3Config, land: LandRaster, sic: "SicSample
 
     result["few_neighbours"] = result.neighbours_30km < v3.few_neighbours_min
     reason = pd.Series("", index=result.index, dtype="string")
-    for column, code in (("r1", "R1"), ("land", "LAND"), ("coastal", "COASTAL"), ("open_water", "OPEN_WATER"),
+    for column, code in (("r1", "R1"), ("land", "LAND"), ("open_water", "OPEN_WATER"),
                          ("interp_unsupported", "INTERP_UNSUPPORTED")):
         reason += np.where(result[column], code + "+", "")
     result["qc3_exclusion"] = reason.str.rstrip("+")
@@ -409,8 +433,6 @@ def reason_text(row) -> str:
             f"0 corroborating neighbours of {int(row.n_neighbours)}")
     if "LAND" in codes:
         parts.append(f"LAND endpoint {max(row.inland_start_km, row.inland_end_km):.1f} km inside land")
-    if "COASTAL" in codes:
-        parts.append(f"COASTAL endpoint {max(row.inland_start_km, row.inland_end_km):.1f} km inside land")
     if "OPEN_WATER" in codes:
         parts.append(f"OPEN_WATER SIC {row.sic_start:.0%} at start, {row.sic_end:.0%} at end")
     if "INTERP_UNSUPPORTED" in codes:
@@ -476,14 +498,20 @@ def months_in(dataset: ds.Dataset) -> list[tuple[int, int]]:
 
 
 def run(input_path: Path, output_dir: Path, land_path: Path, sic_root: Path | None, period: str,
-        sic_product: str = "asi") -> dict:
+        sic_product: str = "asi", sic_fallback_roots: list[tuple[str, Path]] | None = None) -> dict:
     qc_config, v3 = QCConfig(), V3Config()
     qc_config.validate()
     v3.validate()
     validate_frozen_protocol(qc_config)
     validate_v3_protocol(v3)
     land = LandRaster(land_path)
-    sic = (AsiSampler(sic_root) if sic_product == "asi" else SicSampler(sic_root)) if sic_root else None
+    sic = None
+    if sic_root:
+        primary = AsiSampler(sic_root) if sic_product == "asi" else SicSampler(sic_root)
+        chain = [(sic_product, primary)]
+        for name, root in sic_fallback_roots or []:
+            chain.append((name, AsiSampler(root, grid="n6250") if name == "asi_n6250" else SicSampler(root)))
+        sic = FallbackSicSampler(chain)
     work = output_dir / "work"
     work.mkdir(parents=True, exist_ok=True)
     dataset = ds.dataset(input_path)
@@ -550,6 +578,7 @@ def run(input_path: Path, output_dir: Path, land_path: Path, sic_root: Path | No
         "land_raster": str(land_path), "land_raster_sha256": land.sha256,
         "sic_root": str(sic_root) if sic_root else None, "sic_product": sic_product if sic_root else None,
         "sic_files_used": len(sic.files) if sic else 0,
+        "sic_days_by_product": {k: sorted(v) if len(v) <= 20 else len(v) for k, v in sic.days_by_product.items()} if sic else None,
         "input_links": input_total, "kept_links": kept_total, "excluded_links": int(len(excluded)),
         "exclusions_by_reason": counts, "kept_links_by_flag": flag_counts,
         "new_trajectory_id_base": base_id, "continuity_violations": violations, "edge_uid_unique_and_disjoint": bool(unique),
@@ -585,9 +614,13 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--sic-root", type=Path, help="SIC root for the open-water exclusion")
     parser.add_argument("--sic-product", choices=["asi", "nsidc"], default="asi",
                         help="asi: Bremen AMSR2 ASI 3.125 km GeoTIFF (default); nsidc: NOAA/NSIDC CDR v6 25 km")
+    parser.add_argument("--sic-fallback-asi6250", type=Path, help="Bremen AMSR2 ASI 6.25 km root for days missing at 3.125 km")
+    parser.add_argument("--sic-fallback-nsidc", type=Path, help="NOAA/NSIDC CDR v6 root for days missing in the ASI products")
     a = parser.parse_args(argv)
     a.output_dir.mkdir(parents=True, exist_ok=True)
-    manifest = run(a.input, a.output_dir, a.land_raster, a.sic_root, a.period, a.sic_product)
+    fallbacks = ([("asi_n6250", a.sic_fallback_asi6250)] if a.sic_fallback_asi6250 else []) + \
+        ([("nsidc", a.sic_fallback_nsidc)] if a.sic_fallback_nsidc else [])
+    manifest = run(a.input, a.output_dir, a.land_raster, a.sic_root, a.period, a.sic_product, fallbacks)
     print(json.dumps(manifest, indent=2))
     if manifest["status"] != "complete":
         raise SystemExit("v3 QC output failed its checks; see the manifest")

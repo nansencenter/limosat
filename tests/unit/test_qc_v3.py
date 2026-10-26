@@ -77,19 +77,35 @@ def test_corroborated_outlier_is_not_r1():
     assert not scored.loc[[40, 41], "r1"].any()
 
 
-def test_land_exclusion_coastal_flag_and_bitmask(tmp_path):
+def test_any_land_cell_excludes_including_the_coastal_band(tmp_path):
     links = pair_links()
     inland = np.zeros((100, 100), dtype="float32")
     inland[:, :10] = 5.0  # x < 5 km: deep land
-    inland[:, 10:12] = 1.0  # 5 km <= x < 7 km: coastal band
+    inland[:, 10:12] = 1.0  # 5 km <= x < 7 km: land cells next to the coast
     np.savez(tmp_path / "land.npz", inland_km=inland, x0=-5_000.0, y1=60_000.0, res=1_000.0)
     land = v3.LandRaster(tmp_path / "land.npz")
     decided = v3.decide(v3.score_links(links, QCConfig(), v3.V3Config()), v3.V3Config(), land, None)
-    assert decided.land.equals(decided.x0_m < 5_000)  # the x = 0 column starts on land
-    assert decided.coastal.equals((decided.x0_m >= 5_000) & (decided.x0_m < 7_000))
+    assert decided.land.equals(decided.x0_m < 7_000)
     assert (decided.loc[decided.land, "qc3_exclusion"] == "LAND").all()
-    assert (decided.loc[decided.coastal, "qc3_exclusion"] == "COASTAL").all()
-    assert (decided.loc[~decided.land & ~decided.coastal, "qc3_exclusion"] == "").all()
+    assert (decided.loc[~decided.land, "qc3_exclusion"] == "").all()
+
+
+def test_fallback_sampler_uses_first_product_with_the_day(tmp_path):
+    class Fake:
+        def __init__(self, days, value):
+            self.days, self.value, self.files = days, value, {}
+
+        def _grid(self, day):
+            return 1 if day.strftime("%Y%m%d") in self.days else None
+
+        def sample(self, x, y, times):
+            return np.full(len(x), self.value, dtype="float32")
+
+    times = pd.Series(pd.to_datetime(["2022-01-31", "2022-02-01"], utc=True))
+    sampler = v3.FallbackSicSampler([("asi", Fake({"20220131"}, 0.9)), ("nsidc", Fake({"20220131", "20220201"}, 0.1))])
+    values = sampler.sample(np.zeros(2), np.zeros(2), times)
+    assert values.tolist() == pytest.approx([0.9, 0.1])
+    assert sampler.days_by_product == {"asi": {"2022-01-31"}, "nsidc": {"2022-02-01"}}
 
 
 def test_asi_open_water_keeps_links_without_sic(tmp_path):

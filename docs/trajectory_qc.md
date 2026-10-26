@@ -63,8 +63,7 @@ excludes links, splitting trajectories at every excluded link, for these reasons
 | Reason | Condition |
 | --- | --- |
 | `R1` | Isolated outlier: > 2 km from the local prediction, ≥ 5× the neighbours' own spread, no corroborating neighbour (direct or interpolated) |
-| `LAND` | An endpoint at least 2 km inside land |
-| `COASTAL` | An endpoint 0–2 km inside land |
+| `LAND` | An endpoint inside land (any land cell of the 1 km raster) |
 | `OPEN_WATER` | Sea-ice concentration below 15% at both endpoints; links without a value are kept |
 | `INTERP_UNSUPPORTED` | An endpoint interpolated, and fewer than 3 of the 16 nearest other links within 50 km, or more than 1 km from their median displacement |
 
@@ -84,6 +83,8 @@ python -m limosat.qc.v3 \
 - `--sic-root` points to University of Bremen AMSR2 ASI 3.125 km daily GeoTIFFs
   (`<YYYY>/<mon>/asi-AMSR2-n3125-<YYYYMMDD>-v5.4.tif`); `--sic-product nsidc` uses NOAA/NSIDC CDR v6
   25 km files instead. Without `--sic-root` no link is excluded as open water.
+- `--sic-fallback-asi6250` and `--sic-fallback-nsidc` fill days missing from the main product, in that
+  order (AMSR2 ASI 6.25 km, then NOAA/NSIDC CDR v6). The manifest lists which product served each day.
 - Interrupted runs resume from the per-month files in `<output-dir>/work`.
 
 Outputs are `<period>_qc3.parquet` (kept links with `qc3_trajectory_id`, `qc3_segment`, `qc3_flags`,
