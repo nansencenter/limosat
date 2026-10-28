@@ -95,3 +95,35 @@ def test_gross_outliers_are_rogue_even_with_two_agreeing_neighbours():
     d = run(links)
     assert (d.loc[[40, 41, 52], "qc_exclusion"] == "ROGUE_VECTOR").all()
     assert (d.loc[[20, 21], "qc_exclusion"] == "").all()
+
+
+def compact_store(path, points):
+    import sqlite3
+
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE compact_points (source_rowid INTEGER PRIMARY KEY, image_id INTEGER NOT NULL, "
+                "is_last INTEGER NOT NULL, trajectory_id INTEGER NOT NULL, geometry TEXT NOT NULL, "
+                "time TEXT NOT NULL, corr REAL, interpolated INTEGER)")
+    con.executemany("INSERT INTO compact_points VALUES (?,?,?,?,?,?,?,?)", points)
+    con.commit()
+    con.close()
+
+
+def test_links_join_consecutive_points_of_each_trajectory_across_batches(tmp_path):
+    days = [("2024-03-01 10:00:00", 1), ("2024-03-02 10:00:00", 2), ("2024-04-01 10:00:00", 3)]
+    pts, rowid = [], 0
+    for k, (day, image) in enumerate(days):
+        for traj in (7, 9):
+            rowid += 1
+            pts.append((rowid, image, int(k == 2), traj, f"POINT ({1000.0 * traj + 500 * k} -2000.0)", day, 0.5,
+                        int(traj == 9 and k == 1)))
+    compact_store(tmp_path / "c.sqlite", pts)
+    counts = limosat_qc.build_links(tmp_path / "c.sqlite", None, tmp_path / "links", batch_rows=3)
+    assert counts == {"points": 6, "links": 4}
+    files = sorted((tmp_path / "links").glob("*.links.parquet"))
+    assert [p.name for p in files] == ["2024-03.links.parquet"]  # a link belongs to the month it starts in
+    links = pd.read_parquet(files[0])
+    t9 = links[links.original_trajectory_id == 9].sort_values("start_time_utc")
+    assert list(t9.dx_m) == [500.0, 500.0]
+    assert list(t9.target_interpolated) == [1, 0] and list(t9.source_interpolated) == [0, 1]
+    assert np.allclose(links.speed_m_per_day[links.elapsed_seconds == 86400], 500.0)

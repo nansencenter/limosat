@@ -220,3 +220,222 @@ def decide(links: pd.DataFrame, cfg: LimosatQCConfig, land, sic, local: QCConfig
     d["qc_flag_reasons"] = np.where(few & low, "FEW_NEIGHBOURS;LOW_PAIR_DIRECT_SHARE",
                                     np.where(few, "FEW_NEIGHBOURS", np.where(low, "LOW_PAIR_DIRECT_SHARE", "")))
     return d
+
+
+# --------------------------------------------------------------------------- period runner
+
+LINK_COLUMNS = ["edge_uid", "original_trajectory_id", "source_rowid", "target_rowid", "source_image_id",
+                "target_image_id", "start_time_utc", "end_time_utc", "elapsed_seconds", "x0_m", "y0_m", "x1_m", "y1_m",
+                "dx_m", "dy_m", "distance_m", "speed_m_per_day", "source_interpolated", "target_interpolated",
+                "source_corr", "target_corr", "source_orbit_num", "target_orbit_num", "source_is_last", "target_is_last"]
+QC_COLUMNS = ["qc_trajectory_id", "qc_segment", "qc_flags", "qc_flag_reasons", "pair_direct_share", "qc_sic_start",
+              "qc_sic_end", "qc_neighbours_30km"]
+DIAGNOSTICS = ["inland_start_km", "inland_end_km", "sic_start", "sic_end", "neighbours_30km", "coarse_residual_m",
+               "neighbour_spread_m", "n_corroborating", "n_neighbours", "local_residual_m", "coherence_ratio",
+               "local_supported", "support_count", "support_residual_m", "direct", "pair_links", "pair_direct_share"]
+_STATE = ("rowid", "image", "t", "x", "y", "interp", "corr", "last")
+
+
+def _point_xy(wkt: pd.Series) -> tuple[np.ndarray, np.ndarray]:
+    parts = wkt.str.slice(7, -1).str.split(" ", n=1, expand=True)  # "POINT (x y)"
+    return parts[0].astype(float).to_numpy(), parts[1].astype(float).to_numpy()
+
+
+def build_links(compact_database: Path, raw_database: Path | None, links_dir: Path, batch_rows: int = 2_000_000) -> dict:
+    """Links between consecutive points of every trajectory, read in time order from a compact point store
+    (``compact_points`` from the v2 ``prepare`` stage) and written as one Parquet file per month of the
+    source time. Image orbit numbers come from the raw period database when it is given."""
+
+    import sqlite3
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    links_dir.mkdir(parents=True, exist_ok=True)
+    orbit = {}
+    if raw_database is not None:
+        with sqlite3.connect(f"file:{Path(raw_database).resolve()}?mode=ro", uri=True) as raw:
+            table = raw.execute("select name from sqlite_master where type = 'table'").fetchone()[0]
+            orbit = dict(raw.execute(f'select image_id, min(orbit_num) from "{table}" group by image_id').fetchall())
+    con = sqlite3.connect(f"file:{Path(compact_database).resolve()}?mode=ro", uri=True)
+    n_traj = con.execute("select max(trajectory_id) from compact_points").fetchone()[0] + 1
+    state = {k: np.full(n_traj, np.nan) for k in _STATE}
+    cursor = con.execute("select source_rowid, image_id, is_last, trajectory_id, geometry, time, corr, interpolated "
+                         "from compact_points order by time, image_id, source_rowid")
+    writers, counts = {}, {"points": 0, "links": 0}
+    while rows := cursor.fetchmany(batch_rows):
+        b = pd.DataFrame.from_records(rows, columns=["rowid", "image", "last", "traj", "geometry", "time", "corr", "interp"])
+        counts["points"] += len(b)
+        b["x"], b["y"] = _point_xy(b.geometry)
+        b["t"] = (pd.to_datetime(b.time, utc=True) - pd.Timestamp(0, tz="UTC")).dt.total_seconds()
+        b["interp"] = b.interp.fillna(0)
+        b = b.assign(seq=np.arange(len(b))).sort_values(["traj", "seq"], kind="mergesort")
+        tr = b.traj.to_numpy()
+        same = tr[1:] == tr[:-1]
+        first = np.r_[True, ~same]
+        cur = {k: b[k].to_numpy(float) for k in _STATE}
+        prev = {k: np.r_[np.nan, v[:-1]] for k, v in cur.items()}
+        for k in _STATE:  # the previous point of a trajectory's first point in this batch is the stored state
+            prev[k][first] = state[k][tr[first]]
+        ok = ~np.isnan(prev["rowid"])
+        if ok.any():
+            s, c = {k: v[ok] for k, v in prev.items()}, {k: v[ok] for k, v in cur.items()}
+            elapsed = c["t"] - s["t"]
+            dx, dy = c["x"] - s["x"], c["y"] - s["y"]
+            dist = np.hypot(dx, dy)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                speed = np.where(elapsed > 0, dist / (elapsed / 86400.0), np.inf)
+            start = pd.to_datetime(s["t"], unit="s", utc=True)
+            links = pd.DataFrame({
+                "original_trajectory_id": tr[ok].astype(np.int64),
+                "source_rowid": s["rowid"].astype(np.int64), "target_rowid": c["rowid"].astype(np.int64),
+                "source_image_id": s["image"].astype(np.int64), "target_image_id": c["image"].astype(np.int64),
+                "start_time_utc": start, "end_time_utc": pd.to_datetime(c["t"], unit="s", utc=True),
+                "elapsed_seconds": elapsed, "x0_m": s["x"], "y0_m": s["y"], "x1_m": c["x"], "y1_m": c["y"],
+                "dx_m": dx, "dy_m": dy, "distance_m": dist, "speed_m_per_day": speed,
+                "source_interpolated": s["interp"].astype(np.int8), "target_interpolated": c["interp"].astype(np.int8),
+                "source_corr": s["corr"], "target_corr": c["corr"],
+                "source_is_last": s["last"].astype(np.int8), "target_is_last": c["last"].astype(np.int8)})
+            links["source_orbit_num"] = links.source_image_id.map(orbit).astype("Int64")
+            links["target_orbit_num"] = links.target_image_id.map(orbit).astype("Int64")
+            for ym, part in links.groupby(start.strftime("%Y-%m"), sort=False):
+                table = pa.Table.from_pandas(part, preserve_index=False)
+                if ym not in writers:
+                    writers[ym] = pq.ParquetWriter(links_dir / f"{ym}.links.parquet.part", table.schema, compression="zstd")
+                writers[ym].write_table(table.cast(writers[ym].schema))
+            counts["links"] += int(ok.sum())
+        last = np.r_[~same, True]  # keep the last point of every trajectory seen in this batch
+        for k in _STATE:
+            state[k][tr[last]] = cur[k][last]
+        print(json.dumps({"points": counts["points"], "links": counts["links"]}), flush=True)
+    con.close()
+    for ym, w in writers.items():
+        w.close()
+        (links_dir / f"{ym}.links.parquet.part").rename(links_dir / f"{ym}.links.parquet")
+    return counts
+
+
+def _edge_uids(period: str, source: np.ndarray, target: np.ndarray) -> list[str]:
+    import hashlib
+
+    return [hashlib.sha256(f"{period}:{a}:{b}".encode()).hexdigest() for a, b in zip(source, target)]
+
+
+def run(compact_database: Path, raw_database: Path | None, period: str, output_dir: Path, land_path: Path,
+        sic, work_dir: Path | None = None, cfg: LimosatQCConfig | None = None) -> dict:
+    """LiMOSAT QC for one processing period: build the links, decide them month by month, split
+    trajectories at removed links and write ``<period>_qc.parquet`` (kept links),
+    ``<period>_qc_removed.parquet`` and ``<period>_qc.manifest.json``. Resumable through ``work_dir``."""
+
+    import pyarrow as pa
+    import pyarrow.dataset as ds
+    import pyarrow.parquet as pq
+
+    from .v3 import LandRaster, assign_segments, edge_uids_unique_and_disjoint, sha256
+
+    cfg = cfg or LimosatQCConfig()
+    cfg.validate()
+    validate_protocol(cfg)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    work = Path(work_dir) if work_dir else output_dir / "work"
+    links_dir = work / "links"
+    if not (work / "links.done").exists():
+        counts = build_links(compact_database, raw_database, links_dir)
+        (work / "links.done").write_text(json.dumps(counts))
+    land = LandRaster(land_path)
+    months = sorted(p.name.split(".")[0] for p in links_dir.glob("*.links.parquet") if not p.name.startswith("._"))
+    for ym in months:
+        if (work / f"{ym}.done").exists():
+            continue
+        links = pd.read_parquet(links_dir / f"{ym}.links.parquet")
+        links.insert(0, "edge_uid", _edge_uids(period, links.source_rowid.to_numpy(), links.target_rowid.to_numpy()))
+        decided = decide(links, cfg, land, sic)
+        decided.to_parquet(work / f"{ym}.decided.parquet", index=False)
+        (work / f"{ym}.done").write_text("ok")
+        print(json.dumps({"period": period, "month": ym, "links": len(decided),
+                          "removed": int((decided.qc_exclusion != "").sum())}), flush=True)
+
+    parts = [work / f"{ym}.decided.parquet" for ym in months]
+    removed = pd.concat([pd.read_parquet(p).query("qc_exclusion != ''") for p in parts], ignore_index=True)
+    removed[LINK_COLUMNS + ["qc_exclusion"] + DIAGNOSTICS].to_parquet(output_dir / f"{period}_qc_removed.parquet", index=False)
+    base_id = int(max(pd.read_parquet(p, columns=["original_trajectory_id"]).original_trajectory_id.max() for p in parts)) + 1
+    cuts = removed[["original_trajectory_id", "start_time_utc"]].rename(columns={"original_trajectory_id": "qc_trajectory_id"})
+    out_path = output_dir / f"{period}_qc.parquet"
+    tmp = out_path.with_suffix(".parquet.part")
+    writer, kept_total, input_total = None, 0, 0
+    flag_counts = {k: 0 for k in FLAG_BITS}
+    for p in parts:
+        month = pd.read_parquet(p)
+        input_total += len(month)
+        kept = month[month.qc_exclusion == ""].assign(qc_trajectory_id=lambda z: z.original_trajectory_id)
+        kept = assign_segments(kept, cuts, base_id)
+        kept = kept.assign(qc_trajectory_id=kept.qc3_trajectory_id, qc_segment=kept.qc3_segment,
+                           qc_sic_start=kept.sic_start.astype("float32"), qc_sic_end=kept.sic_end.astype("float32"),
+                           qc_neighbours_30km=kept.neighbours_kept_30km.astype("int16"))
+        for name, bit in FLAG_BITS.items():
+            flag_counts[name] += int(((kept.qc_flags.to_numpy().astype(int) >> bit) & 1).sum())
+        table = pa.Table.from_pandas(kept[LINK_COLUMNS + QC_COLUMNS], preserve_index=False)
+        if writer is None:
+            meta = dict(table.schema.metadata or {})
+            meta[b"limosat.qc"] = json.dumps({"protocol_id": PROTOCOL_ID, "flag_bits": FLAG_BITS}).encode()
+            writer = pq.ParquetWriter(tmp, table.schema.with_metadata(meta), compression="zstd")
+        writer.write_table(table.cast(writer.schema), row_group_size=250_000)
+        kept_total += len(kept)
+    writer.close()
+    tmp.rename(out_path)
+    out = ds.dataset(out_path).to_table(columns=["qc_trajectory_id", "start_time_utc", "source_rowid", "target_rowid"]).to_pandas()
+    o = out.sort_values(["qc_trajectory_id", "start_time_utc"], kind="mergesort")
+    same = o.qc_trajectory_id.to_numpy()[1:] == o.qc_trajectory_id.to_numpy()[:-1]
+    violations = int((same & (o.source_rowid.to_numpy()[1:] != o.target_rowid.to_numpy()[:-1])).sum())
+    del out, o
+    unique = edge_uids_unique_and_disjoint(out_path, removed.edge_uid)
+    manifest = {
+        "status": "complete" if violations == 0 and unique and kept_total + len(removed) == input_total else "failed",
+        "period": period, "protocol_id": PROTOCOL_ID, "protocol_sha256": sha256(PROTOCOL_PATH),
+        "parameters": asdict(cfg), "compact_database": str(compact_database),
+        "raw_database": str(raw_database) if raw_database else None,
+        "land_raster": str(land_path), "land_raster_sha256": land.sha256,
+        "sic_days_by_product": {k: sorted(v) if len(v) <= 20 else len(v)
+                                for k, v in getattr(sic, "days_by_product", {}).items()},
+        "links": json.loads((work / "links.done").read_text()),
+        "input_links": input_total, "kept_links": kept_total, "removed_links": int(len(removed)),
+        "removed_by_step": {k: int(v) for k, v in removed.qc_exclusion.value_counts().items()},
+        "kept_links_by_flag": flag_counts, "new_trajectory_id_base": base_id,
+        "continuity_violations": violations, "edge_uid_unique_and_disjoint": bool(unique),
+        "outputs": {out_path.name: sha256(out_path),
+                    f"{period}_qc_removed.parquet": sha256(output_dir / f"{period}_qc_removed.parquet")},
+    }
+    (output_dir / f"{period}_qc.manifest.json").write_text(json.dumps(manifest, indent=2))
+    return manifest
+
+
+def main(argv: list[str] | None = None) -> None:
+    import argparse
+
+    from .v3 import AsiSampler, FallbackSicSampler, SicSampler
+
+    p = argparse.ArgumentParser(description="LiMOSAT QC: one sequential pass of link QC over one processing period.")
+    p.add_argument("--compact-database", required=True, type=Path, help="compact_points store of the period")
+    p.add_argument("--raw-database", type=Path, help="raw period SQLite (image orbit numbers)")
+    p.add_argument("--period", required=True)
+    p.add_argument("--output-dir", required=True, type=Path)
+    p.add_argument("--work-dir", type=Path)
+    p.add_argument("--land-raster", required=True, type=Path)
+    p.add_argument("--sic-root", required=True, type=Path, help="AMSR2 ASI 3.125 km root")
+    p.add_argument("--sic-fallback-asi6250", type=Path)
+    p.add_argument("--sic-fallback-nsidc", type=Path)
+    a = p.parse_args(argv)
+    chain = [("asi", AsiSampler(a.sic_root))]
+    if a.sic_fallback_asi6250:
+        chain.append(("asi_n6250", AsiSampler(a.sic_fallback_asi6250, grid="n6250")))
+    if a.sic_fallback_nsidc:
+        chain.append(("nsidc", SicSampler(a.sic_fallback_nsidc)))
+    manifest = run(a.compact_database, a.raw_database, a.period, a.output_dir, a.land_raster,
+                   FallbackSicSampler(chain), a.work_dir)
+    print(json.dumps(manifest, indent=2))
+    if manifest["status"] != "complete":
+        raise SystemExit("LiMOSAT QC output failed its checks; see the manifest")
+
+
+if __name__ == "__main__":
+    main()
