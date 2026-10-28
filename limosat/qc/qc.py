@@ -1,4 +1,4 @@
-"""LiMOSAT QC v1: one sequential pass of link QC over the regular matching output.
+"""LiMOSAT QC (protocol v1): one sequential pass of link QC over the regular matching output.
 
 Each link between consecutive keypoints of a trajectory is tested by the rules below, in order. A rule
 only sees the links that survived the earlier rules, so the rules we are most confident in act first
@@ -10,15 +10,16 @@ removed it and splits its trajectory.
    ``LAND``: the deeper endpoint at least 1 km inland on the supplied land raster.
 2. ``ISOLATED_UNVERIFIED``: no other link of the image pair within 30 km, and a gap over 54 h or a
    speed over 25 km/day.
-3. ``ROGUE_VECTOR``: more than 2 km from the leave-one-out local-affine prediction of its image pair,
-   at least five times the neighbours' own spread, and no neighbour corroborates it.
+3. ``ROGUE_VECTOR``: at least five times the neighbours' own spread from the leave-one-out local-affine
+   prediction of its image pair, and either more than 2 km off with no neighbour corroborating it, or
+   more than 5 km off with at most 2 corroborating neighbours.
 4. ``INTERP_UNSUPPORTED``: an interpolated link without support from the 16 nearest links of the pair
    within 50 km: at least 3 of them, and within 1 km of their median motion, within 2 km with target
    correlation >= 0.40, or within 3 km with target correlation >= 0.50.
 
 Kept links carry ``pair_direct_share`` (share of the image pair's input links that are direct matches)
 and flags ``FEW_NEIGHBOURS`` (fewer than 2 other kept links within 30 km) and ``LOW_PAIR_DIRECT_SHARE``
-(pair direct share below 0.40). Thresholds are in ``protocols/limosat_qc_v1.json``. EPSG:3413 metres.
+(pair direct share below 0.40). Thresholds are in ``protocols/limosat_qc.json``. EPSG:3413 metres.
 """
 
 from __future__ import annotations
@@ -37,14 +38,14 @@ from .core import QCConfig
 from .v3 import score_pair_isolation
 
 PROTOCOL_ID = "limosat_qc_v1_draft_20261028"
-PROTOCOL_PATH = Path(__file__).resolve().parent / "protocols" / "limosat_qc_v1.json"
+PROTOCOL_PATH = Path(__file__).resolve().parent / "protocols" / "limosat_qc.json"
 STEPS = ("SPEED", "OPEN_WATER", "LAND", "ISOLATED_UNVERIFIED", "ROGUE_VECTOR", "INTERP_UNSUPPORTED")
 FLAG_BITS = {"FEW_NEIGHBOURS": 0, "LOW_PAIR_DIRECT_SHARE": 1}
 
 
 @dataclass(frozen=True)
-class QCv1Config:
-    """Thresholds of LiMOSAT QC v1 (metres, km for inland distance, SIC as a fraction)."""
+class LimosatQCConfig:
+    """Thresholds of LiMOSAT QC (metres, km for inland distance, SIC as a fraction)."""
 
     max_speed_m_per_day: float = 60_000.0
     open_water_sic: float = 0.15
@@ -55,6 +56,8 @@ class QCv1Config:
     rogue_residual_m: float = 2_000.0
     rogue_coherence_min: float = 5.0
     rogue_spread_floor_m: float = 150.0
+    rogue_gross_residual_m: float = 5_000.0
+    rogue_gross_max_corroborating: int = 2
     support_radius_m: float = 50_000.0
     support_nearest: int = 16
     support_min: int = 3
@@ -80,17 +83,17 @@ class QCv1Config:
 def load_protocol() -> dict:
     protocol = json.loads(PROTOCOL_PATH.read_text())
     if protocol.get("protocol_id") != PROTOCOL_ID:
-        raise ValueError("Bundled QC v1 protocol ID does not match the code")
+        raise ValueError("Bundled LiMOSAT QC protocol ID does not match the code")
     return protocol
 
 
-def validate_protocol(config: QCv1Config) -> None:
+def validate_protocol(config: LimosatQCConfig) -> None:
     """Fail if the code defaults and the bundled protocol have drifted apart."""
 
     parameters = load_protocol()["parameters"]
     mismatches = {f: (v, parameters.get(f)) for f, v in asdict(config).items() if v != parameters.get(f)}
     if mismatches:
-        raise ValueError(f"QC v1 configuration does not match the protocol: {mismatches}")
+        raise ValueError(f"LiMOSAT QC configuration does not match the protocol: {mismatches}")
 
 
 def _by_pair(d: pd.DataFrame, alive: np.ndarray):
@@ -102,7 +105,7 @@ def _by_pair(d: pd.DataFrame, alive: np.ndarray):
         yield sub[index]
 
 
-def _support(xy: np.ndarray, uv: np.ndarray, cfg: QCv1Config):
+def _support(xy: np.ndarray, uv: np.ndarray, cfg: LimosatQCConfig):
     """Number of the nearest other links within the support radius, and distance of each link's
     displacement from their median."""
 
@@ -128,8 +131,8 @@ def _neighbour_counts(d: pd.DataFrame, alive: np.ndarray, radius_m: float) -> np
     return out
 
 
-def decide(links: pd.DataFrame, cfg: QCv1Config, land, sic, local: QCConfig | None = None) -> pd.DataFrame:
-    """Run the QC v1 steps on the links of whole image pairs; returns the links with ``qc_exclusion``
+def decide(links: pd.DataFrame, cfg: LimosatQCConfig, land, sic, local: QCConfig | None = None) -> pd.DataFrame:
+    """Run the LiMOSAT QC steps on the links of whole image pairs; returns the links with ``qc_exclusion``
     (the step that removed the link, empty when kept), ``qc_flags``, ``qc_flag_reasons`` and diagnostics."""
 
     local = local or QCConfig()
@@ -185,8 +188,11 @@ def decide(links: pd.DataFrame, cfg: QCv1Config, land, sic, local: QCConfig | No
         d[c] = buf[c]
     d["local_supported"] = supported
     d["coherence_ratio"] = d.local_residual_m / np.maximum(d.neighbour_spread_m, cfg.rogue_spread_floor_m)
-    rogue = alive & (supported & (d.local_residual_m > cfg.rogue_residual_m)
-                     & (d.coherence_ratio >= cfg.rogue_coherence_min) & (d.n_corroborating == 0)).to_numpy()
+    # a single agreeing neighbour protects a moderate outlier (it may be real deformation), but small
+    # clusters of grossly wrong vectors that agree with each other do not protect themselves
+    unprotected = ((d.local_residual_m > cfg.rogue_residual_m) & (d.n_corroborating == 0)) | (
+        (d.local_residual_m > cfg.rogue_gross_residual_m) & (d.n_corroborating <= cfg.rogue_gross_max_corroborating))
+    rogue = alive & (supported & (d.coherence_ratio >= cfg.rogue_coherence_min) & unprotected).to_numpy()
     reason[rogue] = "ROGUE_VECTOR"
     alive &= ~rogue
 

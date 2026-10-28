@@ -1,6 +1,6 @@
 {
   "protocol_id": "limosat_qc_v1_draft_20261028",
-  "status": "draft: 2-3 km correlation threshold and v2 coverage under test",
+  "status": "draft: rules decided 2026-10-28; awaiting the full archive run",
   "applies_to": "every link of the regular LiMOSAT matching output (raw period databases), in one pass",
   "decision_unit": "one drift vector between consecutive keypoints within an original LiMOSAT trajectory",
   "crs": "EPSG:3413",
@@ -16,6 +16,8 @@
     "rogue_residual_m": 2000.0,
     "rogue_coherence_min": 5.0,
     "rogue_spread_floor_m": 150.0,
+    "rogue_gross_residual_m": 5000.0,
+    "rogue_gross_max_corroborating": 2,
     "support_radius_m": 50000.0,
     "support_nearest": 16,
     "support_min": 3,
@@ -32,7 +34,7 @@
     "1_OPEN_WATER": "SIC < open_water_sic at either endpoint (each endpoint on its own date, nearest cell); links with no SIC value are kept. Product per day: AMSR2 ASI 3.125 km, else AMSR2 ASI 6.25 km, else NOAA/NSIDC CDR v6 25 km",
     "1_LAND": "deeper endpoint at least land_min_inland_km inland on the supplied 1 km inland-distance raster (land where Natural Earth 10 m and OpenStreetMap agree)",
     "2_ISOLATED_UNVERIFIED": "no other surviving link of the image pair within neighbour_radius_m, and a gap longer than isolated_max_hours or a speed above isolated_max_speed_m_per_day",
-    "3_ROGUE_VECTOR": "leave-one-out local-affine prediction from surviving links of the exact image pair (v2 neighbour model: up to 24 within 30 km, at least 8, robust distance-weighted affine with the prediction guard) is supported, the residual exceeds rogue_residual_m, residual / max(neighbour spread, rogue_spread_floor_m) >= rogue_coherence_min, and no neighbour corroborates the link",
+    "3_ROGUE_VECTOR": "leave-one-out local-affine prediction from surviving links of the exact image pair (v2 neighbour model: up to 24 within 30 km, at least 8, robust distance-weighted affine with the prediction guard) is supported, residual / max(neighbour spread, rogue_spread_floor_m) >= rogue_coherence_min, and either the residual exceeds rogue_residual_m with no corroborating neighbour, or it exceeds rogue_gross_residual_m with at most rogue_gross_max_corroborating corroborating neighbours",
     "4_INTERP_UNSUPPORTED": "an endpoint interpolated, and not (at least support_min of the support_nearest nearest surviving links within support_radius_m, and the distance from their median displacement <= support_tolerance_m, or <= support_mid_tolerance_m with target_corr >= support_mid_min_corr, or <= support_hard_tolerance_m with target_corr >= support_hard_min_corr)"
   },
   "flags": {

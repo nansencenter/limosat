@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from limosat.qc import qc_v1
+from limosat.qc import qc as limosat_qc
 from test_qc_v3 import pair_links, shift
 
 
@@ -25,13 +25,13 @@ class LandAt:
 
 
 def run(links, land=None):
-    return qc_v1.decide(links, qc_v1.QCv1Config(), land or NoLand(), None)
+    return limosat_qc.decide(links, limosat_qc.LimosatQCConfig(), land or NoLand(), None)
 
 
 def test_protocol_matches_code():
-    cfg = qc_v1.QCv1Config()
+    cfg = limosat_qc.LimosatQCConfig()
     cfg.validate()
-    qc_v1.validate_protocol(cfg)
+    limosat_qc.validate_protocol(cfg)
 
 
 def test_each_step_removes_its_own_case():
@@ -85,5 +85,13 @@ def test_pair_direct_share_and_flags():
     d = run(links)
     kept = d[d.qc_exclusion == ""]
     assert np.allclose(d.pair_direct_share, (links.target_interpolated == 0).mean())
-    assert ((kept.qc_flags.to_numpy() >> qc_v1.FLAG_BITS["LOW_PAIR_DIRECT_SHARE"]) & 1).all()
+    assert ((kept.qc_flags.to_numpy() >> limosat_qc.FLAG_BITS["LOW_PAIR_DIRECT_SHARE"]) & 1).all()
     assert kept.qc_flag_reasons.str.contains("LOW_PAIR_DIRECT_SHARE").all()
+
+
+def test_gross_outliers_are_rogue_even_with_two_agreeing_neighbours():
+    links = shift(pair_links(), [40, 41, 52], 7_000.0, 0.0)   # three neighbours, all 7 km off together
+    links = shift(links, [20, 21], 3_000.0, 0.0)              # 3 km off with one agreeing neighbour
+    d = run(links)
+    assert (d.loc[[40, 41, 52], "qc_exclusion"] == "ROGUE_VECTOR").all()
+    assert (d.loc[[20, 21], "qc_exclusion"] == "").all()
