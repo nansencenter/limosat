@@ -224,7 +224,7 @@ def decide(links: pd.DataFrame, cfg: LimosatQCConfig, land, sic, local: QCConfig
 
 # --------------------------------------------------------------------------- period runner
 
-LINK_COLUMNS = ["edge_uid", "original_trajectory_id", "source_rowid", "target_rowid", "source_image_id",
+LINK_COLUMNS = ["edge_uid", "original_trajectory_id", "trajectory_link_index", "source_rowid", "target_rowid", "source_image_id",
                 "target_image_id", "start_time_utc", "end_time_utc", "elapsed_seconds", "x0_m", "y0_m", "x1_m", "y1_m",
                 "dx_m", "dy_m", "distance_m", "speed_m_per_day", "source_interpolated", "target_interpolated",
                 "source_corr", "target_corr", "source_orbit_num", "target_orbit_num", "source_is_last", "target_is_last"]
@@ -260,6 +260,7 @@ def build_links(compact_database: Path, raw_database: Path | None, links_dir: Pa
     con = sqlite3.connect(f"file:{Path(compact_database).resolve()}?mode=ro", uri=True)
     n_traj = con.execute("select max(trajectory_id) from compact_points").fetchone()[0] + 1
     state = {k: np.full(n_traj, np.nan) for k in _STATE}
+    n_links = np.zeros(n_traj, np.int64)
     cursor = con.execute("select source_rowid, image_id, is_last, trajectory_id, geometry, time, corr, interpolated "
                          "from compact_points order by time, image_id, source_rowid")
     writers, counts = {}, {"points": 0, "links": 0}
@@ -280,6 +281,13 @@ def build_links(compact_database: Path, raw_database: Path | None, links_dir: Pa
         ok = ~np.isnan(prev["rowid"])
         if ok.any():
             s, c = {k: v[ok] for k, v in prev.items()}, {k: v[ok] for k, v in cur.items()}
+            # position of each link along its trajectory: the order key for splitting (times can tie when a
+            # trajectory has two points in the same image)
+            tro = tr[ok]
+            starts = np.r_[0, np.flatnonzero(tro[1:] != tro[:-1]) + 1]
+            within = np.arange(len(tro)) - np.repeat(starts, np.diff(np.r_[starts, len(tro)]))
+            link_index = n_links[tro] + within
+            np.add.at(n_links, tro, 1)
             elapsed = c["t"] - s["t"]
             dx, dy = c["x"] - s["x"], c["y"] - s["y"]
             dist = np.hypot(dx, dy)
@@ -287,7 +295,7 @@ def build_links(compact_database: Path, raw_database: Path | None, links_dir: Pa
                 speed = np.where(elapsed > 0, dist / (elapsed / 86400.0), np.inf)
             start = pd.to_datetime(s["t"], unit="s", utc=True)
             links = pd.DataFrame({
-                "original_trajectory_id": tr[ok].astype(np.int64),
+                "original_trajectory_id": tro.astype(np.int64), "trajectory_link_index": link_index.astype(np.int32),
                 "source_rowid": s["rowid"].astype(np.int64), "target_rowid": c["rowid"].astype(np.int64),
                 "source_image_id": s["image"].astype(np.int64), "target_image_id": c["image"].astype(np.int64),
                 "start_time_utc": start, "end_time_utc": pd.to_datetime(c["t"], unit="s", utc=True),
@@ -359,7 +367,9 @@ def run(compact_database: Path, raw_database: Path | None, period: str, output_d
     removed = pd.concat([pd.read_parquet(p).query("qc_exclusion != ''") for p in parts], ignore_index=True)
     removed[LINK_COLUMNS + ["qc_exclusion"] + DIAGNOSTICS].to_parquet(output_dir / f"{period}_qc_removed.parquet", index=False)
     base_id = int(max(pd.read_parquet(p, columns=["original_trajectory_id"]).original_trajectory_id.max() for p in parts)) + 1
-    cuts = removed[["original_trajectory_id", "start_time_utc"]].rename(columns={"original_trajectory_id": "qc_trajectory_id"})
+    # trajectories are split in link order (assign_segments orders by its start_time_utc column, so the link
+    # index is passed in that column)
+    cuts = removed[["original_trajectory_id", "trajectory_link_index"]].set_axis(["qc_trajectory_id", "start_time_utc"], axis=1)
     out_path = output_dir / f"{period}_qc.parquet"
     tmp = out_path.with_suffix(".parquet.part")
     writer, kept_total, input_total = None, 0, 0
@@ -367,9 +377,10 @@ def run(compact_database: Path, raw_database: Path | None, period: str, output_d
     for p in parts:
         month = pd.read_parquet(p)
         input_total += len(month)
-        kept = month[month.qc_exclusion == ""].assign(qc_trajectory_id=lambda z: z.original_trajectory_id)
-        kept = assign_segments(kept, cuts, base_id)
-        kept = kept.assign(qc_trajectory_id=kept.qc3_trajectory_id, qc_segment=kept.qc3_segment,
+        kept = month[month.qc_exclusion == ""]
+        seg = assign_segments(pd.DataFrame({"qc_trajectory_id": kept.original_trajectory_id.to_numpy(),
+                                            "start_time_utc": kept.trajectory_link_index.to_numpy()}), cuts, base_id)
+        kept = kept.assign(qc_trajectory_id=seg.qc3_trajectory_id.to_numpy(), qc_segment=seg.qc3_segment.to_numpy(),
                            qc_sic_start=kept.sic_start.astype("float32"), qc_sic_end=kept.sic_end.astype("float32"),
                            qc_neighbours_30km=kept.neighbours_kept_30km.astype("int16"))
         for name, bit in FLAG_BITS.items():
@@ -383,8 +394,8 @@ def run(compact_database: Path, raw_database: Path | None, period: str, output_d
         kept_total += len(kept)
     writer.close()
     tmp.rename(out_path)
-    out = ds.dataset(out_path).to_table(columns=["qc_trajectory_id", "start_time_utc", "source_rowid", "target_rowid"]).to_pandas()
-    o = out.sort_values(["qc_trajectory_id", "start_time_utc"], kind="mergesort")
+    out = ds.dataset(out_path).to_table(columns=["qc_trajectory_id", "trajectory_link_index", "source_rowid", "target_rowid"]).to_pandas()
+    o = out.sort_values(["qc_trajectory_id", "trajectory_link_index"], kind="mergesort")
     same = o.qc_trajectory_id.to_numpy()[1:] == o.qc_trajectory_id.to_numpy()[:-1]
     violations = int((same & (o.source_rowid.to_numpy()[1:] != o.target_rowid.to_numpy()[:-1])).sum())
     del out, o

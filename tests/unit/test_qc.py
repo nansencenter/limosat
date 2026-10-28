@@ -127,3 +127,20 @@ def test_links_join_consecutive_points_of_each_trajectory_across_batches(tmp_pat
     assert list(t9.dx_m) == [500.0, 500.0]
     assert list(t9.target_interpolated) == [1, 0] and list(t9.source_interpolated) == [0, 1]
     assert np.allclose(links.speed_m_per_day[links.elapsed_seconds == 86400], 500.0)
+    assert sorted(t9.trajectory_link_index) == [0, 1]
+
+
+def test_period_run_splits_at_a_zero_gap_link_and_keeps_continuity(tmp_path):
+    # trajectory 1 has two points in image 2 (same time): the zero-gap link between them is impossible
+    # (SPEED) and must split the trajectory although its neighbours share its start or end time
+    pts = [(1, 1, 0, 1, "POINT (0 0)", "2024-03-01 10:00:00", 0.5, 0),
+           (2, 2, 0, 1, "POINT (1000 0)", "2024-03-02 10:00:00", 0.5, 0),
+           (3, 2, 0, 1, "POINT (1200 0)", "2024-03-02 10:00:00", 0.5, 0),
+           (4, 3, 1, 1, "POINT (2200 0)", "2024-03-03 10:00:00", 0.5, 0)]
+    compact_store(tmp_path / "c.sqlite", pts)
+    np.savez(tmp_path / "land.npz", inland_km=np.zeros((10, 10), "float32"), x0=-1e6, y1=1e6, res=2e5)
+    m = limosat_qc.run(tmp_path / "c.sqlite", None, "test", tmp_path / "out", tmp_path / "land.npz", None)
+    assert m["status"] == "complete" and m["continuity_violations"] == 0
+    assert m["removed_by_step"] == {"SPEED": 1} and m["kept_links"] == 2
+    kept = pd.read_parquet(tmp_path / "out" / "test_qc.parquet").sort_values("trajectory_link_index")
+    assert kept.qc_trajectory_id.nunique() == 2 and list(kept.qc_segment) == [0, 1]
