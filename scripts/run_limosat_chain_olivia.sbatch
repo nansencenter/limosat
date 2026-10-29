@@ -102,13 +102,18 @@ from dataclasses import replace
 
 import pyarrow
 
+from limosat.catalog import load_catalogue
 from limosat.config import load_config
 from limosat.efficientloftr import EfficientLoFTR
 from limosat.surface import surface_gate
 
 config = load_config(sys.argv[1])
 EfficientLoFTR(replace(config.matcher, device="cpu"))
-assert surface_gate(config) is not None, "surface masking is not configured"
+gate = surface_gate(config)
+assert gate is not None and gate.land is not None, "land masking is not configured"
+# Reading one day's ASI file checks that the container's GDAL can open the product.
+first_day = load_catalogue(config.catalogue, config.analysis_epsg).chronological()[0].time_utc
+assert gate.concentration._day(first_day) is not None, "no ASI concentration for %s" % first_day
 print("pyarrow=%s surface=%s" % (pyarrow.__version__, config.surface))
 PY
     run_json "$control/plan.json" limosat plan "$LIMOSAT_CONFIG"
