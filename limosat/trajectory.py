@@ -19,6 +19,8 @@ from .models import FieldEdge
 
 TargetValidity = Callable[[np.ndarray], np.ndarray]
 TargetValidityFactory = Callable[[ImageRecord], TargetValidity]
+# ``image -> (xy -> keep mask)`` for new seeds, e.g. excluding land and open water.
+SeedFilterFactory = Callable[[ImageRecord], Callable[[np.ndarray], np.ndarray]]
 
 
 @dataclass(frozen=True)
@@ -139,6 +141,7 @@ def compose_global_trajectories(
     trajectory_config: TrajectoryConfig,
     *,
     target_validity_factory: TargetValidityFactory | None = None,
+    seed_filter_factory: SeedFilterFactory | None = None,
 ) -> tuple[TrajectoryPoint, ...]:
     """Recompose the catalogue without treating compute labels as boundaries."""
     return tuple(
@@ -146,6 +149,7 @@ def compose_global_trajectories(
         for batch in iter_global_trajectory_points(
             edges, images, field_config, trajectory_config,
             target_validity_factory=target_validity_factory,
+            seed_filter_factory=seed_filter_factory,
         )
         for point in batch
     )
@@ -158,6 +162,7 @@ def iter_global_trajectory_batches(
     trajectory_config: TrajectoryConfig,
     *,
     target_validity_factory: TargetValidityFactory | None = None,
+    seed_filter_factory: SeedFilterFactory | None = None,
 ) -> Iterator[TrajectoryBatch]:
     """Yield deterministic points and direct extensions for each image."""
     ordered_images = tuple(
@@ -268,6 +273,10 @@ def iter_global_trajectory_batches(
 
         if trajectory_config.add_as_coverage_enters:
             candidates = _outgoing_primary_points(indexed, step)
+            if seed_filter_factory is not None and len(candidates):
+                candidates = candidates[
+                    np.asarray(seed_filter_factory(image)(candidates), dtype=bool)
+                ]
             occupancy = _active_positions(positions[step])
             for xy in _exclude_occupied(
                 candidates,
@@ -308,11 +317,13 @@ def iter_global_trajectory_points(
     trajectory_config: TrajectoryConfig,
     *,
     target_validity_factory: TargetValidityFactory | None = None,
+    seed_filter_factory: SeedFilterFactory | None = None,
 ) -> Iterator[tuple[TrajectoryPoint, ...]]:
     """Yield deterministic per-image rows while retaining only needed positions."""
     for batch in iter_global_trajectory_batches(
         edges, images, field_config, trajectory_config,
         target_validity_factory=target_validity_factory,
+        seed_filter_factory=seed_filter_factory,
     ):
         yield batch.points
 
@@ -324,11 +335,13 @@ def build_trajectories(
     trajectory_config: TrajectoryConfig,
     *,
     target_validity_factory: TargetValidityFactory | None = None,
+    seed_filter_factory: SeedFilterFactory | None = None,
 ) -> tuple[TrajectoryPoint, ...]:
     """Compatibility name for the global catalogue composer."""
     return compose_global_trajectories(
         edges, images, field_config, trajectory_config,
         target_validity_factory=target_validity_factory,
+        seed_filter_factory=seed_filter_factory,
     )
 
 

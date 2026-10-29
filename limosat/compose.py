@@ -13,6 +13,7 @@ from .catalog import load_catalogue
 from .config import RunConfig
 from .field import field_edge_with_fallback
 from .imagery import pass_pixel_validity_factory
+from .surface import seed_filter_factory, surface_gate, surface_validity_factory
 from .models import FieldEdge
 from .pair_products import PAIR_PRODUCT_SCHEMA_VERSION, PairProductStore
 from .planning import build_candidate_plan, recovery_candidates
@@ -118,9 +119,13 @@ def compose_primary_parquet(
             catalogue.chronological(),
             config.field,
             config.trajectories,
-            target_validity_factory=pass_pixel_validity_factory(
-                catalogue.chronological(), config.analysis_epsg
+            target_validity_factory=surface_validity_factory(
+                pass_pixel_validity_factory(
+                    catalogue.chronological(), config.analysis_epsg
+                ),
+                surface_gate(config),
             ),
+            seed_filter_factory=seed_filter_factory(surface_gate(config)),
         ):
             if batch.points:
                 point_writer.write_table(
@@ -360,8 +365,11 @@ def compose_recovery_parquet(
             (*primary_edges, *recovery_edges),
             catalogue.chronological(),
             config.field,
-            target_validity_factory=pass_pixel_validity_factory(
-                catalogue.chronological(), config.analysis_epsg
+            target_validity_factory=surface_validity_factory(
+                pass_pixel_validity_factory(
+                    catalogue.chronological(), config.analysis_epsg
+                ),
+                surface_gate(config),
             ),
         ):
             if batch.points:

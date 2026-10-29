@@ -15,6 +15,7 @@ from shapely.geometry.base import BaseGeometry
 
 from .catalog import ImagePair
 from .config import RunConfig
+from .surface import surface_gate
 from .efficientloftr import (
     source_core_mask,
     speed_limit_mask,
@@ -860,6 +861,12 @@ class PairProcessor:
         target, target_valid = self._patch(pair.target.path, target_center)
         source_valid = valid_support(source_valid, settings.endpoint_support_radius_px)
         target_valid = valid_support(target_valid, settings.endpoint_support_radius_px)
+        surface = surface_gate(self.config)
+        if surface is not None and surface.land is not None:
+            # Inland pixels never anchor matches; the coastal band stays matchable.
+            size = (settings.tile_size_px, settings.pixel_size_m)
+            source_valid = source_valid & ~surface.land.tile(center, *size)
+            target_valid = target_valid & ~surface.land.tile(target_center, *size)
         core = np.zeros_like(source_valid)
         margin = settings.tile_margin_px
         core[margin : settings.tile_size_px - margin, margin : settings.tile_size_px - margin] = True

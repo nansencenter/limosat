@@ -270,6 +270,37 @@ class OpenWaterConfig:
 
 
 @dataclass(frozen=True)
+class SurfaceConfig:
+    """Land and point open-water exclusion (off unless a source is set).
+
+    ``land_raster``: inland-distance ``.npz`` in EPSG:3413; cells at least
+    ``land_minimum_inland_km`` inland are invalid for matching, composed
+    endpoints and seeds. ``point_sic_root``: AMSR2 ASI GeoTIFF root (grid
+    ``point_sic_grid``), with an optional fallback product; positions below
+    ``point_open_water_threshold_percent`` are neither seeded nor accepted as
+    endpoints. The open-water tile gate is separate and unchanged.
+    """
+
+    land_raster: str = ""
+    land_minimum_inland_km: float = 1.0
+    point_sic_root: str = ""
+    point_sic_grid: str = "n3125"
+    point_sic_fallback_root: str = ""
+    point_sic_fallback_grid: str = "n6250"
+    point_open_water_threshold_percent: float = 15.0
+
+    def __post_init__(self) -> None:
+        if self.land_minimum_inland_km < 0:
+            raise ValueError("land_minimum_inland_km cannot be negative")
+        if not 0 <= self.point_open_water_threshold_percent <= 100:
+            raise ValueError("point_open_water_threshold_percent must be in [0, 100]")
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.land_raster or self.point_sic_root)
+
+
+@dataclass(frozen=True)
 class TrajectoryConfig:
     """Observed trajectory construction settings in projected metres."""
 
@@ -306,6 +337,7 @@ class RunConfig:
         default_factory=TrajectoryConfig
     )
     retain_pair_matches: bool = True
+    surface: SurfaceConfig = dataclass_field(default_factory=SurfaceConfig)
 
     def __post_init__(self) -> None:
         if not self.run_id.strip():
@@ -326,6 +358,9 @@ class RunConfig:
 
     def to_dict(self) -> dict[str, Any]:
         values = asdict(self)
+        if not self.surface.enabled:
+            # Configurations without land or point open-water exclusion keep their identity.
+            values.pop("surface")
         if not self.field.missing_node_fallback:
             # Preserve the identity of existing configurations with fallback off.
             values["field"].pop("missing_node_fallback")
@@ -424,6 +459,11 @@ def load_config(path: str | Path) -> RunConfig:
     resolved["trajectories"] = _construct(
         TrajectoryConfig, resolved.get("trajectories", {})
     )
+    surface_values = dict(resolved.get("surface", {}))
+    for name in ("land_raster", "point_sic_root", "point_sic_fallback_root"):
+        if surface_values.get(name):
+            surface_values[name] = str(_resolve_path(base, surface_values[name]))
+    resolved["surface"] = _construct(SurfaceConfig, surface_values)
     return _construct(RunConfig, resolved)
 
 

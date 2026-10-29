@@ -70,6 +70,16 @@ open_water:
   maximum_age_days: 1
   samples_per_axis: 5
 
+# Off unless land_raster or point_sic_root is set; see docs/composition.md.
+surface:
+  land_raster: ""
+  land_minimum_inland_km: 1.0
+  point_sic_root: ""
+  point_sic_grid: n3125
+  point_sic_fallback_root: ""
+  point_sic_fallback_grid: n6250
+  point_open_water_threshold_percent: 15.0
+
 trajectories:
   add_as_coverage_enters: true
   new_point_exclusion_radius_m: 2000.0

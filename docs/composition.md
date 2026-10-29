@@ -37,6 +37,18 @@ platform and absolute orbit, seconds apart) is accepted: in the March 2020
 archive about a quarter of gate rejections were such frame-seam positions. The same rule applies to recovery
 augmentation. Pair matches and fields remain reusable for recomposition.
 
+The optional `surface` section adds land and point open-water exclusion. With
+`land_raster` (an EPSG:3413 inland-distance `.npz`, such as the 1 km
+OpenStreetMap raster), pixels at least `land_minimum_inland_km` inland are
+removed from both matching tiles, and such endpoints are invalid; the coastal
+band stays matchable so drift is kept up to the coast. With `point_sic_root`
+(daily AMSR2 ASI GeoTIFFs, nearest cell, optional coarser fallback), endpoints
+and new seeds below `point_open_water_threshold_percent` on the image date are
+rejected; a missing concentration never rejects. Seeds are filtered by both.
+The tile-level OSI SAF open-water gate is unchanged. On a Fram Strait week
+(1-7 March 2020) this removed all 1,264 land or open-water positions (0.3 %)
+while ice cell-days fell by 0.04 %.
+
 ## Initial QC policy
 
 This branch does not import the ORB production QC protocol wholesale. Its first
