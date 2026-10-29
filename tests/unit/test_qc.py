@@ -171,3 +171,11 @@ def test_period_run_splits_at_a_zero_gap_link_and_keeps_continuity(tmp_path):
     assert kept.qc_trajectory_id.nunique() == 2 and list(kept.qc_segment) == [0, 1]
     assert list(kept.target_stopped) == [0, 1] and kept.target_converged_to.iloc[-1] == 9
     assert kept.source_converged_to.isna().all() and list(kept.target_orbit_num) == [102, 103]
+    # the per-period SQLite keeps every raw point and carries the split trajectories
+    con = sqlite3.connect(tmp_path / "out" / "test_qc.sqlite")
+    pts = con.execute('SELECT rowid, trajectory_id, is_last FROM "test__qc" ORDER BY rowid').fetchall()
+    new = m["new_trajectory_id_base"]
+    assert pts == [(1, 1, 0), (2, 1, 1), (3, new, 0), (4, new, 1)]
+    assert con.execute("SELECT qc_exclusion FROM qc_removed_links").fetchall() == [("SPEED",)]
+    con.close()
+    assert "test_qc.sqlite" in m["outputs"]

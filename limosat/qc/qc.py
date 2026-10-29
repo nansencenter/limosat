@@ -437,8 +437,90 @@ def run(compact_database: Path, raw_database: Path | None, period: str, output_d
         "outputs": {out_path.name: sha256(out_path),
                     f"{period}_qc_removed.parquet": sha256(output_dir / f"{period}_qc_removed.parquet")},
     }
+    if raw_database is not None and manifest["status"] == "complete":
+        sqlite_path = write_points_sqlite(raw_database, output_dir, period, manifest)
+        manifest["outputs"][sqlite_path.name] = sha256(sqlite_path)
     (output_dir / f"{period}_qc.manifest.json").write_text(json.dumps(manifest, indent=2))
     return manifest
+
+
+def point_trajectories(output_dir: Path, period: str, base_id: int) -> pd.DataFrame:
+    """QC trajectory id and ``is_last`` of every point that belongs to a link, from the period outputs.
+
+    A removed link's target point starts a new trajectory segment, so a point's trajectory is the id of
+    the last removed link at or before it along its original trajectory (segment ids as in the kept
+    links: ``base_id`` plus the rank of the removed link in (trajectory, link index) order). The kept
+    links' ``qc_trajectory_id`` is checked against this assignment."""
+
+    cols = ["original_trajectory_id", "trajectory_link_index", "source_rowid", "target_rowid"]
+    kept = pd.read_parquet(output_dir / f"{period}_qc.parquet", columns=cols + ["qc_trajectory_id"])
+    removed = pd.read_parquet(output_dir / f"{period}_qc_removed.parquet", columns=cols)
+    links = pd.concat([kept.assign(removed=False), removed.assign(removed=True, qc_trajectory_id=-1)], ignore_index=True)
+    links = links.sort_values(["original_trajectory_id", "trajectory_link_index"], kind="mergesort").reset_index(drop=True)
+    cut = pd.Series(np.nan, index=links.index)
+    cut[links.removed.to_numpy()] = base_id + np.arange(int(links.removed.sum()))
+    cut = cut.groupby(links.original_trajectory_id.to_numpy()).ffill()
+    target_id = np.where(cut.isna(), links.original_trajectory_id, cut).astype(np.int64)
+    k = ~links.removed.to_numpy()
+    if not np.array_equal(target_id[k], links.qc_trajectory_id.to_numpy()[k]):
+        raise ValueError("point trajectories disagree with the kept links' qc_trajectory_id")
+    first = np.r_[True, links.original_trajectory_id.to_numpy()[1:] != links.original_trajectory_id.to_numpy()[:-1]]
+    points = pd.concat([
+        pd.DataFrame({"rowid": links.source_rowid.to_numpy()[first], "trajectory_id": links.original_trajectory_id.to_numpy()[first], "order": -1}),
+        pd.DataFrame({"rowid": links.target_rowid.to_numpy(), "trajectory_id": target_id, "order": links.trajectory_link_index.to_numpy()})],
+        ignore_index=True)
+    points = points.sort_values(["trajectory_id", "order"], kind="mergesort")
+    points["is_last"] = (~points.trajectory_id.duplicated(keep="last")).astype(np.int64)
+    return points[["rowid", "trajectory_id", "is_last"]]
+
+
+def write_points_sqlite(raw_database: Path, output_dir: Path, period: str, manifest: dict) -> Path:
+    """``<period>_qc.sqlite`` for users of the production databases: the raw point table (same name with
+    a ``__qc`` suffix, same columns and rowids, every point kept) with ``trajectory_id`` and ``is_last``
+    rewritten to the QC trajectories, plus ``qc_removed_links`` (every removed link with its step) and
+    ``qc_metadata`` (the period manifest)."""
+
+    import sqlite3
+
+    out = output_dir / f"{period}_qc.sqlite"
+    tmp = out.with_suffix(".sqlite.part")
+    tmp.unlink(missing_ok=True)
+    points = point_trajectories(output_dir, period, int(manifest["new_trajectory_id_base"]))
+    con = sqlite3.connect(tmp)
+    try:
+        for pragma in ("journal_mode=OFF", "synchronous=OFF", "temp_store=MEMORY", "cache_size=-400000"):
+            con.execute(f"PRAGMA {pragma}")
+        con.execute("ATTACH DATABASE ? AS src", (f"file:{Path(raw_database).resolve()}?mode=ro",))
+        table = con.execute("select name, sql from src.sqlite_master where type = 'table'").fetchone()
+        name, ddl = table[0], table[1]
+        qc_table = f"{name}__qc"
+        columns = [r[1] for r in con.execute(f'PRAGMA src.table_info("{name}")')]
+        quoted = ", ".join(f'"{c}"' for c in columns)
+        con.execute(ddl.replace(f'"{name}"', f'"{qc_table}"', 1).replace("IF NOT EXISTS ", "", 1))
+        con.execute(f'INSERT INTO "{qc_table}" (rowid, {quoted}) SELECT rowid, {quoted} FROM src."{name}"')
+        con.execute("CREATE TEMP TABLE qc_points (rowid INTEGER PRIMARY KEY, trajectory_id INTEGER, is_last INTEGER)")
+        con.executemany("INSERT INTO qc_points VALUES (?, ?, ?)",
+                        points[["rowid", "trajectory_id", "is_last"]].itertuples(index=False, name=None))
+        con.execute(f'UPDATE "{qc_table}" SET trajectory_id = p.trajectory_id, is_last = p.is_last '
+                    f'FROM qc_points AS p WHERE "{qc_table}".rowid = p.rowid')
+        con.execute(f'CREATE INDEX "idx_{qc_table}_traj_last" ON "{qc_table}" (trajectory_id, is_last)')
+        removed = pd.read_parquet(output_dir / f"{period}_qc_removed.parquet")
+        removed = removed.assign(start_time_utc=removed.start_time_utc.astype(str), end_time_utc=removed.end_time_utc.astype(str))
+        removed.to_sql("qc_removed_links", con, index=False, chunksize=200_000)
+        con.execute("CREATE INDEX idx_qc_removed_trajectory ON qc_removed_links (original_trajectory_id, trajectory_link_index)")
+        con.execute("CREATE TABLE qc_metadata (key TEXT PRIMARY KEY, value_json TEXT)")
+        con.executemany("INSERT INTO qc_metadata VALUES (?, ?)",
+                        [(k, json.dumps(v)) for k, v in manifest.items() if k != "outputs"])
+        con.commit()
+        n_raw = con.execute(f'SELECT COUNT(*) FROM src."{name}"').fetchone()[0]
+        n_out = con.execute(f'SELECT COUNT(*) FROM "{qc_table}"').fetchone()[0]
+        con.execute("DETACH DATABASE src")
+    finally:
+        con.close()
+    if n_out != n_raw:
+        raise ValueError(f"{out.name}: {n_out} points written, {n_raw} in the raw database")
+    tmp.rename(out)
+    return out
 
 
 def main(argv: list[str] | None = None) -> None:
