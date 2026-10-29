@@ -168,10 +168,10 @@ def sic_filename(day):
     return "ice_conc_nh_polstere-100_multi_%s1200.nc" % day
 
 
-def prepare_sic(root, download=False, base_url=SIC_BASE_URL):
+def prepare_sic(root, download=False, base_url=SIC_BASE_URL, days=SIC_DATES):
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
-    for day in SIC_DATES:
+    for day in days:
         destination = root / sic_filename(day)
         if destination.is_file() and destination.stat().st_size:
             continue
@@ -197,7 +197,7 @@ def prepare_sic(root, download=False, base_url=SIC_BASE_URL):
         finally:
             if temporary.exists():
                 temporary.unlink()
-    checksums = {sic_filename(day): file_sha256(root / sic_filename(day)) for day in SIC_DATES}
+    checksums = {sic_filename(day): file_sha256(root / sic_filename(day)) for day in days}
     checksum_path = root / "SHA256SUMS"
     checksum_path.write_text(
         "".join("%s  %s\n" % (checksum, name) for name, checksum in sorted(checksums.items())),
