@@ -97,6 +97,20 @@ def test_gross_outliers_are_rogue_even_with_two_agreeing_neighbours():
     assert (d.loc[[20, 21], "qc_exclusion"] == "").all()
 
 
+def test_land_rasters_combine_to_land_where_all_agree(tmp_path):
+    from limosat.qc import land
+
+    a = np.zeros((5, 5), "float32")
+    b = a.copy()
+    a[1:4, 1:4] = 1.0   # 3x3 land in the first source
+    b[2:5, 2:5] = 1.0   # shifted 3x3 land in the second
+    for name, arr in (("a", a), ("b", b)):
+        np.savez(tmp_path / f"{name}.npz", inland_km=arr, x0=0.0, y1=0.0, res=1000.0)
+    assert land.combine([tmp_path / "a.npz", tmp_path / "b.npz"], tmp_path / "c.npz") == 4
+    c = np.load(tmp_path / "c.npz")["inland_km"]
+    assert (c > 0).sum() == 4 and c[2, 2] == 1.0 and c[0, 0] == 0.0
+
+
 def compact_store(path, points):
     import sqlite3
 
