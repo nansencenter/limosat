@@ -138,9 +138,22 @@ def test_period_run_splits_at_a_zero_gap_link_and_keeps_continuity(tmp_path):
            (3, 2, 0, 1, "POINT (1200 0)", "2024-03-02 10:00:00", 0.5, 0),
            (4, 3, 1, 1, "POINT (2200 0)", "2024-03-03 10:00:00", 0.5, 0)]
     compact_store(tmp_path / "c.sqlite", pts)
+    import sqlite3
+
+    raw = sqlite3.connect(tmp_path / "raw.sqlite")
+    raw.execute('CREATE TABLE "test" (image_id BIGINT, is_last BIGINT, trajectory_id BIGINT, geometry TEXT, corr FLOAT, '
+                'time DATETIME, interpolated BIGINT, orbit_num BIGINT, stopped BOOLEAN, converged_to BIGINT)')
+    raw.executemany('INSERT INTO "test" (rowid, image_id, is_last, trajectory_id, geometry, corr, time, interpolated, '
+                    'orbit_num, stopped, converged_to) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                    [(r, i, last, t, g, c, tm, ip, 100 + i, int(r == 4), 9 if r == 4 else None)
+                     for r, i, last, t, g, tm, c, ip in pts])
+    raw.commit()
+    raw.close()
     np.savez(tmp_path / "land.npz", inland_km=np.zeros((10, 10), "float32"), x0=-1e6, y1=1e6, res=2e5)
-    m = limosat_qc.run(tmp_path / "c.sqlite", None, "test", tmp_path / "out", tmp_path / "land.npz", None)
+    m = limosat_qc.run(tmp_path / "c.sqlite", tmp_path / "raw.sqlite", "test", tmp_path / "out", tmp_path / "land.npz", None)
     assert m["status"] == "complete" and m["continuity_violations"] == 0
     assert m["removed_by_step"] == {"SPEED": 1} and m["kept_links"] == 2
     kept = pd.read_parquet(tmp_path / "out" / "test_qc.parquet").sort_values("trajectory_link_index")
     assert kept.qc_trajectory_id.nunique() == 2 and list(kept.qc_segment) == [0, 1]
+    assert list(kept.target_stopped) == [0, 1] and kept.target_converged_to.iloc[-1] == 9
+    assert kept.source_converged_to.isna().all() and list(kept.target_orbit_num) == [102, 103]

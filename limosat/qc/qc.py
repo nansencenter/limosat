@@ -227,7 +227,8 @@ def decide(links: pd.DataFrame, cfg: LimosatQCConfig, land, sic, local: QCConfig
 LINK_COLUMNS = ["edge_uid", "original_trajectory_id", "trajectory_link_index", "source_rowid", "target_rowid", "source_image_id",
                 "target_image_id", "start_time_utc", "end_time_utc", "elapsed_seconds", "x0_m", "y0_m", "x1_m", "y1_m",
                 "dx_m", "dy_m", "distance_m", "speed_m_per_day", "source_interpolated", "target_interpolated",
-                "source_corr", "target_corr", "source_orbit_num", "target_orbit_num", "source_is_last", "target_is_last"]
+                "source_corr", "target_corr", "source_orbit_num", "target_orbit_num", "source_is_last", "target_is_last",
+                "source_stopped", "target_stopped", "source_converged_to", "target_converged_to"]
 QC_COLUMNS = ["qc_trajectory_id", "qc_segment", "qc_flags", "qc_flag_reasons", "pair_direct_share", "qc_sic_start",
               "qc_sic_end", "qc_neighbours_30km"]
 DIAGNOSTICS = ["inland_start_km", "inland_end_km", "sic_start", "sic_end", "neighbours_30km", "coarse_residual_m",
@@ -244,7 +245,8 @@ def _point_xy(wkt: pd.Series) -> tuple[np.ndarray, np.ndarray]:
 def build_links(compact_database: Path, raw_database: Path | None, links_dir: Path, batch_rows: int = 2_000_000) -> dict:
     """Links between consecutive points of every trajectory, read in time order from a compact point store
     (``compact_points`` from the v2 ``prepare`` stage) and written as one Parquet file per month of the
-    source time. Image orbit numbers come from the raw period database when it is given."""
+    source time. Image orbit numbers and the per-point tracker fields ``stopped`` and ``converged_to``
+    come from the raw period database when it is given (missing otherwise)."""
 
     import sqlite3
 
@@ -252,11 +254,21 @@ def build_links(compact_database: Path, raw_database: Path | None, links_dir: Pa
     import pyarrow.parquet as pq
 
     links_dir.mkdir(parents=True, exist_ok=True)
-    orbit = {}
+    orbit, stopped, converged = {}, None, None
     if raw_database is not None:
+        # per-point tracker fields that the compact store does not carry, indexed by rowid
         with sqlite3.connect(f"file:{Path(raw_database).resolve()}?mode=ro", uri=True) as raw:
             table = raw.execute("select name from sqlite_master where type = 'table'").fetchone()[0]
-            orbit = dict(raw.execute(f'select image_id, min(orbit_num) from "{table}" group by image_id').fetchall())
+            n = raw.execute(f'select max(rowid) from "{table}"').fetchone()[0] + 1
+            stopped, converged = np.zeros(n, np.int8), np.full(n, -1, np.int64)
+            image_orbit = {}
+            cur = raw.execute(f'select rowid, image_id, orbit_num, stopped, converged_to from "{table}"')
+            while chunk := cur.fetchmany(2_000_000):
+                c = np.array([(r[0], r[1], -1 if r[2] is None else r[2], 1 if r[3] else 0, -1 if r[4] is None else r[4])
+                              for r in chunk], dtype=np.int64)
+                stopped[c[:, 0]], converged[c[:, 0]] = c[:, 3], c[:, 4]
+                image_orbit.update(zip(c[:, 1].tolist(), c[:, 2].tolist()))
+            orbit = {k: v for k, v in image_orbit.items() if v >= 0}
     con = sqlite3.connect(f"file:{Path(compact_database).resolve()}?mode=ro", uri=True)
     n_traj = con.execute("select max(trajectory_id) from compact_points").fetchone()[0] + 1
     state = {k: np.full(n_traj, np.nan) for k in _STATE}
@@ -306,6 +318,15 @@ def build_links(compact_database: Path, raw_database: Path | None, links_dir: Pa
                 "source_is_last": s["last"].astype(np.int8), "target_is_last": c["last"].astype(np.int8)})
             links["source_orbit_num"] = links.source_image_id.map(orbit).astype("Int64")
             links["target_orbit_num"] = links.target_image_id.map(orbit).astype("Int64")
+            for end in ("source", "target"):
+                rid = links[f"{end}_rowid"].to_numpy()
+                if stopped is None:
+                    links[f"{end}_stopped"] = pd.array([pd.NA] * len(links), dtype="Int8")
+                    links[f"{end}_converged_to"] = pd.array([pd.NA] * len(links), dtype="Int64")
+                else:
+                    links[f"{end}_stopped"] = stopped[rid]
+                    links[f"{end}_converged_to"] = pd.array(np.where(converged[rid] < 0, 0, converged[rid]), dtype="Int64")
+                    links.loc[converged[rid] < 0, f"{end}_converged_to"] = pd.NA
             for ym, part in links.groupby(start.strftime("%Y-%m"), sort=False):
                 table = pa.Table.from_pandas(part, preserve_index=False)
                 if ym not in writers:
