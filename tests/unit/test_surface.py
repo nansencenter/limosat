@@ -66,3 +66,24 @@ def test_land_tile_matches_pointwise_lookup(tmp_path):
     offsets = (np.arange(pixels) - (pixels - 1) / 2.0) * size
     x, y = np.meshgrid(center[0] + offsets, center[1] - offsets)
     assert np.array_equal(land.tile(center, pixels, size), land.is_land(x, y))
+
+
+def test_asi_reads_netcdf_layout_in_file_crs(tmp_path):
+    import rasterio
+    import rasterio.shutil
+    from rasterio.transform import from_origin
+
+    from limosat.surface import AsiConcentration
+
+    values = np.array([[10.0, np.nan], [90.0, 120.0]], dtype=np.float32)
+    (tmp_path / "2020").mkdir()
+    tif = tmp_path / "source.tif"
+    with rasterio.open(tif, "w", driver="GTiff", width=2, height=2, count=1, dtype="float32",
+                       crs="EPSG:3413", transform=from_origin(0.0, 2000.0, 1000.0, 1000.0)) as out:
+        out.write(values, 1)
+    # The netCDF driver only supports CreateCopy.
+    rasterio.shutil.copy(tif, tmp_path / "2020" / "asi-AMSR2-n3125-20200303-v5.4.nc", driver="netCDF")
+    sic = AsiConcentration(((str(tmp_path), "n3125"),)).sample(
+        [500.0, 1500.0, 500.0, 1500.0, 9000.0], [1500.0, 1500.0, 500.0, 500.0, 500.0], datetime(2020, 3, 3)
+    )
+    assert np.array_equal(sic, [10.0, np.nan, 90.0, np.nan, np.nan], equal_nan=True)

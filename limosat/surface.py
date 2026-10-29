@@ -6,10 +6,11 @@ example the 1 km OpenStreetMap raster used by the ORB trajectory QC. Cells at
 least ``land_minimum_inland_km`` inland are land; the coastal band stays
 matchable so coastal and fast ice can be tracked.
 
-Open water uses daily University of Bremen AMSR2 ASI sea-ice concentration
-GeoTIFFs (``<root>/<YYYY>/<mon>/asi-AMSR2-<grid>-<YYYYMMDD>-v5.4.tif``,
-EPSG:3411, percent; values above 100 are land or missing), nearest cell, with
-an optional coarser fallback product for missing days. A position is open water
+Open water uses daily University of Bremen AMSR2 ASI sea-ice concentration in
+percent, either GeoTIFF (``<root>/<YYYY>/<mon>/asi-AMSR2-<grid>-<YYYYMMDD>-v5.4.tif``,
+values above 100 are land or missing) or single-variable NetCDF
+(``<root>/<YYYY>/...v5.4.nc``, NaN where missing), nearest cell in the file's own CRS, with an
+optional coarser fallback product for missing days. A position is open water
 only where a value exists and is below the threshold; missing values keep it.
 """
 
@@ -63,24 +64,32 @@ class AsiConcentration:
     """Nearest-cell daily AMSR2 ASI concentration in percent (NaN where missing)."""
 
     def __init__(self, roots: tuple[tuple[str, str], ...]) -> None:
-        from pyproj import Transformer
-
         self.roots = tuple((Path(root), grid) for root, grid in roots)
-        self.to_grid = Transformer.from_crs(3413, 3411, always_xy=True).transform
         self._cache: dict[str, tuple | None] = {}
 
+    def _path(self, day: datetime) -> str | None:
+        for root, grid in self.roots:
+            name = f"asi-AMSR2-{grid}-{day:%Y%m%d}-v5.4"
+            tif = root / f"{day:%Y}" / day.strftime("%b").lower() / f"{name}.tif"
+            if tif.is_file():
+                return str(tif)
+            netcdf = root / f"{day:%Y}" / f"{name}.nc"
+            if netcdf.is_file():
+                return str(netcdf)
+        return None
+
     def _day(self, day: datetime):
-        key = day.strftime("%Y%m%d")
+        key = f"{day:%Y%m%d}"
         if key not in self._cache:
             import rasterio
+            from pyproj import Transformer
 
+            path = self._path(day)
             self._cache[key] = None
-            for root, grid in self.roots:
-                path = root / day.strftime("%Y") / day.strftime("%b").lower() / f"asi-AMSR2-{grid}-{key}-v5.4.tif"
-                if path.is_file():
-                    with rasterio.open(path) as source:
-                        self._cache[key] = (source.transform, source.read(1))
-                    break
+            if path is not None:
+                with rasterio.open(path) as source:
+                    to_grid = Transformer.from_crs(3413, source.crs, always_xy=True).transform
+                    self._cache[key] = (to_grid, source.transform, source.read(1).astype(np.float32))
             if len(self._cache) > 16:
                 self._cache.pop(next(iter(self._cache)))
         return self._cache[key]
@@ -91,12 +100,12 @@ class AsiConcentration:
         grid = self._day(day)
         if grid is None:
             return out
-        transform, values = grid
-        gx, gy = self.to_grid(x, np.asarray(y_m, dtype=np.float64))
+        to_grid, transform, values = grid
+        gx, gy = to_grid(x, np.asarray(y_m, dtype=np.float64))
         col = np.floor((np.asarray(gx) - transform.c) / transform.a).astype(np.int64)
         row = np.floor((np.asarray(gy) - transform.f) / transform.e).astype(np.int64)
         inside = (col >= 0) & (col < values.shape[1]) & (row >= 0) & (row < values.shape[0])
-        sampled = values[row[inside], col[inside]].astype(np.float32)
+        sampled = values[row[inside], col[inside]]
         sampled[sampled > 100] = np.nan
         out[inside] = sampled
         return out

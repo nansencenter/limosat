@@ -39,10 +39,9 @@ def asi_coverage(root, grid, start_utc, stop_utc):
     present, missing = 0, []
     day = start_utc.date()
     while day < stop_utc.date():
-        path = Path(root) / day.strftime("%Y") / day.strftime("%b").lower() / (
-            "asi-AMSR2-%s-%s-v5.4.tif" % (grid, day.strftime("%Y%m%d"))
-        )
-        if path.is_file():
+        name = "asi-AMSR2-%s-%s-v5.4" % (grid, day.strftime("%Y%m%d"))
+        year = Path(root) / day.strftime("%Y")
+        if (year / day.strftime("%b").lower() / (name + ".tif")).is_file() or (year / (name + ".nc")).is_file():
             present += 1
         else:
             missing.append(day.isoformat())
