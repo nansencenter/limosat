@@ -339,8 +339,7 @@ def test_parquet_request_plan_can_fill_a_missing_target_row(tmp_path):
     rows = table.to_pylist()
     source_ids = [row["trajectory_id"] for row in rows if row["image_id"] == "a"]
     chosen, nearby_unrequested = source_ids[:2]
-    assert all(any(row["trajectory_id"] == identity and row["image_id"] == "c"
-                   for row in rows) for identity in (chosen, nearby_unrequested))
+    # Neither identity may keep a measured row on "c"; gaps there are implied, not stored.
     reduced = [row for row in rows
                if not (row["trajectory_id"] in {chosen, nearby_unrequested}
                        and row["image_id"] == "c")]

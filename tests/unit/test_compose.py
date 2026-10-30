@@ -236,9 +236,10 @@ def test_compose_uses_pair_products_without_creating_sqlite(tmp_path):
     composed = compose_primary_parquet(config, output)
 
     assert not Path(config.database).exists()
-    assert composed["counts"]["trajectory_points"] == 8
+    # The seed whose endpoint falls on invalid pixels leaves a gap; gaps are not stored.
+    assert composed["counts"]["trajectory_points"] == 7
     assert composed["counts"]["trajectory_extensions"] == 3
-    assert composed["counts"]["trajectory_point_states"]["dormant"] == 1
+    assert "dormant" not in composed["counts"]["trajectory_point_states"]
     extensions = pq.read_table(composed["trajectory_extensions"])
     assert extensions.num_rows == 3
     assert extensions.column("qc_status").to_pylist() == ["accept"] * 3

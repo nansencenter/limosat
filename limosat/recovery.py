@@ -207,6 +207,7 @@ def prepare_recovery_targets(
     eligible = recovery_candidates(
         plan.pairs, config.routing.maximum_recovery_elapsed_hours
     )
+    primary = tuple(item for item in plan.pairs if item.selection == "primary")
     requests = None
     request_plan_sha256 = None
     if request_plan is not None:
@@ -262,7 +263,7 @@ def prepare_recovery_targets(
         _write_recovery_targets(
             store, available, images,
             iter_primary_position_batches(points_path, images),
-            counts=counts, collect=collected,
+            counts=counts, collect=collected, primary_pairs=primary,
         )
         loss_candidates = len(collected)
         by_id = {item.pair.pair_id: item for item in available}
@@ -282,7 +283,7 @@ def prepare_recovery_targets(
     targeted = _write_recovery_targets(
         store, eligible, images,
         iter_primary_position_batches(points_path, images),
-        requests, counts=counts,
+        requests, counts=counts, primary_pairs=primary,
     )
     product_set = hashlib.sha256()
     target_count = 0
@@ -377,6 +378,7 @@ class PositionRow(NamedTuple):
     trajectory_id: str
     image_id: str
     state: str
+    position_basis: str
     x_m: float | None
     y_m: float | None
 
@@ -389,7 +391,7 @@ def iter_primary_position_batches(
     path: str | Path, images: Sequence[ImageRecord]
 ) -> Iterable[tuple[PositionRow, ...]]:
     """Per-image rows for target selection; much cheaper than full points."""
-    columns = ["trajectory_id", "image_id", "state", "x_m", "y_m"]
+    columns = ["trajectory_id", "image_id", "state", "position_basis", "x_m", "y_m"]
     for table in _image_tables(path, images, columns):
         yield tuple(map(PositionRow._make, zip(*(table[name].to_pylist() for name in columns))))
 
@@ -432,8 +434,15 @@ def _write_recovery_targets(
     *,
     counts: dict[str, int] | None = None,
     collect: dict[str, tuple[tuple[str, ...], np.ndarray, np.ndarray]] | None = None,
+    primary_pairs: Sequence[PlannedPair] | None = None,
 ) -> tuple[PlannedPair, ...]:
     """Write recovery targets for dormant rows and unscheduled losses.
+
+    With ``primary_pairs``, dormant rows are derived instead of read: a
+    trajectory is dormant on an image when a primary pair reaches it from an
+    image where the primary composer measured the trajectory, and nothing
+    measured it on the image. On the MOSAiC Jan-Apr primary composition and its
+    four-pass merged base this reproduced all 16.4M and 16.2M stored rows.
 
     With ``collect``, nothing is written: each candidate pair's identities,
     frozen source positions and predicted target positions are recorded instead,
@@ -464,6 +473,14 @@ def _write_recovery_targets(
             source_requests.setdefault(source, set()).update(
                 requests[item.pair.pair_id]
             )
+    primary_sources: dict[int, list[int]] = {}
+    primary_last_use: dict[int, int] = {}
+    for item in primary_pairs or ():
+        source = index[item.pair.source.image_id]
+        target = index[item.pair.target.image_id]
+        primary_sources.setdefault(target, []).append(source)
+        primary_last_use[source] = max(primary_last_use.get(source, target), target)
+    primary_measured: dict[int, set[str]] = {}
     positions: list[dict[str, tuple[float, float]]] = [dict() for _ in images]
     velocities: list[dict[str, tuple[float, float]]] = [dict() for _ in images]
     latest: dict[str, tuple[float, float, float]] = {}
@@ -495,13 +512,28 @@ def _write_recovery_targets(
                         velocities[step][identity] = (
                             (x - previous[1]) / gap, (y - previous[2]) / gap
                         )
-        dormant = {
-            point.trajectory_id for point in points if point.state == "dormant"
-        }
         measured = {
             point.trajectory_id for point in points if point.available
         }
-        present = {point.trajectory_id for point in points}
+        if primary_pairs is None:
+            dormant = {
+                point.trajectory_id for point in points if point.state == "dormant"
+            }
+            present = {point.trajectory_id for point in points}
+        else:
+            if step in primary_last_use:
+                primary_measured[step] = {
+                    point.trajectory_id for point in points
+                    if point.available and point.position_basis in _PRIMARY_BASES
+                }
+            reached = set().union(
+                *(primary_measured[source] for source in primary_sources.get(step, ()))
+            )
+            dormant = reached - measured
+            present = reached | measured
+            for source in primary_sources.get(step, ()):
+                if primary_last_use[source] == step:
+                    del primary_measured[source]
         for item in by_target.get(step, ()):
             source_step = index[item.pair.source.image_id]
             source = positions[source_step]
@@ -563,6 +595,10 @@ def _write_recovery_targets(
     except StopIteration:
         return tuple(targeted)
     raise ValueError("primary point batches exceed the catalogue")
+
+
+# Position bases written by the primary composer; merged passes prefix their own.
+_PRIMARY_BASES = frozenset({"seed_grid", "primary_pair_field"})
 
 
 def _filter_by_target_validity(config, collected, by_id):

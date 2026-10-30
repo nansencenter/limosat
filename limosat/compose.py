@@ -116,6 +116,7 @@ def compose_primary_parquet(
                 surface_gate(config),
             ),
             seed_filter_factory=seed_filter_factory(surface_gate(config)),
+            gap_rows=False,
         ):
             if batch.points:
                 point_writer.write_table(
@@ -156,6 +157,8 @@ def compose_primary_parquet(
         "trajectory_extension_schema_version": TRAJECTORY_EXTENSION_SCHEMA_VERSION,
         "qc_protocol_id": QC_PROTOCOL_ID,
         "target_pixel_validity": TARGET_PIXEL_VALIDITY_POLICY,
+        # Gaps are implied by primary pairs, not stored (see iter_global_trajectory_batches).
+        "gap_rows": "derived",
         "run_id": config.run_id,
         "config_sha256": config.sha256,
         "producer_implementation_sha256": next(iter(producer_hashes)),

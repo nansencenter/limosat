@@ -164,8 +164,15 @@ def iter_global_trajectory_batches(
     *,
     target_validity_factory: TargetValidityFactory | None = None,
     seed_filter_factory: SeedFilterFactory | None = None,
+    gap_rows: bool = True,
 ) -> Iterator[TrajectoryBatch]:
-    """Yield deterministic points and direct extensions for each image."""
+    """Yield deterministic points and direct extensions for each image.
+
+    With ``gap_rows`` false no ``dormant`` rows are written. A gap is then
+    implied wherever a primary pair reaches an image from one where the
+    trajectory was measured but the trajectory has no row on that image;
+    ``recovery.prepare_recovery_targets`` derives them that way.
+    """
     ordered_images = tuple(
         sorted(images, key=lambda image: (image.time_utc, image.image_id))
     )
@@ -223,9 +230,10 @@ def iter_global_trajectory_batches(
             for identity in eligible:
                 continuation = chosen.get(identity)
                 if continuation is None:
-                    points.append(
-                        _point(identity, image, "dormant", "missing", None, None)
-                    )
+                    if gap_rows:
+                        points.append(
+                            _point(identity, image, "dormant", "missing", None, None)
+                        )
                     continue
                 source_xy = positions[continuation.source_step][identity]
                 xy = source_xy + continuation.displacement_m
