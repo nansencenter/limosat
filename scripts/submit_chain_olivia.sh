@@ -1,19 +1,23 @@
 #!/usr/bin/env bash
 # Submit the chained Parquet run on Olivia (see run_limosat_chain_olivia.sbatch).
-#   submit_chain_olivia.sh [--dry-run]        freeze the run environment and submit prepare -> primary -> compose
-#   submit_chain_olivia.sh --stage S --after J  (used by the pass controllers) submit one stage, print its job ID
+#   submit_chain_olivia.sh [--dry-run]   freeze the run environment and submit prepare, which submits the rest
+#   submit_chain_olivia.sh --stage S [--after J] [--pairs N]   (used by running stages) submit one stage, print its ID
+# A GPU stage for N pairs gets ceil(N / PAIRS_PER_GPU_TASK) one-GPU tasks (at most MAXIMUM_GPU_TASKS) and a time
+# limit of twice the expected run time at PAIRS_PER_GPU_HOUR, at least 30 minutes: short requests backfill sooner.
 # RUN_ROOT must hold control/config.json and control/catalogue.json from prepare_chain_olivia.py.
 set -euo pipefail
 
 stage=""
 after=""
+pairs=0
 dry_run=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) dry_run=1; shift ;;
     --stage) stage="$2"; shift 2 ;;
     --after) after="$2"; shift 2 ;;
-    *) echo "usage: $0 [--dry-run] | --stage STAGE [--after JOB]" >&2; exit 2 ;;
+    --pairs) pairs="$2"; shift 2 ;;
+    *) echo "usage: $0 [--dry-run] | --stage STAGE [--after JOB] [--pairs N]" >&2; exit 2 ;;
   esac
 done
 
@@ -65,13 +69,15 @@ else
     printf 'export LIMOSAT_CHECKPOINT_SHA256=%q\n' "$(sha256sum "$checkpoint" | awk '{print $1}')"
     printf 'export LIMOSAT_CONTAINER=%q\n' "$container"
     printf 'export LIMOSAT_OVERLAY=%q\n' "$overlay"
-    printf 'export LIMOSAT_GPU_WORKERS=%q\n' "${GPU_WORKERS:-4}"
+    printf 'export LIMOSAT_PROCESSES_PER_GPU=%q\n' "${PROCESSES_PER_GPU:-1}"
     printf 'export LIMOSAT_SUBMIT=%q\n' "$method_root/scripts/submit_chain_olivia.sh"
     printf 'export LIMOSAT_MINIMUM_PASS_PAIRS=%q\n' "${MINIMUM_PASS_PAIRS:-50}"
     printf 'export LIMOSAT_MINIMUM_GAIN_SHARE=%q\n' "${MINIMUM_GAIN_SHARE:-0.3}"
     printf 'export LIMOSAT_MAXIMUM_PASSES=%q\n' "${MAXIMUM_PASSES:-12}"
     printf 'GPU_ACCOUNT=%q\nCPU_ACCOUNT=%q\n' "${GPU_ACCOUNT:-nn2993k}" "${CPU_ACCOUNT:-${GPU_ACCOUNT:-nn2993k}}"
-    printf 'GPU_WALL_TIME=%q\nGPU_MEMORY=%q\nGPU_CPUS=%q\n' "${WALL_TIME:-24:00:00}" "${MEMORY:-32G}" "${CPUS_PER_TASK:-8}"
+    printf 'MAXIMUM_GPU_TASKS=%q\nPAIRS_PER_GPU_TASK=%q\nPAIRS_PER_GPU_HOUR=%q\n' \
+      "${MAXIMUM_GPU_TASKS:-4}" "${PAIRS_PER_GPU_TASK:-1000}" "${PAIRS_PER_GPU_HOUR:-500}"
+    printf 'CPUS_PER_PROCESS=%q\nMEMORY_PER_PROCESS_GB=%q\n' "${CPUS_PER_PROCESS:-4}" "${MEMORY_PER_PROCESS_GB:-12}"
     printf 'CPU_PARTITION=%q\nCPU_WALL_TIME=%q\nCPU_MEMORY=%q\nCPU_CPUS=%q\n' \
       "${CPU_PARTITION:-accel}" "${CPU_WALL_TIME:-12:00:00}" "${CPU_MEMORY:-128G}" "${CPU_CPUS_PER_TASK:-16}"
   } > "$environment.tmp"
@@ -85,8 +91,15 @@ build_command() {
   local name="$1" dependency="$2"
   command=(sbatch --parsable --nodes=1 --ntasks=1 --job-name="eloftr-$name-p${LIMOSAT_PASS:-0}")
   if [[ "$name" == *-pairs ]]; then
-    command+=(--account="$GPU_ACCOUNT" --partition=accel --gpus=1 --array="0-$((LIMOSAT_GPU_WORKERS - 1))"
-      --cpus-per-task="$GPU_CPUS" --mem="$GPU_MEMORY" --time="$GPU_WALL_TIME"
+    local tasks=$(( (pairs + PAIRS_PER_GPU_TASK - 1) / PAIRS_PER_GPU_TASK ))
+    (( tasks >= 1 )) || tasks=1
+    (( tasks <= MAXIMUM_GPU_TASKS )) || tasks=$MAXIMUM_GPU_TASKS
+    local minutes=$(( 2 * 60 * pairs / (tasks * PAIRS_PER_GPU_HOUR) ))
+    (( minutes >= 30 )) || minutes=30
+    (( minutes <= 1440 )) || minutes=1440
+    command+=(--account="$GPU_ACCOUNT" --partition=accel --gpus=1 --array="0-$((tasks - 1))"
+      --cpus-per-task=$(( CPUS_PER_PROCESS * LIMOSAT_PROCESSES_PER_GPU ))
+      --mem="$(( MEMORY_PER_PROCESS_GB * LIMOSAT_PROCESSES_PER_GPU ))G" --time="$minutes"
       --output="$LIMOSAT_RUN_ROOT/logs/%x-%A_%a.out" --error="$LIMOSAT_RUN_ROOT/logs/%x-%A_%a.err")
   else
     command+=(--account="$CPU_ACCOUNT" --cpus-per-task="$CPU_CPUS" --mem="$CPU_MEMORY" --time="$CPU_WALL_TIME"
@@ -115,10 +128,12 @@ if [[ -n "$stage" ]]; then
   submit_stage "$stage" "$after"
   exit 0
 fi
-prepare_job=$(submit_stage prepare "")
-primary_job=$(submit_stage primary-pairs "$prepare_job")
-compose_job=$(submit_stage primary-compose "$primary_job")
-echo "prepare_job=$prepare_job primary_pair_job=$primary_job primary_compose_job=$compose_job"
+echo "prepare_job=$(submit_stage prepare "")"
+if [[ "$dry_run" == 1 ]]; then
+  # Shows the GPU request prepare would make for this week's 2,418 primary pairs.
+  pairs=2418
+  submit_stage primary-pairs "<prepare>" > /dev/null
+fi
 echo "ledger=$LIMOSAT_RUN_ROOT/control/passes.log"
 if [[ "$dry_run" == 1 ]]; then
   rm -f "$LIMOSAT_RUN_ROOT/control/submit.env.dry-run"

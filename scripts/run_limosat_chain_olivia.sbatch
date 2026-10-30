@@ -4,6 +4,9 @@
 # of continuation passes follows the stop rule instead of being fixed at submission:
 #   prepare -> primary-pairs -> primary-compose -> pass 1 -> pass 2 -> ... -> finalize
 # A pass is: pass (CPU: base + targets + stop rule) -> recovery-pairs (GPU array) -> pass-compose (CPU).
+# Each GPU task runs LIMOSAT_PROCESSES_PER_GPU matcher processes: pair work is mostly CPU-side tile sampling and
+# field fitting, so one process keeps an H200 only ~15 % busy. GPU arrays are sized and time-limited from their
+# pair count (see submit_chain_olivia.sh) so that small passes backfill quickly.
 # Stop when a pass targets fewer than LIMOSAT_MINIMUM_PASS_PAIRS pairs, when its accepted continuation links per
 # matcher tile fall below LIMOSAT_MINIMUM_GAIN_SHARE of pass 1's, or after LIMOSAT_MAXIMUM_PASSES.
 
@@ -25,7 +28,7 @@ set -euo pipefail
 : "${LIMOSAT_CONTAINER:?}"
 : "${LIMOSAT_OVERLAY:?}"
 : "${LIMOSAT_STAGE:?}"
-: "${LIMOSAT_GPU_WORKERS:?}"
+: "${LIMOSAT_PROCESSES_PER_GPU:?}"
 : "${LIMOSAT_SUBMIT:?}"
 LIMOSAT_PASS="${LIMOSAT_PASS:-0}"
 LIMOSAT_MINIMUM_PASS_PAIRS="${LIMOSAT_MINIMUM_PASS_PAIRS:-50}"
@@ -89,7 +92,7 @@ run_json() {
   mv "$destination.tmp.${SLURM_JOB_ID:-local}.$array_index" "$destination"
 }
 # The submitter script, re-entered with a stage name, prints the new job ID.
-submit() { LIMOSAT_PASS="$2" "$LIMOSAT_SUBMIT" --stage "$1" --after "${3:-}"; }
+submit() { LIMOSAT_PASS="$2" "$LIMOSAT_SUBMIT" --stage "$1" --after "${3:-}" --pairs "${4:-0}"; }
 
 echo "job_started_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ) stage=$LIMOSAT_STAGE pass=$LIMOSAT_PASS"
 echo "method_revision=$LIMOSAT_EXPECTED_REVISION official_revision=$LIMOSAT_OFFICIAL_REVISION"
@@ -118,15 +121,25 @@ print("pyarrow=%s surface=%s" % (pyarrow.__version__, config.surface))
 PY
     run_json "$control/plan.json" limosat plan "$LIMOSAT_CONFIG"
     run_json "$control/prepare-stage.json" limosat prepare "$LIMOSAT_CONFIG"
+    pairs=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["primary_pairs"])' "$control/plan.json")
+    gpu=$(submit primary-pairs 0 "" "$pairs")
+    submit primary-compose 0 "$gpu"
     ;;
   primary-pairs|recovery-pairs)
     nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
     kind="${LIMOSAT_STAGE%-pairs}"
     extra=()
     [[ "$kind" == primary ]] || extra=(--recovery-targets "$passes/p$LIMOSAT_PASS/targets")
-    run_json "$control/${kind}-pairs-p${LIMOSAT_PASS}-${array_index}.json" \
-      limosat pairs "$LIMOSAT_CONFIG" --kind "$kind" --batch-index "$array_index" \
-      --batch-count "$LIMOSAT_GPU_WORKERS" "${extra[@]}"
+    tasks="${SLURM_ARRAY_TASK_COUNT:-1}"
+    workers=()
+    for (( k = 0; k < LIMOSAT_PROCESSES_PER_GPU; k++ )); do
+      batch=$(( array_index * LIMOSAT_PROCESSES_PER_GPU + k ))
+      run_json "$control/${kind}-pairs-p${LIMOSAT_PASS}-${batch}.json" \
+        limosat pairs "$LIMOSAT_CONFIG" --kind "$kind" --batch-index "$batch" \
+        --batch-count $(( tasks * LIMOSAT_PROCESSES_PER_GPU )) "${extra[@]}" &
+      workers+=($!)
+    done
+    for worker in "${workers[@]}"; do wait "$worker"; done
     ;;
   primary-compose)
     run_json "$control/primary-compose.json" \
@@ -155,7 +168,7 @@ PY
       submit finalize $((n - 1))
       exit 0
     fi
-    gpu=$(submit recovery-pairs "$n")
+    gpu=$(submit recovery-pairs "$n" "" "$pairs")
     submit pass-compose "$n" "$gpu"
     ;;
   pass-compose)
