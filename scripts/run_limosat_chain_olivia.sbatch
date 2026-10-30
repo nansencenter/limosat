@@ -7,7 +7,7 @@
 # Each GPU task runs LIMOSAT_PROCESSES_PER_GPU matcher processes: pair work is mostly CPU-side tile sampling and
 # field fitting, so one process keeps an H200 only ~15 % busy. Olivia GPUs are in Exclusive_Process mode, so the
 # processes share the GPU through an MPS daemon started by the task. On the January 2020 test week, 8 processes ran
-# 5.5x faster than one (GPU ~78 % busy, ~6 GB each) with bit-identical pair products. GPU arrays are sized and time-limited from their
+# 5.5x faster than one with bit-identical pair products; 10 ran 6.3x (GPU 86 % busy, 60 GB), 12 and 14 no faster. GPU arrays are sized and time-limited from their
 # pair count (see submit_chain_olivia.sh) so that small passes backfill quickly.
 # Stop when a pass targets fewer than LIMOSAT_MINIMUM_PASS_PAIRS pairs, when its accepted continuation links per
 # matcher tile fall below LIMOSAT_MINIMUM_GAIN_SHARE of pass 1's, or after LIMOSAT_MAXIMUM_PASSES.

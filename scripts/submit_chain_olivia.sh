@@ -69,7 +69,7 @@ else
     printf 'export LIMOSAT_CHECKPOINT_SHA256=%q\n' "$(sha256sum "$checkpoint" | awk '{print $1}')"
     printf 'export LIMOSAT_CONTAINER=%q\n' "$container"
     printf 'export LIMOSAT_OVERLAY=%q\n' "$overlay"
-    printf 'export LIMOSAT_PROCESSES_PER_GPU=%q\n' "${PROCESSES_PER_GPU:-8}"
+    printf 'export LIMOSAT_PROCESSES_PER_GPU=%q\n' "${PROCESSES_PER_GPU:-10}"
     printf 'export LIMOSAT_SUBMIT=%q\n' "$method_root/scripts/submit_chain_olivia.sh"
     printf 'export LIMOSAT_MINIMUM_PASS_PAIRS=%q\n' "${MINIMUM_PASS_PAIRS:-50}"
     printf 'export LIMOSAT_MINIMUM_GAIN_SHARE=%q\n' "${MINIMUM_GAIN_SHARE:-0.3}"
@@ -78,7 +78,7 @@ else
     printf 'GPU_ACCOUNT=%q\nCPU_ACCOUNT=%q\n' "${GPU_ACCOUNT:-nn2993k}" "${CPU_ACCOUNT:-${GPU_ACCOUNT:-nn2993k}}"
     printf 'MAXIMUM_GPU_TASKS=%q\nPAIRS_PER_GPU_TASK=%q\nPAIRS_PER_GPU_HOUR=%q\n' \
       "${MAXIMUM_GPU_TASKS:-4}" "${PAIRS_PER_GPU_TASK:-4000}" "${PAIRS_PER_GPU_HOUR:-2500}"
-    printf 'CPUS_PER_PROCESS=%q\nMEMORY_PER_PROCESS_GB=%q\n' "${CPUS_PER_PROCESS:-6}" "${MEMORY_PER_PROCESS_GB:-16}"
+    printf 'CPUS_PER_PROCESS=%q\nMEMORY_PER_PROCESS_GB=%q\n' "${CPUS_PER_PROCESS:-6}" "${MEMORY_PER_PROCESS_GB:-10}"
     printf 'CPU_PARTITION=%q\nCPU_WALL_TIME=%q\nCPU_MEMORY=%q\nCPU_CPUS=%q\n' \
       "${CPU_PARTITION:-accel}" "${CPU_WALL_TIME:-12:00:00}" "${CPU_MEMORY:-128G}" "${CPU_CPUS_PER_TASK:-16}"
   } > "$environment.tmp"
