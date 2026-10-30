@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import hashlib
+import json
+import os
+import pickle
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Literal, Mapping
 
 import numpy as np
 from shapely.geometry.base import BaseGeometry
 
 from .catalog import ImageCatalogue, ImagePair, ImageRecord
-from .config import RoutingConfig
+from .config import RoutingConfig, RunConfig
 from .field import regular_grid
 from .imagery import projected_footprint
 
@@ -29,6 +34,47 @@ class PlannedPair:
 class CandidatePlan:
     pairs: tuple[PlannedPair, ...]
     exclusion_counts: Mapping[str, int]
+
+
+def run_plan(config: RunConfig, catalogue: ImageCatalogue) -> CandidatePlan:
+    """The run's candidate plan, cached under ``output_directory/plan-cache``.
+
+    Planning a pan-Arctic week takes about four minutes and every stage (and
+    every matcher process) needs the same plan. The cache key covers every
+    catalogue record, the routing settings and the planning code, so any change
+    to them plans afresh.
+    """
+    package = Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    for path in (package / "planning.py", package / "catalog.py"):
+        digest.update(path.read_bytes())
+    records = [
+        [image.image_id, str(image.path), image.time_utc.isoformat(), image.component_id,
+         image.footprint.wkb_hex if image.footprint is not None else None,
+         image.platform, image.absolute_orbit]
+        for image in catalogue.chronological()
+    ]
+    digest.update(json.dumps(
+        [records, asdict(config.routing), config.matcher.maximum_speed_m_per_day,
+         config.analysis_epsg],
+        sort_keys=True, default=str,
+    ).encode("utf-8"))
+    path = Path(config.output_directory) / "plan-cache" / f"{digest.hexdigest()}.pickle"
+    if path.is_file():
+        with path.open("rb") as stream:
+            return pickle.load(stream)
+    plan = build_candidate_plan(
+        catalogue,
+        config.routing,
+        grid_spacing_m=config.routing.planning_grid_spacing_m,
+        maximum_speed_m_per_day=config.matcher.maximum_speed_m_per_day,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}")
+    with temporary.open("wb") as stream:
+        pickle.dump(plan, stream, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(temporary, path)
+    return plan
 
 
 def plan_candidate_pairs(

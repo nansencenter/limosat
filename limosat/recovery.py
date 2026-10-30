@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence
+from typing import Iterable, Mapping, NamedTuple, Sequence
 
 import numpy as np
 import shapely
@@ -15,7 +15,7 @@ from .catalog import ImagePair, ImageRecord, load_catalogue
 from .config import RunConfig
 from .pair_queue import loss_targeted_pairs
 from .pair_products import PairProductStore
-from .planning import PlannedPair, build_candidate_plan, recovery_candidates
+from .planning import PlannedPair, run_plan, recovery_candidates
 from .store import file_sha256
 from .trajectory import TrajectoryPoint
 
@@ -203,12 +203,7 @@ def prepare_recovery_targets(
         raise ValueError("primary trajectory points failed manifest checksum")
 
     catalogue = load_catalogue(config.catalogue, config.analysis_epsg)
-    plan = build_candidate_plan(
-        catalogue,
-        config.routing,
-        grid_spacing_m=config.routing.planning_grid_spacing_m,
-        maximum_speed_m_per_day=config.matcher.maximum_speed_m_per_day,
-    )
+    plan = run_plan(config, catalogue)
     eligible = recovery_candidates(
         plan.pairs, config.routing.maximum_recovery_elapsed_hours
     )
@@ -266,7 +261,7 @@ def prepare_recovery_targets(
         collected: dict[str, tuple[tuple[str, ...], np.ndarray]] = {}
         _write_recovery_targets(
             store, available, images,
-            iter_primary_point_batches(points_path, images),
+            iter_primary_position_batches(points_path, images),
             counts=counts, collect=collected,
         )
         loss_candidates = len(collected)
@@ -286,7 +281,7 @@ def prepare_recovery_targets(
         del collected, options
     targeted = _write_recovery_targets(
         store, eligible, images,
-        iter_primary_point_batches(points_path, images),
+        iter_primary_position_batches(points_path, images),
         requests, counts=counts,
     )
     product_set = hashlib.sha256()
@@ -356,6 +351,51 @@ def iter_primary_point_batches(
     path: str | Path, images: Sequence[ImageRecord]
 ) -> Iterable[tuple[TrajectoryPoint, ...]]:
     """Read composer output as deterministic per-image primary batches."""
+    columns = [
+        "trajectory_id", "image_id", "time_utc", "state", "position_basis",
+        "x_m", "y_m", "source_pair_id", "selected_matches",
+        "support_radius_m", "maximum_residual_m",
+    ]
+    for table in _image_tables(path, images, columns):
+        yield tuple(
+            TrajectoryPoint(
+                trajectory_id=row["trajectory_id"], image_id=row["image_id"],
+                time_utc=row["time_utc"], state=row["state"],
+                position_basis=row["position_basis"], x_m=row["x_m"], y_m=row["y_m"],
+                source_pair_id=row["source_pair_id"],
+                selected_matches=row["selected_matches"],
+                support_radius_m=row["support_radius_m"],
+                maximum_residual_m=row["maximum_residual_m"],
+            )
+            for row in table.to_pylist()
+        )
+
+
+class PositionRow(NamedTuple):
+    """The fields target selection reads, without TrajectoryPoint validation."""
+
+    trajectory_id: str
+    image_id: str
+    state: str
+    x_m: float | None
+    y_m: float | None
+
+    @property
+    def available(self) -> bool:
+        return self.x_m is not None and self.y_m is not None
+
+
+def iter_primary_position_batches(
+    path: str | Path, images: Sequence[ImageRecord]
+) -> Iterable[tuple[PositionRow, ...]]:
+    """Per-image rows for target selection; much cheaper than full points."""
+    columns = ["trajectory_id", "image_id", "state", "x_m", "y_m"]
+    for table in _image_tables(path, images, columns):
+        yield tuple(map(PositionRow._make, zip(*(table[name].to_pylist() for name in columns))))
+
+
+def _image_tables(path, images, columns):
+    """Yield each catalogue image's rows as one Arrow table, chronologically."""
     _pa, pq = _pyarrow()
     parquet = pq.ParquetFile(path)
     image_order = {image.image_id: index for index, image in enumerate(images)}
@@ -377,27 +417,10 @@ def iter_primary_point_batches(
                 f"primary point image is absent from catalogue: {image_id}"
             )
         grouped.setdefault(image_id, []).append(row_group)
-    columns = [
-        "trajectory_id", "image_id", "time_utc", "state", "position_basis",
-        "x_m", "y_m", "source_pair_id", "selected_matches",
-        "support_radius_m", "maximum_residual_m",
-    ]
+    empty = parquet.schema_arrow.empty_table().select(columns)
     for image in images:
-        rows = []
-        for row_group in grouped.get(image.image_id, ()):
-            rows.extend(parquet.read_row_group(row_group, columns=columns).to_pylist())
-        yield tuple(
-            TrajectoryPoint(
-                trajectory_id=row["trajectory_id"], image_id=row["image_id"],
-                time_utc=row["time_utc"], state=row["state"],
-                position_basis=row["position_basis"], x_m=row["x_m"], y_m=row["y_m"],
-                source_pair_id=row["source_pair_id"],
-                selected_matches=row["selected_matches"],
-                support_radius_m=row["support_radius_m"],
-                maximum_residual_m=row["maximum_residual_m"],
-            )
-            for row in rows
-        )
+        groups = grouped.get(image.image_id, ())
+        yield parquet.read_row_groups(groups, columns=columns) if groups else empty
 
 
 def _write_recovery_targets(

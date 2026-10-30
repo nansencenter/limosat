@@ -65,7 +65,7 @@ class _SceneTransform:
         return np.asarray(x_m, dtype=np.float64), np.asarray(y_m, dtype=np.float64)
 
 
-@lru_cache(maxsize=8)
+@lru_cache(maxsize=64)
 def scene_transform(path: str | Path, analysis_epsg: int = 3413) -> _SceneTransform:
     """Return cached affine or thin-plate-spline pixel transforms."""
     with rasterio.open(path) as dataset:
@@ -164,9 +164,13 @@ class TargetPixelValidity:
         return inside
 
 
-@lru_cache(maxsize=8)
+@lru_cache(maxsize=64)
 def _cached_target_validity(path: str, analysis_epsg: int) -> TargetPixelValidity:
-    """Frames are checked repeatedly as targets and as neighbours' siblings."""
+    """Frames are checked repeatedly as targets and as neighbours' siblings.
+
+    Pan-Arctic passes interleave many frames, so eight entries missed most
+    lookups; 64 masks of an EW scene (~5k x 5k) hold about 1.7 GB.
+    """
     return TargetPixelValidity(path, analysis_epsg)
 
 

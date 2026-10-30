@@ -17,7 +17,7 @@ from .imagery import pass_pixel_validity_factory
 from .surface import seed_filter_factory, surface_gate, surface_validity_factory
 from .models import FieldEdge
 from .pair_products import PAIR_PRODUCT_SCHEMA_VERSION, PairProductStore
-from .planning import build_candidate_plan, recovery_candidates
+from .planning import run_plan, recovery_candidates
 from .qc import QC_PROTOCOL_ID, ExtensionQCConfig, ScoredExtension, score_extensions
 from .recovery import (
     RecoveryTargetStore,
@@ -63,12 +63,7 @@ def compose_primary_parquet(
         ),
     )
     catalogue = load_catalogue(config.catalogue, config.analysis_epsg)
-    plan = build_candidate_plan(
-        catalogue,
-        config.routing,
-        grid_spacing_m=config.routing.planning_grid_spacing_m,
-        maximum_speed_m_per_day=config.matcher.maximum_speed_m_per_day,
-    )
+    plan = run_plan(config, catalogue)
     primary = tuple(item for item in plan.pairs if item.selection == "primary")
     products = PairProductStore(config)
     if products.count("primary") != len(primary):
@@ -250,12 +245,7 @@ def compose_recovery_parquet(
         hard_speed_m_per_day=max(60_000.0, config.matcher.maximum_speed_m_per_day),
     )
     catalogue = load_catalogue(config.catalogue, config.analysis_epsg)
-    plan = build_candidate_plan(
-        catalogue,
-        config.routing,
-        grid_spacing_m=config.routing.planning_grid_spacing_m,
-        maximum_speed_m_per_day=config.matcher.maximum_speed_m_per_day,
-    )
+    plan = run_plan(config, catalogue)
     primary = tuple(item for item in plan.pairs if item.selection == "primary")
     eligible = recovery_candidates(
         plan.pairs, config.routing.maximum_recovery_elapsed_hours

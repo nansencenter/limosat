@@ -25,7 +25,7 @@ from .models import FieldEdge
 from .pair_products import PAIR_PRODUCT_SCHEMA_VERSION, PairProductStore
 from .pair_queue import loss_targeted_pairs
 from .pairs import PairProcessor
-from .planning import PlannedPair, build_candidate_plan, recovery_candidates
+from .planning import PlannedPair, run_plan, recovery_candidates
 from .recovery import RecoveryTargetStore, load_recovery_target_manifest
 from .store import RunStore
 from .trajectory import (
@@ -80,12 +80,7 @@ class RunStages:
 
     def prepare(self) -> dict:
         """Freeze the catalogue and candidate image-pair plan in SQLite."""
-        plan = build_candidate_plan(
-            self.catalogue,
-            self.config.routing,
-            grid_spacing_m=self.config.routing.planning_grid_spacing_m,
-            maximum_speed_m_per_day=self.config.matcher.maximum_speed_m_per_day,
-        )
+        plan = run_plan(self.config, self.catalogue)
         store = RunStore(self.config)
         store.register_catalogue(self.catalogue)
         store.register_candidate_pairs(plan.pairs)
@@ -114,14 +109,7 @@ class RunStages:
             if kind != "recovery":
                 raise ValueError("recovery targets apply only to recovery pairs")
             store = None
-            plan = build_candidate_plan(
-                self.catalogue,
-                self.config.routing,
-                grid_spacing_m=self.config.routing.planning_grid_spacing_m,
-                maximum_speed_m_per_day=(
-                    self.config.matcher.maximum_speed_m_per_day
-                ),
-            )
+            plan = run_plan(self.config, self.catalogue)
             candidates = recovery_candidates(
                 plan.pairs,
                 self.config.routing.maximum_recovery_elapsed_hours,

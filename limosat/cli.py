@@ -12,7 +12,7 @@ from .config import load_config
 from .finalize import finalize_products
 from .pair_products import PairProductStore
 from .compose import compose_primary_parquet, compose_recovery_parquet
-from .planning import build_candidate_plan, recovery_candidates, select_overlap_probe
+from .planning import run_plan, recovery_candidates, select_overlap_probe
 from .recovery import prepare_recovery_targets
 from .run import LiMOSATRun
 from .stages import RunStages
@@ -201,12 +201,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     else:
         catalogue = load_catalogue(config.catalogue, config.analysis_epsg)
-        candidate_plan = build_candidate_plan(
-            catalogue,
-            config.routing,
-            grid_spacing_m=config.routing.planning_grid_spacing_m,
-            maximum_speed_m_per_day=config.matcher.maximum_speed_m_per_day,
-        )
+        candidate_plan = run_plan(config, catalogue)
         pairs = candidate_plan.pairs
         recovery = recovery_candidates(
             pairs,
