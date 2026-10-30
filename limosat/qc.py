@@ -172,35 +172,51 @@ def _local_diagnostics(
         k=k,
         distance_upper_bound=config.neighbour_search_radius_m,
     )
-    for index in range(count):
-        valid = (
-            np.isfinite(distances[index])
-            & (neighbours[index] < count)
-            & (neighbours[index] != index)
-        )
-        selected = neighbours[index, valid].astype(int)
-        selected_distances = distances[index, valid]
-        result["count"][index] = len(selected)
-        if len(selected) < config.minimum_neighbours:
-            continue
-        neighbour_uv = uv[selected]
-        median_uv = np.median(neighbour_uv, axis=0)
-        neighbour_residuals = np.linalg.norm(neighbour_uv - median_uv, axis=1)
-        residual = float(np.linalg.norm(uv[index] - median_uv))
-        median_residual = float(np.median(neighbour_residuals))
-        mad = float(np.median(np.abs(neighbour_residuals - median_residual)))
-        scale = max(1.4826 * mad, config.residual_noise_floor_m)
-        robust_z = max(0.0, (residual - median_residual) / scale)
-        threshold = max(
-            config.local_review_floor_m,
-            median_residual + config.local_review_z * scale,
-        )
-        result["support_radius_m"][index] = float(np.max(selected_distances))
-        result["median_uv"][index] = median_uv
-        result["residual_m"][index] = residual
-        result["robust_z"][index] = robust_z
-        result["review"][index] = residual > threshold
+    distances = distances.reshape(count, -1)
+    neighbours = neighbours.reshape(count, -1)
+    valid = (
+        np.isfinite(distances)
+        & (neighbours < count)
+        & (neighbours != np.arange(count)[:, None])
+    )
+    result["count"][:] = valid.sum(axis=1)
+    rows = np.flatnonzero(result["count"] >= config.minimum_neighbours)
+    if not len(rows):
+        return result
+    valid, counts = valid[rows], result["count"][rows]
+    # Neighbour arrays padded with NaN; _row_median takes each row's median
+    # over its valid entries exactly as np.median would.
+    neighbour_uv = np.where(
+        valid[:, :, None], uv[np.where(valid, neighbours[rows], 0)], np.nan
+    )
+    median_uv = np.stack(
+        [_row_median(neighbour_uv[:, :, axis], counts) for axis in (0, 1)], axis=1
+    )
+    neighbour_residuals = np.linalg.norm(neighbour_uv - median_uv[:, None, :], axis=2)
+    residual = np.linalg.norm(uv[rows] - median_uv, axis=1)
+    median_residual = _row_median(neighbour_residuals, counts)
+    mad = _row_median(np.abs(neighbour_residuals - median_residual[:, None]), counts)
+    scale = np.maximum(1.4826 * mad, config.residual_noise_floor_m)
+    threshold = np.maximum(
+        config.local_review_floor_m, median_residual + config.local_review_z * scale
+    )
+    result["support_radius_m"][rows] = np.max(
+        np.where(valid, distances[rows], -np.inf), axis=1
+    )
+    result["median_uv"][rows] = median_uv
+    result["residual_m"][rows] = residual
+    result["robust_z"][rows] = np.maximum(0.0, (residual - median_residual) / scale)
+    result["review"][rows] = residual > threshold
     return result
+
+
+def _row_median(values: np.ndarray, counts: np.ndarray) -> np.ndarray:
+    """Median of each row's first ``counts`` non-NaN entries (NaN sorts last)."""
+    ordered = np.sort(values, axis=1)
+    rows = np.arange(len(values))
+    upper = ordered[rows, counts // 2]
+    lower = ordered[rows, (counts - 1) // 2]
+    return np.where(counts % 2 == 1, upper, (lower + upper) / 2.0)
 
 
 def _optional_float(value: float) -> float | None:

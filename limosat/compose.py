@@ -5,7 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from collections import Counter
+from collections import Counter, deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
 
@@ -79,13 +80,7 @@ def compose_primary_parquet(
     edges: list[FieldEdge] = []
     producer_hashes: set[str] = set()
     product_set = hashlib.sha256()
-    for item in primary:
-        product = products.load(
-            item.pair,
-            "primary",
-            False,
-            require_current_implementation=False,
-        )
+    for item, product in zip(primary, _load_primary_products(products, primary)):
         if product is None:
             raise RuntimeError(f"primary pair product is missing: {item.pair.pair_id}")
         producer_hashes.add(product.producer_implementation_sha256)
@@ -286,10 +281,7 @@ def compose_recovery_parquet(
     recovery_producers: set[str] = set()
     recovery_product_set = hashlib.sha256()
     target_set = hashlib.sha256()
-    for item in primary:
-        product = products.load(
-            item.pair, "primary", False, require_current_implementation=False
-        )
+    for item, product in zip(primary, _load_primary_products(products, primary)):
         if product is None:
             raise RuntimeError(f"primary pair product is missing: {item.pair.pair_id}")
         primary_producers.add(product.producer_implementation_sha256)
@@ -456,6 +448,27 @@ def compose_recovery_parquet(
         "trajectory_augmentation_extensions": str(extensions_path),
         "counts": manifest["counts"],
     }
+
+
+def _load_primary_products(products: PairProductStore, primary, workers: int = 8):
+    """Load (and checksum) primary products on threads, in plan order.
+
+    At most twice ``workers`` products are held at once, since each carries its
+    full match arrays.
+    """
+    def load(item):
+        return products.load(
+            item.pair, "primary", False, require_current_implementation=False
+        )
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        pending = deque()
+        for item in primary:
+            pending.append(pool.submit(load, item))
+            if len(pending) >= 2 * workers:
+                yield pending.popleft().result()
+        while pending:
+            yield pending.popleft().result()
 
 
 def _point_row(point: TrajectoryPoint) -> dict:

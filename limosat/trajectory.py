@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
+from functools import lru_cache
 from datetime import datetime, timezone
 from collections.abc import Callable, Iterator
 from typing import Iterable, Sequence
@@ -826,6 +827,7 @@ def _continuation_key(candidate: _Continuation) -> tuple:
     )
 
 
+@lru_cache(maxsize=65536)
 def _reverse_text(value: str) -> tuple[int, ...]:
     return tuple(-ord(character) for character in value)
 

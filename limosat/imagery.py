@@ -164,6 +164,12 @@ class TargetPixelValidity:
         return inside
 
 
+@lru_cache(maxsize=8)
+def _cached_target_validity(path: str, analysis_epsg: int) -> TargetPixelValidity:
+    """Frames are checked repeatedly as targets and as neighbours' siblings."""
+    return TargetPixelValidity(path, analysis_epsg)
+
+
 # Sibling frames are read only near their catalogue footprint, which traces the
 # raster border approximately; the exact check is always the raster itself.
 _SIBLING_FOOTPRINT_BUFFER_M = 5_000.0
@@ -178,7 +184,7 @@ class PassPixelValidity:
     """
 
     def __init__(self, image, siblings=(), analysis_epsg: int = 3413) -> None:
-        self.target = TargetPixelValidity(image.path, analysis_epsg)
+        self.target = _cached_target_validity(str(image.path), analysis_epsg)
         self.siblings = tuple(siblings)
         self.analysis_epsg = analysis_epsg
 
@@ -197,8 +203,8 @@ class PassPixelValidity:
                 missing = missing[near]
                 if not len(missing):
                     continue
-            valid[missing] = TargetPixelValidity(
-                sibling.path, self.analysis_epsg
+            valid[missing] = _cached_target_validity(
+                str(sibling.path), self.analysis_epsg
             )(xy[missing])
         return valid
 
