@@ -74,6 +74,7 @@ else
     printf 'export LIMOSAT_MINIMUM_PASS_PAIRS=%q\n' "${MINIMUM_PASS_PAIRS:-50}"
     printf 'export LIMOSAT_MINIMUM_GAIN_SHARE=%q\n' "${MINIMUM_GAIN_SHARE:-0.3}"
     printf 'export LIMOSAT_MAXIMUM_PASSES=%q\n' "${MAXIMUM_PASSES:-12}"
+    printf 'export LIMOSAT_STOP_AFTER=%q\n' "${STOP_AFTER:-}"
     printf 'GPU_ACCOUNT=%q\nCPU_ACCOUNT=%q\n' "${GPU_ACCOUNT:-nn2993k}" "${CPU_ACCOUNT:-${GPU_ACCOUNT:-nn2993k}}"
     printf 'MAXIMUM_GPU_TASKS=%q\nPAIRS_PER_GPU_TASK=%q\nPAIRS_PER_GPU_HOUR=%q\n' \
       "${MAXIMUM_GPU_TASKS:-4}" "${PAIRS_PER_GPU_TASK:-4000}" "${PAIRS_PER_GPU_HOUR:-2500}"

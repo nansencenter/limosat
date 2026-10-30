@@ -128,7 +128,8 @@ PY
     run_json "$control/prepare-stage.json" limosat prepare "$LIMOSAT_CONFIG"
     pairs=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["primary_pairs"])' "$control/plan.json")
     gpu=$(submit primary-pairs 0 "" "$pairs")
-    submit primary-compose 0 "$gpu"
+    # STOP_AFTER=primary-pairs matches only, e.g. while composition is being changed; compose later by hand.
+    [[ "${LIMOSAT_STOP_AFTER:-}" == primary-pairs ]] || submit primary-compose 0 "$gpu"
     ;;
   primary-pairs|recovery-pairs)
     nvidia-smi --query-gpu=name,driver_version,memory.total,compute_mode --format=csv,noheader
