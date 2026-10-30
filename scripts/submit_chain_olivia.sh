@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Submit the chained Parquet run on Olivia (see run_limosat_chain_olivia.sbatch).
 #   submit_chain_olivia.sh [--dry-run]   freeze the run environment and submit prepare, which submits the rest
+#   submit_chain_olivia.sh --start-at STAGE   re-freeze an existing run with this checkout (e.g. newer composition
+#       code after STOP_AFTER=primary-pairs) and continue from STAGE; the previous environment is kept beside it
 #   submit_chain_olivia.sh --stage S [--after J] [--pairs N]   (used by running stages) submit one stage, print its ID
 # A GPU stage for N pairs gets ceil(N / PAIRS_PER_GPU_TASK) one-GPU tasks (at most MAXIMUM_GPU_TASKS) and a time
 # limit of twice the expected run time at PAIRS_PER_GPU_HOUR, at least 30 minutes: short requests backfill sooner.
@@ -11,13 +13,15 @@ stage=""
 after=""
 pairs=0
 dry_run=0
+start_at=prepare
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) dry_run=1; shift ;;
     --stage) stage="$2"; shift 2 ;;
     --after) after="$2"; shift 2 ;;
     --pairs) pairs="$2"; shift 2 ;;
-    *) echo "usage: $0 [--dry-run] | --stage STAGE [--after JOB] [--pairs N]" >&2; exit 2 ;;
+    --start-at) start_at="$2"; shift 2 ;;
+    *) echo "usage: $0 [--dry-run] [--start-at STAGE] | --stage STAGE [--after JOB] [--pairs N]" >&2; exit 2 ;;
   esac
 done
 
@@ -49,9 +53,11 @@ else
   environment="$run_root/control/submit.env"
   if [[ "$dry_run" == 1 ]]; then
     environment="$run_root/control/submit.env.dry-run"
-  elif [[ -e "$environment" ]]; then
-    echo "run already submitted: $environment" >&2
+  elif [[ -e "$environment" && "$start_at" == prepare ]]; then
+    echo "run already submitted: $environment (use --start-at to continue it)" >&2
     exit 2
+  elif [[ -e "$environment" ]]; then
+    mv "$environment" "$environment.$(date -u +%Y%m%dT%H%M%SZ)"
   fi
   {
     printf 'export LIMOSAT_METHOD_ROOT=%q\n' "$method_root"
@@ -129,7 +135,7 @@ if [[ -n "$stage" ]]; then
   submit_stage "$stage" "$after"
   exit 0
 fi
-echo "prepare_job=$(submit_stage prepare "")"
+echo "${start_at}_job=$(submit_stage "$start_at" "")"
 if [[ "$dry_run" == 1 ]]; then
   # Shows the GPU request prepare would make for this week's 2,418 primary pairs.
   pairs=2418
