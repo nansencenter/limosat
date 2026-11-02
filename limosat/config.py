@@ -45,8 +45,15 @@ class MatcherConfig:
     # (October 2026, MOSAiC) favoured 10 agreeing matches within 500 m.
     layout_gap_minimum_agreeing_matches: int | None = None
     layout_gap_agreement_distance_m: float | None = None
+    # Scene band 2 values at or above this are invalid pixels. The preprocessed
+    # scenes mark land and everything within ~5 km of it as 2 (and, near the date
+    # line, long strips of sea ice); 3 ignores that land mask, leaving land to
+    # surface.land_raster, which must then be set.
+    scene_mask_invalid_from: int = 2
 
     def __post_init__(self) -> None:
+        if self.scene_mask_invalid_from not in (2, 3):
+            raise ValueError("scene_mask_invalid_from must be 2 or 3")
         _require_positive(
             {
                 "pixel_size_m": self.pixel_size_m,
@@ -353,6 +360,8 @@ class RunConfig:
             )
         if not self.catalogue or not self.database or not self.output_directory:
             raise ValueError("catalogue, database, and output_directory are required")
+        if self.matcher.scene_mask_invalid_from == 3 and not self.surface.land_raster:
+            raise ValueError("ignoring the scene land mask requires surface.land_raster")
         if self.field.missing_node_fallback and not self.retain_pair_matches:
             raise ValueError("missing_node_fallback requires retain_pair_matches")
 
@@ -373,6 +382,7 @@ class RunConfig:
             "tile_sampling",
             "layout_gap_minimum_agreeing_matches",
             "layout_gap_agreement_distance_m",
+            "scene_mask_invalid_from",
         ):
             if getattr(self.matcher, name) == getattr(defaults, name):
                 # Preserve the identity of configurations with one plain tile layout.

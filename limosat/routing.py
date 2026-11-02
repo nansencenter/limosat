@@ -81,8 +81,8 @@ def coarse_phase_translation(
     pixel_size = max(1_000.0, required_extent / 1_024)
     pixels = max(32, min(1_024, int(math.ceil(required_extent / pixel_size / 32) * 32)))
     center = ((minx + maxx) / 2, (miny + maxy) / 2)
-    source, source_valid = north_up_patch(source_path, center, pixels, pixel_size, transform_grid_spacing_px=matcher.transform_grid_spacing_px)
-    target, target_valid = north_up_patch(target_path, center, pixels, pixel_size, transform_grid_spacing_px=matcher.transform_grid_spacing_px)
+    source, source_valid = north_up_patch(source_path, center, pixels, pixel_size, transform_grid_spacing_px=matcher.transform_grid_spacing_px, invalid_from=matcher.scene_mask_invalid_from)
+    target, target_valid = north_up_patch(target_path, center, pixels, pixel_size, transform_grid_spacing_px=matcher.transform_grid_spacing_px, invalid_from=matcher.scene_mask_invalid_from)
     overlap = source_valid & target_valid
     if overlap.sum() < 64:
         raise CoarseTranslationUnavailable(

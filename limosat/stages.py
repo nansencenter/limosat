@@ -341,7 +341,10 @@ class RunStages:
                     self.config.field,
                     self.config.trajectories,
                     target_validity_factory=surface_validity_factory(
-                        pass_pixel_validity_factory(images, self.config.analysis_epsg),
+                        pass_pixel_validity_factory(
+                            images, self.config.analysis_epsg,
+                            self.config.matcher.scene_mask_invalid_from,
+                        ),
                         surface_gate(self.config),
                     ),
                     seed_filter_factory=seed_filter_factory(surface_gate(self.config)),
@@ -360,7 +363,10 @@ class RunStages:
                     images,
                     self.config.field,
                     target_validity_factory=surface_validity_factory(
-                        pass_pixel_validity_factory(images, self.config.analysis_epsg),
+                        pass_pixel_validity_factory(
+                            images, self.config.analysis_epsg,
+                            self.config.matcher.scene_mask_invalid_from,
+                        ),
                         surface_gate(self.config),
                     ),
                 )

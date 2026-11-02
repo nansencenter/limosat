@@ -20,8 +20,13 @@ from shapely.ops import transform
 
 
 @lru_cache(maxsize=4)
-def read_scene(path: str | Path) -> tuple[np.ndarray, np.ndarray | None]:
-    """Read one grayscale image and its optional LiMOSAT invalid-pixel band."""
+def read_scene(
+    path: str | Path, invalid_from: int = 2
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Read one grayscale image and its optional LiMOSAT invalid-pixel band.
+
+    Pixels whose band-2 value is at least ``invalid_from`` are zeroed.
+    """
     with rasterio.open(path) as dataset:
         image = dataset.read(1)
         mask = dataset.read(2).astype(np.uint8) if dataset.count >= 2 else None
@@ -36,7 +41,7 @@ def read_scene(path: str | Path) -> tuple[np.ndarray, np.ndarray | None]:
     else:
         image = image.copy()
     if mask is not None:
-        image[mask >= 2] = 0
+        image[mask >= invalid_from] = 0
     return image, mask
 
 
@@ -93,7 +98,9 @@ atexit.register(scene_transform.cache_clear)
 
 
 @lru_cache(maxsize=2)
-def _valid_integral(path: str, decimation: int) -> tuple[np.ndarray, int, int]:
+def _valid_integral(
+    path: str, decimation: int, invalid_from: int = 2
+) -> tuple[np.ndarray, int, int]:
     from rasterio.enums import Resampling
 
     with rasterio.open(path) as dataset:
@@ -101,7 +108,7 @@ def _valid_integral(path: str, decimation: int) -> tuple[np.ndarray, int, int]:
         if dataset.count >= 2:
             valid = dataset.read(
                 2, out_shape=(height, width), resampling=Resampling.nearest
-            ) < 2
+            ) < invalid_from
         else:
             valid = np.ones((height, width), dtype=bool)
     integral = np.zeros((height + 1, width + 1), dtype=np.int64)
@@ -117,13 +124,14 @@ def valid_share_around(
     pixel_size_m: float,
     analysis_epsg: int = 3413,
     decimation: int = 4,
+    invalid_from: int = 2,
 ) -> np.ndarray:
     """Share of valid pixels in a square window (side ``window_m``) around points.
 
     Computed in raster geometry on a mask decimated by ``decimation``; pixels
     outside the raster count as invalid.
     """
-    integral, height, width = _valid_integral(str(path), decimation)
+    integral, height, width = _valid_integral(str(path), decimation, invalid_from)
     columns, rows = scene_transform(path, analysis_epsg).analysis_to_pixels(
         np.asarray(x_m, dtype=np.float64), np.asarray(y_m, dtype=np.float64)
     )
@@ -140,10 +148,12 @@ def valid_share_around(
 class TargetPixelValidity:
     """Check composed EPSG:3413 endpoints against one target scene's mask."""
 
-    def __init__(self, path: str | Path, analysis_epsg: int = 3413) -> None:
+    def __init__(
+        self, path: str | Path, analysis_epsg: int = 3413, invalid_from: int = 2
+    ) -> None:
         self.transform = scene_transform(path, analysis_epsg)
         with rasterio.open(path) as dataset:
-            self.mask = dataset.read(2) < 2 if dataset.count >= 2 else None
+            self.mask = dataset.read(2) < invalid_from if dataset.count >= 2 else None
 
     def __call__(self, xy_m: np.ndarray) -> np.ndarray:
         xy = np.asarray(xy_m, dtype=np.float64)
@@ -165,13 +175,15 @@ class TargetPixelValidity:
 
 
 @lru_cache(maxsize=64)
-def _cached_target_validity(path: str, analysis_epsg: int) -> TargetPixelValidity:
+def _cached_target_validity(
+    path: str, analysis_epsg: int, invalid_from: int
+) -> TargetPixelValidity:
     """Frames are checked repeatedly as targets and as neighbours' siblings.
 
     Pan-Arctic passes interleave many frames, so eight entries missed most
     lookups; 64 masks of an EW scene (~5k x 5k) hold about 1.7 GB.
     """
-    return TargetPixelValidity(path, analysis_epsg)
+    return TargetPixelValidity(path, analysis_epsg, invalid_from)
 
 
 # Sibling frames are read only near their catalogue footprint, which traces the
@@ -187,8 +199,11 @@ class PassPixelValidity:
     the same pass was imaged at effectively the same time.
     """
 
-    def __init__(self, image, siblings=(), analysis_epsg: int = 3413) -> None:
-        self.target = _cached_target_validity(str(image.path), analysis_epsg)
+    def __init__(
+        self, image, siblings=(), analysis_epsg: int = 3413, invalid_from: int = 2
+    ) -> None:
+        self.target = _cached_target_validity(str(image.path), analysis_epsg, invalid_from)
+        self.invalid_from = invalid_from
         self.siblings = tuple(siblings)
         self.analysis_epsg = analysis_epsg
 
@@ -208,12 +223,12 @@ class PassPixelValidity:
                 if not len(missing):
                     continue
             valid[missing] = _cached_target_validity(
-                str(sibling.path), self.analysis_epsg
+                str(sibling.path), self.analysis_epsg, self.invalid_from
             )(xy[missing])
         return valid
 
 
-def pass_pixel_validity_factory(images, analysis_epsg: int = 3413):
+def pass_pixel_validity_factory(images, analysis_epsg: int = 3413, invalid_from: int = 2):
     """Return ``image -> PassPixelValidity`` using catalogue acquisition passes."""
     passes: dict[tuple[str, int], list] = {}
     for image in images:
@@ -226,7 +241,7 @@ def pass_pixel_validity_factory(images, analysis_epsg: int = 3413):
             for other in passes.get((image.platform, image.absolute_orbit), ())
             if other.image_id != image.image_id
         ]
-        return PassPixelValidity(image, siblings, analysis_epsg)
+        return PassPixelValidity(image, siblings, analysis_epsg, invalid_from)
 
     return factory
 
@@ -253,9 +268,10 @@ def north_up_patch(
     pixel_size_m: float,
     analysis_epsg: int = 3413,
     transform_grid_spacing_px: int = 32,
+    invalid_from: int = 2,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Resample one projected north-up grayscale tile and validity mask."""
-    image, mask = read_scene(path)
+    image, mask = read_scene(path, invalid_from)
     coarse_pixels = math.ceil((pixels - 1) / transform_grid_spacing_px) + 1
     offsets = np.linspace(
         -(pixels - 1) / 2.0 * pixel_size_m,
@@ -295,9 +311,9 @@ def north_up_patch(
             safe_y,
             interpolation=cv2.INTER_NEAREST,
             borderMode=cv2.BORDER_CONSTANT,
-            borderValue=2,
+            borderValue=255,
         )
-        valid &= sampled_mask < 2
+        valid &= sampled_mask < invalid_from
     patch = patch.astype(np.uint8, copy=False)
     patch[~valid] = 0
     return patch, valid
@@ -318,9 +334,11 @@ class ProjectedPatchCache:
         analysis_epsg: int = 3413,
         transform_grid_spacing_px: int = 32,
         block_px: int = 1024,
+        invalid_from: int = 2,
     ) -> None:
         self.analysis_epsg = analysis_epsg
         self.transform_grid_spacing_px = transform_grid_spacing_px
+        self.invalid_from = invalid_from
         self.block_px = block_px
         self._blocks: dict[tuple, tuple[np.ndarray, np.ndarray]] = {}
 
@@ -346,7 +364,7 @@ class ProjectedPatchCache:
         if not self.aligned(center_xy_m, pixels, pixel_size_m):
             return north_up_patch(
                 path, center_xy_m, pixels, pixel_size_m,
-                self.analysis_epsg, self.transform_grid_spacing_px,
+                self.analysis_epsg, self.transform_grid_spacing_px, self.invalid_from,
             )
         column0 = round(center_xy_m[0] / pixel_size_m) - pixels // 2
         row0 = -round(center_xy_m[1] / pixel_size_m) - pixels // 2
@@ -379,7 +397,7 @@ class ProjectedPatchCache:
             )
             self._blocks[key] = north_up_patch(
                 path, center, size, pixel_size_m,
-                self.analysis_epsg, self.transform_grid_spacing_px,
+                self.analysis_epsg, self.transform_grid_spacing_px, self.invalid_from,
             )
         return self._blocks[key]
 

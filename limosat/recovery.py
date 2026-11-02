@@ -627,6 +627,7 @@ def _filter_by_target_validity(config, collected, by_id):
                 target.path, xy[:, 0], xy[:, 1],
                 routing.recovery_target_valid_window_m,
                 config.matcher.pixel_size_m, config.analysis_epsg,
+                invalid_from=config.matcher.scene_mask_invalid_from,
             )
             keep = share >= routing.recovery_minimum_target_valid_fraction
             checked += len(identities)

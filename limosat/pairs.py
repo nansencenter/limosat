@@ -112,7 +112,8 @@ class PairProcessor:
             self.sic_index = SicFileIndex(config.open_water.sic_root)
         self._patch_cache = (
             ProjectedPatchCache(
-                config.analysis_epsg, config.matcher.transform_grid_spacing_px
+                config.analysis_epsg, config.matcher.transform_grid_spacing_px,
+                invalid_from=config.matcher.scene_mask_invalid_from,
             )
             if config.matcher.tile_sampling == "pair_cache"
             else None
@@ -851,6 +852,7 @@ class PairProcessor:
             settings.pixel_size_m,
             self.config.analysis_epsg,
             settings.transform_grid_spacing_px,
+            settings.scene_mask_invalid_from,
         )
 
     def _sample_pair(self, pair: ImagePair, center, shift):

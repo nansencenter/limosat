@@ -111,7 +111,8 @@ def compose_primary_parquet(
             config.trajectories,
             target_validity_factory=surface_validity_factory(
                 pass_pixel_validity_factory(
-                    catalogue.chronological(), config.analysis_epsg
+                    catalogue.chronological(), config.analysis_epsg,
+                    config.matcher.scene_mask_invalid_from,
                 ),
                 surface_gate(config),
             ),
@@ -352,7 +353,8 @@ def compose_recovery_parquet(
             config.field,
             target_validity_factory=surface_validity_factory(
                 pass_pixel_validity_factory(
-                    catalogue.chronological(), config.analysis_epsg
+                    catalogue.chronological(), config.analysis_epsg,
+                    config.matcher.scene_mask_invalid_from,
                 ),
                 surface_gate(config),
             ),

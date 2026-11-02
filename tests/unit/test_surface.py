@@ -87,3 +87,31 @@ def test_asi_reads_netcdf_layout_in_file_crs(tmp_path):
         [500.0, 1500.0, 500.0, 1500.0, 9000.0], [1500.0, 1500.0, 500.0, 500.0, 500.0], datetime(2020, 3, 3)
     )
     assert np.array_equal(sic, [10.0, np.nan, 90.0, np.nan, np.nan], equal_nan=True)
+
+
+def test_scene_land_mask_can_be_left_to_the_land_raster(tmp_path):
+    import rasterio
+    from rasterio.transform import from_origin
+
+    from limosat.imagery import TargetPixelValidity, read_scene
+
+    path = tmp_path / "scene.tif"
+    mask = np.array([[1, 2], [0, 253]], dtype=np.uint8)
+    with rasterio.open(path, "w", driver="GTiff", width=2, height=2, count=2, dtype="uint8",
+                       crs="EPSG:3413", transform=from_origin(0.0, 2000.0, 1000.0, 1000.0)) as out:
+        out.write(np.full((2, 2), 90, dtype=np.uint8), 1)
+        out.write(mask, 2)
+    assert read_scene(path)[0].tolist() == [[90, 0], [90, 0]]
+    assert read_scene(path, 3)[0].tolist() == [[90, 90], [90, 0]]
+    # Pixel coordinates are fractional with the last valid index at width - 1.
+    xy = np.array([[250.0, 1750.0], [1000.0, 1750.0], [250.0, 1000.0], [1000.0, 1000.0]])
+    assert TargetPixelValidity(path).__call__(xy).tolist() == [True, False, True, False]
+    assert TargetPixelValidity(path, invalid_from=3)(xy).tolist() == [True, True, True, False]
+    base = RunConfig("run", "catalogue", "database", "output")
+    assert "scene_mask_invalid_from" not in base.to_dict()["matcher"]
+    from dataclasses import replace
+    with pytest.raises(ValueError):
+        replace(base, matcher=replace(base.matcher, scene_mask_invalid_from=3))
+    with_land = replace(base, surface=SurfaceConfig(land_raster="land.npz"),
+                        matcher=replace(base.matcher, scene_mask_invalid_from=3))
+    assert with_land.to_dict()["matcher"]["scene_mask_invalid_from"] == 3
