@@ -4,7 +4,9 @@
 Writes ``control/catalogue.json`` and ``control/config.json`` under the run root for
 ``submit_chain_olivia.sh``. The configuration is the production one: at most four
 primary pairs per target, loss-targeted continuation passes, the OSI-SAF tile gate,
-and land (OSM inland distance) plus AMSR2 ASI point open-water exclusion.
+and land (OSM inland distance) plus AMSR2 ASI point open-water exclusion. By default
+matching ignores the scenes' band-2 land mask (land comes from the OSM raster) and new
+points are seeded 3 km from existing ones.
 """
 
 import argparse
@@ -85,6 +87,11 @@ def parser():
     result.add_argument("--expected-images", type=int, help="fail unless the window has this many scenes")
     result.add_argument("--maximum-speed-m-per-day", type=float, default=43200.0)
     result.add_argument("--primary-maximum-pairs-per-target", type=int, default=4)
+    result.add_argument(
+        "--scene-mask-invalid-from", type=int, choices=(2, 3), default=3,
+        help="2 keeps the scenes' band-2 land mask, which has false land near the date line",
+    )
+    result.add_argument("--new-point-exclusion-radius-m", type=float, default=3000.0)
     return result
 
 
@@ -128,6 +135,8 @@ def main(argv=None):
     config["database"] = str(run_root / "outputs" / "limosat.sqlite")
     config["output_directory"] = str(run_root / "outputs")
     config["matcher"]["maximum_speed_m_per_day"] = arguments.maximum_speed_m_per_day
+    config["matcher"]["scene_mask_invalid_from"] = arguments.scene_mask_invalid_from
+    config["trajectories"]["new_point_exclusion_radius_m"] = arguments.new_point_exclusion_radius_m
     surface = {
         "land_raster": str(arguments.land_raster),
         "land_minimum_inland_km": 1.0,
