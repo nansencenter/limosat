@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -15,10 +16,23 @@ import numpy as np
 from .catalog import ImagePair
 from .config import RunConfig
 from .models import DisplacementField, MotionMatches, PairResult
+from .pair_identity import (
+    MATCHING_VERSION,
+    SceneChecksums,
+    identity_sha256,
+    matching_identity,
+)
 from .store import file_sha256, implementation_sha256
 
 
-PAIR_PRODUCT_SCHEMA_VERSION = 2
+# Schema 3 identifies a product by its matching fingerprint (pair_identity.py) and the
+# checksums of its scene and SIC files, so any run with the same fingerprint can reuse
+# it. Schema 2 products were tied to the run (ID and full configuration hash) that made
+# them; they still load in that run.
+PAIR_PRODUCT_SCHEMA_VERSION = 3
+LEGACY_PAIR_PRODUCT_SCHEMA_VERSION = 2
+# How long a writer that lost a publication race waits for the winner's marker.
+PUBLICATION_WAIT_SECONDS = 600.0
 
 
 @dataclass(frozen=True)
@@ -31,12 +45,20 @@ class PairProduct:
     sha256: str
     content_sha256: str
     producer_implementation_sha256: str
+    schema_version: int = PAIR_PRODUCT_SCHEMA_VERSION
 
 
 class PairProductStore:
-    """Write pair results once and validate them before every reuse."""
+    """Write pair results once and validate them before every reuse.
 
-    def __init__(self, config: RunConfig) -> None:
+    Primary products live in ``config.pair_store_directory/<matching_sha256>/primary``
+    when a shared store is configured, otherwise in the run's pair-product directory.
+    Recovery products target one run's lost tracks and always stay with the run.
+    """
+
+    def __init__(
+        self, config: RunConfig, scene_checksums: SceneChecksums | None = None
+    ) -> None:
         self.config = config
         self.root = config.pair_products
         self.implementation_sha256 = implementation_sha256()
@@ -46,6 +68,54 @@ class PairProductStore:
             and Path(config.matcher.checkpoint).is_file()
             else None
         )
+        self.scene_checksums = scene_checksums or SceneChecksums(
+            config.scene_checksums or None
+        )
+        self._matching_identity = None
+        self._matching_sha256 = None
+        self._sic_index = None
+
+    @property
+    def matching_identity(self) -> dict:
+        """Settings and input checksums this store's products depend on (computed once,
+        since it reads the model and land raster)."""
+        if self._matching_identity is None:
+            self._matching_identity = matching_identity(self.config)
+            self._matching_sha256 = identity_sha256(self._matching_identity)
+        return self._matching_identity
+
+    @property
+    def matching_sha256(self) -> str:
+        self.matching_identity
+        return self._matching_sha256
+
+    def kind_root(self, kind: str) -> Path:
+        if kind not in {"primary", "recovery"}:
+            raise ValueError("pair kind must be primary or recovery")
+        if kind == "primary" and self.config.pair_store_directory:
+            return Path(self.config.pair_store_directory) / self.matching_sha256 / kind
+        return self.root / kind
+
+    def input_checksums(self, pair: ImagePair) -> dict:
+        """Content checksums of the per-pair inputs: both scenes and their SIC files."""
+        sic = {"source": None, "target": None}
+        if self.config.open_water.enabled:
+            from .tile_gates import SicFileIndex, sic_file_sha256
+
+            if self._sic_index is None:
+                self._sic_index = SicFileIndex(self.config.open_water.sic_root)
+            for role, image in (("source", pair.source), ("target", pair.target)):
+                path = self._sic_index.resolve(
+                    image.time_utc, self.config.open_water.maximum_age_days
+                )
+                sic[role] = None if path is None else sic_file_sha256(path)
+        return {
+            "scene_sha256": {
+                "source": self.scene_checksums.sha256(pair.source),
+                "target": self.scene_checksums.sha256(pair.target),
+            },
+            "sic_sha256": sic,
+        }
 
     def save(
         self,
@@ -54,8 +124,17 @@ class PairProductStore:
         targeted: bool,
         result: PairResult,
         targeted_positions_xy_m: np.ndarray | None = None,
+        *,
+        provenance: dict | None = None,
     ) -> PairProduct:
-        """Atomically publish a pair product without replacing an existing one."""
+        """Atomically publish a pair product without replacing an existing one.
+
+        ``provenance`` overrides the producer fields (run, configuration and code
+        hashes) for a product made elsewhere, e.g. when migrating schema 2 products.
+        """
+        unknown = set(provenance or {}) - _PROVENANCE_FIELDS
+        if unknown:
+            raise ValueError(f"unknown provenance fields: {sorted(unknown)}")
         self._validate_identity(pair, kind, targeted, result)
         positions_sha256 = _positions_sha256(targeted_positions_xy_m)
         if kind == "recovery" and (
@@ -71,14 +150,10 @@ class PairProductStore:
             targeted_positions_xy_m=targeted_positions_xy_m,
         )
         if existing is not None:
-            if (
-                existing.content_sha256 != content_sha256
-                or existing.match_count != len(result.matches)
-            ):
-                raise ValueError(
-                    f"immutable pair product already differs: {pair.pair_id}"
-                )
+            # Products are immutable and first-writer-wins: another worker or run with
+            # the same fingerprint already measured this pair, so its result is kept.
             return existing
+        inputs = self.input_checksums(pair)
 
         data_path, marker_path = self._paths(pair.pair_id, kind)
         data_path.parent.mkdir(parents=True, exist_ok=True)
@@ -91,15 +166,27 @@ class PairProductStore:
                 stream.flush()
                 os.fsync(stream.fileno())
             data_sha256 = _publish_data(
-                temporary, data_path, content_sha256
+                temporary, data_path, marker_path, content_sha256
             )
         finally:
             temporary.unlink(missing_ok=True)
+        if data_sha256 is None:
+            # Another writer published different data first; adopt its product.
+            adopted = self.load(
+                pair, kind, targeted, targeted_positions_xy_m=targeted_positions_xy_m
+            )
+            if adopted is None:  # pragma: no cover - _publish_data waited for it
+                raise RuntimeError(f"pair product was not published: {pair.pair_id}")
+            return adopted
 
         metadata = {
             "pair_product_schema_version": PAIR_PRODUCT_SCHEMA_VERSION,
-            "run_id": self.config.run_id,
-            "config_sha256": self.config.sha256,
+            "matching_version": MATCHING_VERSION,
+            "matching_sha256": self.matching_sha256,
+            "matching_identity": self.matching_identity,
+            **inputs,
+            "producer_run_id": self.config.run_id,
+            "producer_config_sha256": self.config.sha256,
             "implementation_sha256": self.implementation_sha256,
             "model_sha256": self.model_sha256,
             "pair_id": pair.pair_id,
@@ -124,6 +211,7 @@ class PairProductStore:
             "data_sha256": data_sha256,
             "data_size_bytes": data_path.stat().st_size,
         }
+        metadata.update(provenance or {})
         metadata["marker_content_sha256"] = _metadata_sha256(metadata)
         marker_bytes = (
             json.dumps(
@@ -153,13 +241,6 @@ class PairProductStore:
         )
         if product is None:  # pragma: no cover - guarded by publication above
             raise RuntimeError(f"pair product was not published: {pair.pair_id}")
-        if (
-            product.content_sha256 != content_sha256
-            or product.match_count != len(result.matches)
-        ):
-            raise ValueError(
-                f"immutable pair product already differs: {pair.pair_id}"
-            )
         return product
 
     def has_product(self, pair_id: str, kind: str) -> bool:
@@ -177,9 +258,12 @@ class PairProductStore:
     ) -> PairProduct | None:
         """Load a completed pair product, or ``None`` without a marker.
 
-        Pair workers require an exact implementation match when resuming their
-        own output.  Downstream readers may accept a different implementation
-        while retaining the producer hash in their own manifest.
+        Schema 3 products are accepted by any run with the same matching fingerprint
+        and identical scene and SIC files; ``MATCHING_VERSION`` decides when code
+        changes invalidate them. Schema 2 products load only in the run that made
+        them, and there pair workers require an exact implementation match when
+        resuming their own output, while downstream readers may accept a different
+        implementation and record the producer hash in their own manifest.
         """
         data_path, marker_path = self._paths(pair.pair_id, kind)
         if not marker_path.exists():
@@ -206,11 +290,26 @@ class PairProductStore:
             raise ValueError(
                 f"pair product producer hash is invalid: {pair.pair_id}"
             )
-        expected = {
-            "pair_product_schema_version": PAIR_PRODUCT_SCHEMA_VERSION,
-            "run_id": self.config.run_id,
-            "config_sha256": self.config.sha256,
-            "model_sha256": self.model_sha256,
+        schema = metadata.get("pair_product_schema_version")
+        if schema == LEGACY_PAIR_PRODUCT_SCHEMA_VERSION:
+            expected = {
+                "run_id": self.config.run_id,
+                "config_sha256": self.config.sha256,
+                "model_sha256": self.model_sha256,
+            }
+            if require_current_implementation:
+                expected["implementation_sha256"] = self.implementation_sha256
+        elif schema == PAIR_PRODUCT_SCHEMA_VERSION:
+            expected = {
+                "matching_version": MATCHING_VERSION,
+                "matching_sha256": self.matching_sha256,
+                **self.input_checksums(pair),
+            }
+        else:
+            raise ValueError(
+                f"unsupported pair product schema {schema!r}: {pair.pair_id}"
+            )
+        expected.update({
             "pair_id": pair.pair_id,
             "kind": kind,
             "targeted": bool(targeted),
@@ -222,9 +321,7 @@ class PairProductStore:
             "targeted_positions_sha256": _positions_sha256(
                 targeted_positions_xy_m
             ),
-        }
-        if require_current_implementation:
-            expected["implementation_sha256"] = self.implementation_sha256
+        })
         changed = [
             name for name, value in expected.items() if metadata.get(name) != value
         ]
@@ -252,7 +349,10 @@ class PairProductStore:
         if match_count < 0:
             raise ValueError(f"pair match count is negative: {pair.pair_id}")
         matches_included = metadata.get("matches_included")
-        if matches_included is not self.config.retain_pair_matches:
+        if not isinstance(matches_included, bool) or (
+            self.config.retain_pair_matches and not matches_included
+        ):
+            # A product with retained matches also serves runs that do not keep them.
             raise ValueError(f"pair match retention changed: {pair.pair_id}")
         if matches_included and len(result.matches) != match_count:
             raise ValueError(f"pair match count changed: {pair.pair_id}")
@@ -267,12 +367,13 @@ class PairProductStore:
             data_sha256,
             content_sha256,
             producer_implementation_sha256,
+            schema,
         )
 
     def count(self, kind: str) -> int:
-        if kind not in {"primary", "recovery"}:
-            raise ValueError("pair kind must be primary or recovery")
-        directory = self.root / kind
+        """Completed products of this kind in the store (a shared store also holds
+        other runs' pairs)."""
+        directory = self.kind_root(kind)
         return (
             sum(1 for _path in directory.glob("*.json"))
             if directory.is_dir()
@@ -280,10 +381,8 @@ class PairProductStore:
         )
 
     def _paths(self, pair_id: str, kind: str) -> tuple[Path, Path]:
-        if kind not in {"primary", "recovery"}:
-            raise ValueError("pair kind must be primary or recovery")
         identity = hashlib.sha256(pair_id.encode("utf-8")).hexdigest()
-        base = self.root / kind / identity
+        base = self.kind_root(kind) / identity
         return base.with_suffix(".npz"), base.with_suffix(".json")
 
     @staticmethod
@@ -306,6 +405,11 @@ class PairProductStore:
             or field.target_time_utc != pair.target.time_utc
         ):
             raise ValueError("pair product field identity differs from its image pair")
+
+
+_PROVENANCE_FIELDS = {
+    "producer_run_id", "producer_config_sha256", "implementation_sha256", "migrated_from",
+}
 
 
 def _arrays(result: PairResult, include_matches: bool) -> dict[str, np.ndarray]:
@@ -436,15 +540,30 @@ def _content_sha256(arrays: dict[str, np.ndarray]) -> str:
 def _publish_data(
     temporary: Path,
     destination: Path,
+    marker: Path,
     content_sha256: str,
-) -> str:
+) -> str | None:
+    """Publish data atomically; ``None`` when another writer's product wins.
+
+    Matching is not bit-reproducible on GPUs, so two writers of one pair (two batch
+    tasks, or two runs sharing a store) may produce different data. The first data
+    file published wins; a later writer waits for the winner's marker and adopts it.
+    """
     try:
         os.link(temporary, destination)
     except FileExistsError:
         with np.load(destination, allow_pickle=False) as values:
             arrays = {name: _array(values, name) for name in _ARRAY_NAMES}
-        if _content_sha256(arrays) != content_sha256:
-            raise ValueError(f"immutable pair product already differs: {destination}")
+        if _content_sha256(arrays) == content_sha256:
+            return file_sha256(destination)
+        deadline = time.monotonic() + PUBLICATION_WAIT_SECONDS
+        while not marker.exists():
+            if time.monotonic() > deadline:
+                raise ValueError(
+                    f"pair product data differs and its marker never appeared: {destination}"
+                )
+            time.sleep(5.0)
+        return None
     return file_sha256(destination)
 
 

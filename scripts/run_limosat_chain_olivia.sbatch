@@ -70,6 +70,7 @@ run_in_container() {
   # Inputs (scenes, OSI-SAF, AMSR2 ASI, land raster) are bound read-only from a colon-separated list.
   IFS=: read -r -a data_binds <<< "$LIMOSAT_DATA_BINDS"
   for path in "${data_binds[@]}"; do options+=(--bind "$path:$path:ro"); done
+  [[ -z "${LIMOSAT_PAIR_STORE:-}" ]] || options+=(--bind "$LIMOSAT_PAIR_STORE:$LIMOSAT_PAIR_STORE")
   env -u APPTAINER_BIND -u APPTAINER_BINDPATH -u SINGULARITY_BIND -u SINGULARITY_BINDPATH \
     apptainer "${options[@]}" \
     --overlay "$LIMOSAT_OVERLAY:ro" \

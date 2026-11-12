@@ -195,7 +195,7 @@ def test_sequence_recovers_measured_loss_and_resumes_with_versioned_manifest(tmp
     assert len(manifest["implementation_sha256"]) == 64
     assert manifest["product_schemas"]["lagrangian_trajectory"] == 5
     assert manifest["product_schemas"]["pair_match_archive"] == 1
-    assert manifest["product_schemas"]["pair_worker_product"] == 2
+    assert manifest["product_schemas"]["pair_worker_product"] == 3
     assert manifest["coordinates"]["crs"] == "EPSG:3413"
     assert manifest["product_counts"]["trajectories"] == 4
     assert manifest["product_counts"]["candidate_pairs"] == 3

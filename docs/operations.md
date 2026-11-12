@@ -248,9 +248,45 @@ numeric radius is not reused because its coordinate semantics were ambiguous.
 The run begins with `limosat prepare`, which freezes the catalogue and
 candidate image-pair plan in SQLite. Pair workers then write atomic NPZ data
 and JSON completion markers under `pair_product_directory`. A completion
-marker binds the product to the run, configuration, source implementation,
-checkpoint, image-pair identity, and—for recovery—the exact measured source
-positions. Existing completed products are verified and never overwritten.
+marker binds the product to its matching fingerprint, the image-pair identity,
+the checksums of both scene files and their OSI SAF SIC files, and—for
+recovery—the exact measured source positions. Existing completed products are
+verified and never overwritten; when two writers race on one pair, the first
+published product wins and the other adopts it.
+
+### Sharing pair products between runs
+
+A pair product does not depend on the run that made it, only on what changes
+matching: the matching settings, the model checkpoint and EfficientLoFTR source,
+the land raster, the two scene files and their SIC files, and the matching code.
+`limosat/pair_identity.py` hashes exactly these (file contents, never paths) into
+the matching fingerprint. Every configuration field is classified there as
+matching or excluded, and a unit test fails when a new field is left
+unclassified. Run IDs, paths, pair selection and all composition settings (for
+example the re-seeding radius) are excluded, so changing them never invalidates
+matched pairs.
+
+Set `pair_store_directory` to share primary products: they are then stored under
+`<pair_store_directory>/<matching fingerprint>/primary/` and any run with the
+same fingerprint reuses them, on any cluster, provided its scene files are
+byte-identical. Recovery products target one run's lost tracks and stay in the
+run's `pair_product_directory`. `scene_checksums` names a file of scene SHA256
+values that `limosat prepare` writes once (in parallel); without it, checksums
+are computed when first needed.
+
+Code changes invalidate stored products only through `MATCHING_VERSION` in
+`limosat/pair_identity.py`. A unit test records a digest of the matching modules;
+when it fails, bump `MATCHING_VERSION` if the change alters matching output and
+record the new digest either way. The producer code hash stays in each marker as
+provenance. Products written before schema 3 (`pair_product_schema_version` 2)
+remain readable only in the run that made them;
+`scripts/migrate_pair_products.py` verifies them and republishes them into a
+shared store.
+
+On Olivia the store lives under `/cluster/work`, which Slurm jobs can write, and
+is archived to NIRD (`/nird/datapeak/NS2993K/seachu/eloftr-pair-store`) with
+`scripts/sync_pair_store_nird.sh archive`, run on the svc01 transfer node; `restore`
+copies it back after a work-area cleanup.
 
 `limosat compose` is the only pair-product SQLite writer. It checksum-verifies
 and imports every expected worker product before streaming per-image
@@ -286,7 +322,8 @@ report is sufficient.
 
 For a controlled restart under a changed configuration, choose a new `run_id`
 and database/output path. Reusing a `run_id` with a different resolved config is
-rejected.
+rejected. With a shared pair store, the new run reuses every pair whose matching
+fingerprint is unchanged.
 
 After successful finalization and transfer of any required assessment
 products, the pair-product directory can be removed to reclaim duplicated work

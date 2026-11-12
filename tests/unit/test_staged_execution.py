@@ -158,13 +158,18 @@ def test_pair_product_round_trip_is_checked_and_immutable(tmp_path):
     recovered = products.save(pair, "primary", False, expected)
     assert recovered.sha256 == saved.sha256
 
-    with pytest.raises(ValueError, match="already differs"):
-        products.save(
-            pair,
-            "primary",
-            False,
-            result(pair, available=False),
-        )
+    # First writer wins: a later, different result for the same pair keeps the stored one.
+    adopted = products.save(pair, "primary", False, result(pair, available=False))
+    assert adopted.content_sha256 == saved.content_sha256
+
+    # Different data without a marker means another writer is mid-publication; a writer
+    # that loses the race waits for that marker and fails if it never appears.
+    marker.unlink()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("limosat.pair_products.PUBLICATION_WAIT_SECONDS", 0.0)
+        with pytest.raises(ValueError, match="marker never appeared"):
+            products.save(pair, "primary", False, result(pair, available=False))
+    products.save(pair, "primary", False, expected)
 
     metadata = json.loads(marker.read_text())
     metadata["field_sha256"] = "f" * 64
@@ -173,7 +178,7 @@ def test_pair_product_round_trip_is_checked_and_immutable(tmp_path):
         products.load(pair, "primary", False)
 
 
-def test_downstream_pair_reader_retains_a_different_producer_hash(tmp_path):
+def test_pair_products_outlive_code_changes_until_the_matching_version_changes(tmp_path):
     cfg = config(tmp_path)
     pair = catalogue(tmp_path).adjacent_pairs("component")[0]
     products = PairProductStore(cfg)
@@ -181,18 +186,47 @@ def test_downstream_pair_reader_retains_a_different_producer_hash(tmp_path):
     producer_hash = saved.producer_implementation_sha256
 
     products.implementation_sha256 = "f" * 64
-    with pytest.raises(ValueError, match="implementation_sha256"):
-        products.load(pair, "primary", False)
-
-    loaded = products.load(
-        pair,
-        "primary",
-        False,
-        require_current_implementation=False,
-    )
+    loaded = products.load(pair, "primary", False)
     assert loaded is not None
     assert loaded.producer_implementation_sha256 == producer_hash
     assert loaded.result.field.checksum == saved.result.field.checksum
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("limosat.pair_products.MATCHING_VERSION", 2)
+        with pytest.raises(ValueError, match="matching_version"):
+            products.load(pair, "primary", False)
+
+
+def test_legacy_pair_products_load_only_in_their_own_run(tmp_path):
+    cfg = config(tmp_path)
+    pair = catalogue(tmp_path).adjacent_pairs("component")[0]
+    products = PairProductStore(cfg)
+    saved = products.save(pair, "primary", False, result(pair))
+    marker = saved.path.with_suffix(".json")
+    metadata = json.loads(marker.read_text())
+    for name in ("matching_version", "matching_sha256", "matching_identity", "scene_sha256",
+                 "sic_sha256", "producer_run_id", "producer_config_sha256", "marker_content_sha256"):
+        metadata.pop(name)
+    metadata.update(pair_product_schema_version=2, run_id=cfg.run_id, config_sha256=cfg.sha256)
+    metadata["marker_content_sha256"] = _marker_sha256(metadata)
+    marker.write_text(json.dumps(metadata))
+
+    loaded = products.load(pair, "primary", False)
+    assert loaded is not None and loaded.schema_version == 2
+    products.implementation_sha256 = "f" * 64
+    with pytest.raises(ValueError, match="implementation_sha256"):
+        products.load(pair, "primary", False)
+    assert products.load(pair, "primary", False, require_current_implementation=False)
+    other = PairProductStore(replace(cfg, run_id="another-run"))
+    with pytest.raises(ValueError, match="run_id"):
+        other.load(pair, "primary", False)
+
+
+def _marker_sha256(metadata):
+    import hashlib
+
+    encoded = json.dumps(metadata, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def test_recovery_product_is_bound_to_measured_source_positions(tmp_path):

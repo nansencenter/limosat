@@ -49,6 +49,9 @@ else
   done
   [[ -z "$(git -C "$method_root" status --porcelain)" ]] || { echo "LiMOSAT checkout is dirty" >&2; exit 2; }
   [[ -z "$(git -C "$official_repository" status --porcelain)" ]] || { echo "EfficientLoFTR checkout is dirty" >&2; exit 2; }
+  # A shared pair store (config pair_store_directory) is bound read-write into every stage.
+  pair_store="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("pair_store_directory", ""))' "$config")"
+  [[ -z "$pair_store" ]] || mkdir -p "$pair_store"
   mkdir -p "$run_root/logs"
   environment="$run_root/control/submit.env"
   if [[ "$dry_run" == 1 ]]; then
@@ -66,6 +69,7 @@ else
     printf 'export LIMOSAT_RUN_ROOT=%q\n' "$run_root"
     printf 'export LIMOSAT_CONFIG=%q\n' "$config"
     printf 'export LIMOSAT_CONFIG_SHA256=%q\n' "$(sha256sum "$config" | awk '{print $1}')"
+    printf 'export LIMOSAT_PAIR_STORE=%q\n' "$pair_store"
     printf 'export LIMOSAT_CATALOGUE=%q\n' "$catalogue"
     printf 'export LIMOSAT_CATALOGUE_SHA256=%q\n' "$(sha256sum "$catalogue" | awk '{print $1}')"
     printf 'export LIMOSAT_DATA_BINDS=%q\n' "$data_binds"

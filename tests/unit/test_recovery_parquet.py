@@ -115,6 +115,9 @@ def test_saved_recovery_pair_fills_absent_row_then_primary_continues(tmp_path):
     from test_staged_execution import GRID, config, result
 
     cfg = config(tmp_path)
+    for name in ("a", "b", "c", "d"):
+        # Pair products record each scene file's checksum.
+        (tmp_path / f"{name}.tif").write_bytes(name.encode("ascii"))
     images = tuple(
         ImageRecord(name, tmp_path / f"{name}.tif", START + timedelta(days=step))
         for step, name in enumerate(("a", "b", "c", "d"))

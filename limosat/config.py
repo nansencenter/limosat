@@ -345,6 +345,13 @@ class RunConfig:
     )
     retain_pair_matches: bool = True
     surface: SurfaceConfig = dataclass_field(default_factory=SurfaceConfig)
+    # Shared store for primary pair products, keyed by matching fingerprint
+    # (pair_identity.py) so runs with the same matching settings reuse each other's
+    # pairs. Empty keeps them in pair_product_directory.
+    pair_store_directory: str = ""
+    # Scene SHA256 file written by `limosat prepare` (see pair_identity.SceneChecksums);
+    # empty computes checksums when first needed.
+    scene_checksums: str = ""
 
     def __post_init__(self) -> None:
         if not self.run_id.strip():
@@ -373,6 +380,10 @@ class RunConfig:
         if not self.field.missing_node_fallback:
             # Preserve the identity of existing configurations with fallback off.
             values["field"].pop("missing_node_fallback")
+        for name in ("pair_store_directory", "scene_checksums"):
+            if not values[name]:
+                # Locations only; preserve the identity of configurations without them.
+                values.pop(name)
         defaults = MatcherConfig()
         for name in (
             "tile_grid_offsets",
@@ -442,6 +453,8 @@ def load_config(path: str | Path) -> RunConfig:
         "database",
         "output_directory",
         "pair_product_directory",
+        "pair_store_directory",
+        "scene_checksums",
     ):
         if resolved.get(name):
             resolved[name] = str(_resolve_path(base, resolved[name]))

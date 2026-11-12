@@ -13,12 +13,14 @@ archive must use that archive's frozen configuration, not current defaults.
 limosat compose-parquet CONFIG OUTPUT_DIRECTORY
 ```
 
-The input pair-product count must exactly match the deterministic primary plan.
-Every marker, NPZ file, array-content checksum, field checksum, configuration,
-model, and pair identity is verified. The producer implementation hash is
-retained as provenance but does not have to equal the downstream consumer code
-hash. This allows composition and publication code to evolve without
-invalidating completed GPU measurements.
+Every pair of the deterministic primary plan must have a product; a shared pair
+store may hold other runs' pairs as well, which are ignored. Every marker, NPZ
+file, array-content checksum, field checksum, matching fingerprint, scene and SIC
+checksum, and pair identity is verified. The producer implementation hashes are
+retained as provenance but do not have to equal the downstream consumer code
+hash, and products from several producer versions may be composed together when
+they share one matching fingerprint. This allows composition and publication code
+to evolve without invalidating completed GPU measurements.
 
 The command writes these files atomically:
 

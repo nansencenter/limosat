@@ -22,6 +22,7 @@ from .imagery import pass_pixel_validity_factory
 from .surface import seed_filter_factory, surface_gate, surface_validity_factory
 from .manifest import write_manifest
 from .models import FieldEdge
+from .pair_identity import write_scene_checksums
 from .pair_products import PAIR_PRODUCT_SCHEMA_VERSION, PairProductStore
 from .pair_queue import loss_targeted_pairs
 from .pairs import PairProcessor
@@ -86,7 +87,13 @@ class RunStages:
         store.register_candidate_pairs(plan.pairs)
         store.register_planning_counts(plan.exclusion_counts)
         store.start_run()
+        checksums = (
+            write_scene_checksums(self.catalogue.records, self.config.scene_checksums)
+            if self.config.scene_checksums
+            else None
+        )
         return {
+            "scene_checksums": checksums,
             "catalogue_images": len(self.catalogue.records),
             "candidate_pairs": len(plan.pairs),
             "primary_pairs": sum(

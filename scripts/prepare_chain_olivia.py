@@ -6,7 +6,8 @@ Writes ``control/catalogue.json`` and ``control/config.json`` under the run root
 primary pairs per target, loss-targeted continuation passes, the OSI-SAF tile gate,
 and land (OSM inland distance) plus AMSR2 ASI point open-water exclusion. By default
 matching ignores the scenes' band-2 land mask (land comes from the OSM raster) and new
-points are seeded 3 km from existing ones.
+points are seeded 3 km from existing ones. Primary pair products go to a shared store
+keyed by matching fingerprint, so runs with the same matching settings reuse them.
 """
 
 import argparse
@@ -92,6 +93,13 @@ def parser():
         help="2 keeps the scenes' band-2 land mask, which has false land near the date line",
     )
     result.add_argument("--new-point-exclusion-radius-m", type=float, default=3000.0)
+    result.add_argument(
+        "--pair-store", type=Path, default=work_root / "eloftr-pair-store",
+        help="shared primary pair-product store (keyed by matching fingerprint); "
+        "archived to NIRD with scripts/sync_pair_store_nird.sh",
+    )
+    result.add_argument("--no-pair-store", action="store_true",
+                        help="keep primary pair products inside the run")
     return result
 
 
@@ -137,6 +145,10 @@ def main(argv=None):
     config["matcher"]["maximum_speed_m_per_day"] = arguments.maximum_speed_m_per_day
     config["matcher"]["scene_mask_invalid_from"] = arguments.scene_mask_invalid_from
     config["trajectories"]["new_point_exclusion_radius_m"] = arguments.new_point_exclusion_radius_m
+    if not arguments.no_pair_store:
+        config["pair_store_directory"] = str(arguments.pair_store)
+    # Written by the prepare stage; pair products record and check scene checksums.
+    config["scene_checksums"] = str(run_root / "control" / "scene-checksums.json")
     surface = {
         "land_raster": str(arguments.land_raster),
         "land_minimum_inland_km": 1.0,

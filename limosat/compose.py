@@ -65,31 +65,26 @@ def compose_primary_parquet(
     catalogue = load_catalogue(config.catalogue, config.analysis_epsg)
     plan = run_plan(config, catalogue)
     primary = tuple(item for item in plan.pairs if item.selection == "primary")
+    # A shared store may hold other runs' pairs too; every planned pair must load
+    # (a missing one raises below), extra ones are ignored.
     products = PairProductStore(config)
-    if products.count("primary") != len(primary):
-        raise RuntimeError(
-            "primary pair-product count differs from the frozen plan: "
-            f"{products.count('primary')} != {len(primary)}"
-        )
 
     edges: list[FieldEdge] = []
     producer_hashes: set[str] = set()
+    schemas: set[int] = set()
     product_set = hashlib.sha256()
     for item, product in zip(primary, _load_primary_products(products, primary)):
         if product is None:
             raise RuntimeError(f"primary pair product is missing: {item.pair.pair_id}")
         producer_hashes.add(product.producer_implementation_sha256)
+        schemas.add(product.schema_version)
         product_set.update(item.pair.pair_id.encode("utf-8"))
         product_set.update(product.sha256.encode("ascii"))
         product_set.update(product.content_sha256.encode("ascii"))
         edges.append(field_edge_with_fallback(
             product.result.field, product.result.matches, config.field
         ))
-    if len(producer_hashes) != 1:
-        raise ValueError(
-            "primary pair products have multiple producer implementations: "
-            f"{sorted(producer_hashes)}"
-        )
+    _check_producers(producer_hashes, schemas)
 
     point_schema = _point_schema(pa, config)
     extension_schema = _extension_schema(pa, config, qc)
@@ -162,7 +157,15 @@ def compose_primary_parquet(
         "gap_rows": "derived",
         "run_id": config.run_id,
         "config_sha256": config.sha256,
-        "producer_implementation_sha256": next(iter(producer_hashes)),
+        "producer_implementation_sha256": (
+            next(iter(producer_hashes)) if len(producer_hashes) == 1 else None
+        ),
+        "producer_implementation_sha256s": sorted(producer_hashes),
+        "matching_sha256": (
+            products.matching_sha256
+            if schemas == {PAIR_PRODUCT_SCHEMA_VERSION}
+            else None
+        ),
         "consumer_implementation_note": (
             "consumer code may differ; every pair-product checksum was verified"
         ),
@@ -272,6 +275,7 @@ def compose_recovery_parquet(
     primary_edges = []
     recovery_edges = []
     primary_producers: set[str] = set()
+    primary_schemas: set[int] = set()
     recovery_producers: set[str] = set()
     recovery_product_set = hashlib.sha256()
     target_set = hashlib.sha256()
@@ -279,9 +283,11 @@ def compose_recovery_parquet(
         if product is None:
             raise RuntimeError(f"primary pair product is missing: {item.pair.pair_id}")
         primary_producers.add(product.producer_implementation_sha256)
+        primary_schemas.add(product.schema_version)
         primary_edges.append(field_edge_with_fallback(
             product.result.field, product.result.matches, config.field
         ))
+    _check_producers(primary_producers, primary_schemas)
     target_records = {record["pair_id"]: record for record in target_manifest["pairs"]}
     for item in targeted:
         positions = target_store.load(item.pair)
@@ -409,10 +415,14 @@ def compose_recovery_parquet(
         "primary_composition_manifest_sha256": file_sha256(primary_manifest_path),
         "recovery_target_manifest": str(target_manifest_path),
         "recovery_target_manifest_sha256": file_sha256(target_manifest_path),
-        "primary_producer_implementation_sha256": next(iter(primary_producers)),
-        "recovery_producer_implementation_sha256": (
-            next(iter(recovery_producers)) if recovery_producers else None
+        "primary_producer_implementation_sha256": (
+            next(iter(primary_producers)) if len(primary_producers) == 1 else None
         ),
+        "primary_producer_implementation_sha256s": sorted(primary_producers),
+        "recovery_producer_implementation_sha256": (
+            next(iter(recovery_producers)) if len(recovery_producers) == 1 else None
+        ),
+        "recovery_producer_implementation_sha256s": sorted(recovery_producers),
         "targeted_recovery_pair_products": len(targeted),
         "recovery_pair_product_set_sha256": recovery_product_set.hexdigest(),
         "qc": asdict(qc),
@@ -443,6 +453,17 @@ def compose_recovery_parquet(
         "trajectory_augmentation_extensions": str(extensions_path),
         "counts": manifest["counts"],
     }
+
+
+def _check_producers(producer_hashes: set[str], schemas: set[int]) -> None:
+    """Products from several code versions may be composed together only when their
+    shared matching fingerprint vouches for them (schema 3); legacy products must all
+    come from one implementation."""
+    if len(producer_hashes) > 1 and schemas != {PAIR_PRODUCT_SCHEMA_VERSION}:
+        raise ValueError(
+            "primary pair products have multiple producer implementations: "
+            f"{sorted(producer_hashes)}"
+        )
 
 
 def _load_primary_products(products: PairProductStore, primary, workers: int = 8):
