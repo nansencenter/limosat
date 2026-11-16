@@ -136,14 +136,57 @@ class FieldConfig:
     # Off by default since October 2026: at MOSAiC and Beaufort buoys the points it
     # adds were 2-3x less accurate than measured nodes at the same lags.
     missing_node_fallback: bool = False
+    # Composition-time gap filling, used only where a point has no usable triangle
+    # (off by default; field.py fill_gaps). Rigid: accept a triangle of accepted
+    # nodes with edges up to gap_fill_rigid_edge_m when its node displacements
+    # differ by at most gap_fill_rigid_spread_m. Point-local: estimate the point's
+    # own motion from the raw matches around it (needs retained matches). Neither
+    # changes a pair product, so neither is in the matching fingerprint. Tested on
+    # the January 2020 week and MOSAiC Jan-Apr 2020 (November 2026) with 12800 m /
+    # 300 m and 12 matches within 3 km, 8 agreeing within 500 m.
+    gap_fill_rigid_edge_m: float | None = None
+    gap_fill_rigid_spread_m: float = 300.0
+    gap_fill_point_neighbour_count: int | None = None
+    gap_fill_point_minimum_agreeing_matches: int = 8
+    gap_fill_point_neighbour_distance_m: float = 3_000.0
+    gap_fill_point_agreement_distance_m: float = 500.0
 
     def __post_init__(self) -> None:
-        _require_positive({key: value for key, value in asdict(self).items()
-                           if key != "missing_node_fallback"})
+        _require_positive({
+            key: value for key, value in asdict(self).items()
+            if key != "missing_node_fallback" and value is not None
+        })
         if not isinstance(self.missing_node_fallback, bool):
             raise ValueError("missing_node_fallback must be a boolean")
         if self.minimum_agreeing_matches > self.neighbour_count:
             raise ValueError("minimum_agreeing_matches exceeds neighbour_count")
+        if (
+            self.gap_fill_rigid_edge_m is not None
+            and self.gap_fill_rigid_edge_m <= self.maximum_triangle_edge_m
+        ):
+            raise ValueError("gap_fill_rigid_edge_m must exceed maximum_triangle_edge_m")
+        if self.gap_fill_point_neighbour_count is not None and (
+            isinstance(self.gap_fill_point_neighbour_count, bool)
+            or not isinstance(self.gap_fill_point_neighbour_count, int)
+            or self.gap_fill_point_minimum_agreeing_matches
+            > self.gap_fill_point_neighbour_count
+        ):
+            raise ValueError(
+                "gap_fill_point_neighbour_count must be an integer of at least "
+                "gap_fill_point_minimum_agreeing_matches"
+            )
+
+    @property
+    def gap_filling(self) -> bool:
+        return (
+            self.gap_fill_rigid_edge_m is not None
+            or self.gap_fill_point_neighbour_count is not None
+        )
+
+
+GAP_FILL_SETTINGS = tuple(
+    item.name for item in fields(FieldConfig) if item.name.startswith("gap_fill_")
+)
 
 
 @dataclass(frozen=True)
@@ -369,6 +412,8 @@ class RunConfig:
             raise ValueError("catalogue, database, and output_directory are required")
         if self.matcher.scene_mask_invalid_from == 3 and not self.surface.land_raster:
             raise ValueError("ignoring the scene land mask requires surface.land_raster")
+        if self.field.gap_fill_point_neighbour_count is not None and not self.retain_pair_matches:
+            raise ValueError("point-local gap filling requires retain_pair_matches")
         if self.field.missing_node_fallback and not self.retain_pair_matches:
             raise ValueError("missing_node_fallback requires retain_pair_matches")
 
@@ -380,6 +425,10 @@ class RunConfig:
         if not self.field.missing_node_fallback:
             # Preserve the identity of existing configurations with fallback off.
             values["field"].pop("missing_node_fallback")
+        if not self.field.gap_filling:
+            # Preserve the identity of existing configurations without gap filling.
+            for name in GAP_FILL_SETTINGS:
+                values["field"].pop(name)
         for name in ("pair_store_directory", "scene_checksums"):
             if not values[name]:
                 # Locations only; preserve the identity of configurations without them.
@@ -465,7 +514,7 @@ def load_config(path: str | Path) -> RunConfig:
     resolved["matcher"] = _construct(MatcherConfig, matcher_values)
     field_values = dict(resolved.get("field", {}))
     legacy_field_keys = {item.name for item in fields(FieldConfig)} - {
-        "missing_node_fallback"
+        "missing_node_fallback", *GAP_FILL_SETTINGS
     }
     if ("missing_node_fallback" not in field_values
             and legacy_field_keys <= field_values.keys()):

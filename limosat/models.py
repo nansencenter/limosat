@@ -154,6 +154,8 @@ class FieldEdge:
     skipped_images: int = 0
     eligible_trajectory_ids: frozenset[str] | None = None
     fallback_field: DisplacementField | None = None
+    # Raw matches near the field's gaps, kept for point-local gap filling only.
+    gap_matches: MotionMatches | None = None
 
     def __post_init__(self) -> None:
         if self.pair_kind not in {"primary", "recovery"}:

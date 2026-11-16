@@ -314,6 +314,21 @@ so field variants can be recomputed later. The missing-node fallback
 (January–April 2020) the points it adds had median errors of 64–159 m, against
 28–52 m for measured nodes at the same lags. Enabling it requires retained matches.
 
+Gap filling (`field.gap_fill_*`, off by default) acts during composition only,
+where a point has no usable triangle: first a rigid triangle of accepted nodes up
+to `gap_fill_rigid_edge_m` apart whose displacements differ by at most
+`gap_fill_rigid_spread_m`, then the point's own raw matches under the node rule
+with the `gap_fill_point_*` settings (point-local consensus, which needs retained
+matches). Existing links are never changed, and neither setting is in the
+matching fingerprint, so it can be switched on without rematching. With 12.8 km /
+300 m and 12 matches within 3 km, 8 agreeing within 500 m (November 2026): on the
+January 2020 test week lost tracks fell 5.9% and 6-day persistence rose from
+61.1% to 63.1%; over MOSAiC January–April 2020 lost tracks fell 13%; at MOSAiC
+buoys the added samples had median errors of 56–61 m against 47–51 m for
+ordinary samples (p90 180–245 m), and against ORB on shared image pairs 0.19
+against 0.13 km/day. Composition keeps only the raw matches near field gaps
+(`field.gap_matches`); the test-week primary compose took 975 s against 740 s.
+
 Once `limosat status` reports `complete`, run `limosat finalize CONFIG` to
 write the compact global trajectory Parquet catalogue and a checksummed
 assessment summary. This command does not alter scientific rows. Use

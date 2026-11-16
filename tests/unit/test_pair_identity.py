@@ -35,7 +35,7 @@ MATCHING_MODULES = (
     "efficientloftr.py", "field.py", "imagery.py", "models.py", "pairs.py",
     "routing.py", "surface.py", "tile_gates.py",
 )
-MATCHING_MODULES_SHA256 = "eae7d72f9379f4650c672e2d7c92d5fa0a19fa31a1be823e42a22f05f4248610"
+MATCHING_MODULES_SHA256 = "581573616280fc0c3b39407ce590f792a6c166f1741a5097477bd5c7af8ad4c4"
 
 
 def test_every_configuration_setting_is_classified_for_pair_identity():

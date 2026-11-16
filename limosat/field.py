@@ -158,7 +158,51 @@ def field_edge_with_fallback(
     return FieldEdge(
         baseline,
         fallback_field=fallback if fallback is not baseline else None,
+        gap_matches=(
+            gap_matches(baseline, matches, config)
+            if config.gap_fill_point_neighbour_count is not None else None
+        ),
         **edge_options,
+    )
+
+
+def gap_matches(
+    field: DisplacementField, matches: MotionMatches, config: FieldConfig
+) -> MotionMatches:
+    """The raw matches point-local gap filling can use, so composition need not hold
+    every match of every pair.
+
+    A point lacks a usable triangle only if a corner of its field grid cell is a
+    failed node or lies outside the field (a regular grid cell of accepted nodes
+    triangulates into usable triangles), so it is within one cell diagonal of a
+    failed or boundary node. Matches farther than that plus the neighbour radius
+    from every such node can never be selected.
+    """
+    if not len(matches):
+        return matches
+    rows = field.grid_row - field.grid_row.min() + 1
+    columns = field.grid_column - field.grid_column.min() + 1
+    present = np.zeros((rows.max() + 2, columns.max() + 2), dtype=bool)
+    present[rows, columns] = True
+    boundary = np.zeros(len(rows), dtype=bool)
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr or dc:
+                boundary |= ~present[rows + dr, columns + dc]
+    anchors = field.source_xy_m[~field.available | boundary]
+    if not len(anchors):
+        return MotionMatches.empty()
+    reach = (
+        config.gap_fill_point_neighbour_distance_m
+        + math.sqrt(2.0) * config.grid_spacing_m
+        + 1.0
+    )
+    near = cKDTree(anchors).query(
+        matches.source_xy_m, distance_upper_bound=reach, workers=1
+    )[0] < np.inf
+    return MotionMatches(
+        matches.source_xy_m[near], matches.target_xy_m[near], matches.score[near],
+        matches.source_tile[near], matches.target_tile[near],
     )
 
 
@@ -279,27 +323,191 @@ def sample_field_with_fallback(
     fallback: DisplacementField | None,
     query_xy_m: np.ndarray,
     maximum_triangle_edge_m: float,
+    *,
+    field_config: FieldConfig | None = None,
+    gap_matches: MotionMatches | None = None,
 ) -> FieldSamples:
-    """Preserve all supported baseline samples; use fallback only for gaps."""
+    """Preserve all supported baseline samples; use fallback only for gaps.
+
+    With gap filling configured (``field_config``), points still without a sample
+    are filled by ``fill_gaps``.
+    """
     original = sample_field(baseline, query_xy_m, maximum_triangle_edge_m)
-    if fallback is None or original.available.all():
-        return original
-    missing = np.flatnonzero(~original.available)
-    recovered = sample_field(fallback, np.asarray(query_xy_m)[missing],
-                             maximum_triangle_edge_m)
-    values = {}
-    for name in original.__dataclass_fields__:
-        value = getattr(original, name).copy()
-        value[missing] = getattr(recovered, name)
-        values[name] = value
+    if fallback is not None and not original.available.all():
+        missing = np.flatnonzero(~original.available)
+        recovered = sample_field(fallback, np.asarray(query_xy_m)[missing],
+                                 maximum_triangle_edge_m)
+        original = _merge_samples(original, missing, recovered)
+    if field_config is not None and field_config.gap_filling:
+        original = fill_gaps(baseline, original, query_xy_m, field_config, gap_matches)
+    return original
+
+
+def fill_gaps(
+    field: DisplacementField,
+    samples: FieldSamples,
+    query_xy_m: np.ndarray,
+    config: FieldConfig,
+    gap_matches: MotionMatches | None,
+) -> FieldSamples:
+    """Fill points without a usable triangle, in order: rigid large triangles, then
+    the point's own raw matches (point-local consensus).
+
+    A rigid triangle joins accepted nodes up to ``gap_fill_rigid_edge_m`` apart whose
+    displacements differ by at most ``gap_fill_rigid_spread_m``: the ice inside moves
+    as one block, so a hole between them is bridged. Its residual is at least that
+    spread. Point-local consensus applies the node rule at the point itself with the
+    ``gap_fill_point_*`` settings, so at a shear zone it uses the matches on the
+    point's own side. Existing samples are never changed.
+    """
+    query = np.asarray(query_xy_m, dtype=np.float64)
+    missing = np.flatnonzero(~samples.available)
+    if len(missing) and config.gap_fill_rigid_edge_m is not None:
+        rigid = sample_field(
+            field, query[missing], config.maximum_triangle_edge_m,
+            rigid=(config.gap_fill_rigid_edge_m, config.gap_fill_rigid_spread_m),
+        )
+        samples = _merge_samples(samples, missing, rigid)
+        missing = np.flatnonzero(~samples.available)
+    if (
+        len(missing)
+        and config.gap_fill_point_neighbour_count is not None
+        and gap_matches is not None
+        and len(gap_matches)
+    ):
+        estimate = estimate_points(
+            gap_matches,
+            query[missing],
+            config.gap_fill_point_neighbour_count,
+            config.gap_fill_point_minimum_agreeing_matches,
+            config.gap_fill_point_neighbour_distance_m,
+            config.gap_fill_point_agreement_distance_m,
+        )
+        samples = _merge_samples(samples, missing, FieldSamples(
+            estimate["displacement_m"], estimate["available"],
+            estimate["selected_matches"].astype(np.float64),
+            estimate["support_radius_m"], estimate["maximum_residual_m"],
+        ))
+    return samples
+
+
+def _merge_samples(
+    samples: FieldSamples, rows: np.ndarray, update: FieldSamples
+) -> FieldSamples:
+    """Copy ``update`` into ``samples`` at ``rows`` where ``update`` is available."""
+    values = {name: getattr(samples, name).copy() for name in samples.__dataclass_fields__}
+    filled = rows[update.available]
+    for name in values:
+        values[name][filled] = getattr(update, name)[update.available]
     return FieldSamples(**values)
+
+
+def estimate_points(
+    matches: MotionMatches,
+    query_xy_m: np.ndarray,
+    neighbour_count: int,
+    minimum_agreeing_matches: int,
+    maximum_neighbour_distance_m: float,
+    agreement_distance_m: float,
+) -> dict[str, np.ndarray]:
+    """Vectorized consensus at query points: the node rule of ``estimate_queries``
+    applied to many points at once.
+
+    For each point, the ``neighbour_count`` nearest matches within
+    ``maximum_neighbour_distance_m`` vote; the largest score-weighted group agreeing
+    within ``agreement_distance_m`` must have ``minimum_agreeing_matches`` members,
+    and its weighted geometric median is the estimate. Equal-distance neighbours are
+    ordered by match index rather than ``estimate_queries``' canonical order.
+    """
+    query = np.asarray(query_xy_m, dtype=np.float64)
+    count = len(query)
+    result = {
+        "displacement_m": np.full((count, 2), np.nan),
+        "available": np.zeros(count, dtype=bool),
+        "selected_matches": np.zeros(count, dtype=np.int32),
+        "candidate_matches": np.zeros(count, dtype=np.int32),
+        "support_radius_m": np.full(count, np.nan),
+        "maximum_residual_m": np.full(count, np.nan),
+    }
+    if not count or not len(matches):
+        return result
+    k = min(neighbour_count, len(matches))
+    distances, neighbours = cKDTree(matches.source_xy_m).query(
+        query, k=k, distance_upper_bound=maximum_neighbour_distance_m, workers=1
+    )
+    distances = np.asarray(distances, dtype=np.float64).reshape(count, k)
+    neighbours = np.asarray(neighbours).reshape(count, k)
+    valid = np.isfinite(distances) & (neighbours < len(matches))
+    safe = np.where(valid, neighbours, 0)
+    vectors = matches.displacement_m[safe]
+    weights = np.where(valid, np.maximum(matches.score[safe], 1.0e-12), 0.0)
+    separation = np.linalg.norm(vectors[:, :, None, :] - vectors[:, None, :, :], axis=3)
+    agree = (separation <= agreement_distance_m) & valid[:, :, None] & valid[:, None, :]
+    support = np.einsum("nij,nj->ni", agree, weights)
+    support[~valid] = -1.0
+    best = np.argmax(support, axis=1)
+    members = agree[np.arange(count), best]
+    selected = members.sum(axis=1)
+    result["candidate_matches"] = valid.sum(axis=1).astype(np.int32)
+    result["selected_matches"] = selected.astype(np.int32)
+    rows = np.flatnonzero(selected >= minimum_agreeing_matches)
+    if not len(rows):
+        return result
+    member_weights = np.where(members[rows], weights[rows], 0.0)
+    estimate = _batched_geometric_median(vectors[rows], member_weights)
+    residual = np.where(
+        members[rows], np.linalg.norm(vectors[rows] - estimate[:, None, :], axis=2), 0.0
+    ).max(axis=1)
+    result["displacement_m"][rows] = estimate
+    result["available"][rows] = True
+    result["support_radius_m"][rows] = np.where(valid[rows], distances[rows], 0.0).max(axis=1)
+    result["maximum_residual_m"][rows] = residual
+    return result
+
+
+def _batched_geometric_median(vectors: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    """``weighted_geometric_median`` for many point sets (zero weight = not a member)."""
+    total = weights.sum(axis=1, keepdims=True)
+    estimate = np.einsum("nk,nkj->nj", weights, vectors) / total
+    active = np.ones(len(vectors), dtype=bool)
+    member = weights > 0
+    for _ in range(100):
+        if not active.any():
+            break
+        rows = np.flatnonzero(active)
+        distance = np.linalg.norm(vectors[rows] - estimate[rows, None, :], axis=2)
+        close = (distance <= 1.0e-3) & member[rows]
+        settled = close.any(axis=1)
+        if settled.any():
+            done = rows[settled]
+            close_weights = np.where(close[settled], weights[done], 0.0)
+            estimate[done] = np.einsum("nk,nkj->nj", close_weights, vectors[done]) / close_weights.sum(axis=1, keepdims=True)
+            active[done] = False
+        rows, distance = rows[~settled], distance[~settled]
+        if not len(rows):
+            continue
+        inverse = np.where(member[rows], weights[rows] / np.maximum(distance, 1.0e-12), 0.0)
+        updated = np.einsum("nk,nkj->nj", inverse, vectors[rows]) / inverse.sum(axis=1, keepdims=True)
+        converged = np.linalg.norm(updated - estimate[rows], axis=1) <= 1.0e-3
+        estimate[rows] = updated
+        active[rows[converged]] = False
+    return estimate
 
 
 def sample_field(
     field: DisplacementField,
     query_xy_m: np.ndarray,
     maximum_triangle_edge_m: float,
+    *,
+    rigid: tuple[float, float] | None = None,
 ) -> FieldSamples:
+    """Interpolate the field linearly in usable triangles of accepted nodes.
+
+    ``rigid=(edge_m, spread_m)`` samples only triangles that are not usable under
+    ``maximum_triangle_edge_m`` but have edges up to ``edge_m`` and node
+    displacements within ``spread_m`` of each other (gap filling); their residual
+    is at least the displacement spread.
+    """
     query = np.asarray(query_xy_m, dtype=np.float64)
     count = len(query)
     displacement = np.full((count, 2), np.nan, dtype=np.float64)
@@ -319,10 +527,13 @@ def sample_field(
         return FieldSamples(displacement, available, selected, radius, residual)
     vertices = triangulation.simplices
     source_triangles = source[vertices]
-    usable = (
-        (_maximum_edge(source_triangles) <= maximum_triangle_edge_m)
-        & (_area(source_triangles) * _area(target[vertices]) > 0)
-    )
+    edges = _maximum_edge(source_triangles)
+    unfolded = _area(source_triangles) * _area(target[vertices]) > 0
+    usable = (edges <= maximum_triangle_edge_m) & unfolded
+    spread = None
+    if rigid is not None:
+        spread = _maximum_edge(vectors[vertices])
+        usable = ~usable & unfolded & (edges <= rigid[0]) & (spread <= rigid[1])
     del source_triangles, target
     simplex = triangulation.find_simplex(query)
     _recover_boundary_simplices(triangulation, usable, query, simplex)
@@ -342,6 +553,8 @@ def sample_field(
     selected[query_indices] = np.einsum("ni,ni->n", weights, field.selected_matches[valid][triangle_vertices])
     radius[query_indices] = _weighted(weights, field.support_radius_m[valid][triangle_vertices])
     residual[query_indices] = _weighted(weights, field.maximum_residual_m[valid][triangle_vertices])
+    if spread is not None:
+        residual[query_indices] = np.fmax(residual[query_indices], spread[chosen])
     available[query_indices] = True
     return FieldSamples(displacement, available, selected, radius, residual)
 

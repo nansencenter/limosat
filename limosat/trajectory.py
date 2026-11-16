@@ -797,6 +797,7 @@ def _supported_continuations(
         sampled = sample_field_with_fallback(
             edge.field, edge.fallback_field, queries,
             field_config.maximum_triangle_edge_m,
+            field_config=field_config, gap_matches=edge.gap_matches,
         )
         candidate_indices = np.flatnonzero(sampled.available)
         if target_validity is not None and len(candidate_indices):

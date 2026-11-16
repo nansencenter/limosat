@@ -66,7 +66,11 @@ EXCLUDED_SETTINGS = {
         "repository", "checkpoint", "device", "tile_batch_size",
         "prefix_cuda_graph", "cuda_graph_warmup_batches",
     ),
-    "field": ("missing_node_fallback",),
+    "field": (
+        "missing_node_fallback", "gap_fill_rigid_edge_m", "gap_fill_rigid_spread_m",
+        "gap_fill_point_neighbour_count", "gap_fill_point_minimum_agreeing_matches",
+        "gap_fill_point_neighbour_distance_m", "gap_fill_point_agreement_distance_m",
+    ),
     "routing": (
         "planning_grid_spacing_m", "targeted_recovery",
         "maximum_recovery_elapsed_hours", "candidate_minimum_elapsed_hours",
