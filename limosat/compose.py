@@ -277,6 +277,7 @@ def compose_recovery_parquet(
     primary_producers: set[str] = set()
     primary_schemas: set[int] = set()
     recovery_producers: set[str] = set()
+    recovery_schemas: set[int] = set()
     recovery_product_set = hashlib.sha256()
     target_set = hashlib.sha256()
     for item, product in zip(primary, _load_primary_products(products, primary)):
@@ -314,6 +315,7 @@ def compose_recovery_parquet(
         if product is None:
             raise RuntimeError(f"recovery pair product is missing: {item.pair.pair_id}")
         recovery_producers.add(product.producer_implementation_sha256)
+        recovery_schemas.add(product.schema_version)
         recovery_product_set.update(item.pair.pair_id.encode("utf-8"))
         recovery_product_set.update(product.sha256.encode("ascii"))
         recovery_product_set.update(product.content_sha256.encode("ascii"))
@@ -329,8 +331,7 @@ def compose_recovery_parquet(
         )
     if target_set.hexdigest() != target_manifest.get("pair_target_set_sha256"):
         raise ValueError("recovery target set failed manifest checksum")
-    if len(primary_producers) != 1 or len(recovery_producers) > 1:
-        raise ValueError("pair products have inconsistent producer implementations")
+    _check_producers(recovery_producers, recovery_schemas, "recovery")
 
     point_schema = _point_schema(pa, config, "trajectory_augmentations_v1")
     extension_schema = _extension_schema(
@@ -455,13 +456,13 @@ def compose_recovery_parquet(
     }
 
 
-def _check_producers(producer_hashes: set[str], schemas: set[int]) -> None:
+def _check_producers(producer_hashes: set[str], schemas: set[int], kind: str = "primary") -> None:
     """Products from several code versions may be composed together only when their
     shared matching fingerprint vouches for them (schema 3); legacy products must all
     come from one implementation."""
     if len(producer_hashes) > 1 and schemas != {PAIR_PRODUCT_SCHEMA_VERSION}:
         raise ValueError(
-            "primary pair products have multiple producer implementations: "
+            f"{kind} pair products have multiple producer implementations: "
             f"{sorted(producer_hashes)}"
         )
 

@@ -150,3 +150,6 @@ def test_compose_mixes_producer_versions_only_under_a_shared_fingerprint():
     _check_producers({"a" * 64}, {2})
     with pytest.raises(ValueError, match="multiple producer implementations"):
         _check_producers({"a" * 64, "b" * 64}, {2, 3})
+    _check_producers({"a" * 64, "b" * 64}, {3}, "recovery")
+    with pytest.raises(ValueError, match="recovery pair products have multiple"):
+        _check_producers({"a" * 64, "b" * 64}, {2}, "recovery")
