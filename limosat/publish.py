@@ -1,14 +1,19 @@
-"""Publish the LiMOSAT trajectory dataset (schema 2): one Parquet file of observations per period.
+"""Convert the internal database outputs into the public LiMOSAT trajectory dataset (schema 2).
+
+The internal outputs of each processing period (kept-link Parquet and manifest, removed links, SQLite) are
+built for our own analysis and checking. This module turns them into a format fit for public use and leaves
+out what an ordinary data user does not need: internal ids and row numbers, quality-control bookkeeping,
+removed links, raw points and local file paths. It never re-scores or alters a link.
 
 The public dataset is a *point table*: one row per observation of a trajectory, carrying the step that
 arrived at it (displacement, speed, interpolation status, correlation, pair statistics and flags), the
-Sentinel-1 scene it belongs to, and a ``primary`` flag that marks the rows belonging to the period's own
-date window (selecting ``primary`` rows from all periods covers each date once). Rows are sorted by time.
+Sentinel-1 scene it belongs to, and an ``is_primary`` flag that marks the rows belonging to the period's own
+date window (selecting ``is_primary`` rows from all periods covers each date once). Rows are sorted by time.
 
-This module only *projects* a frozen internal release. It consumes the internal kept-link Parquet of each
-period (``<period>/<period>_qc.parquet`` and its manifest) and the period's image catalogue, and never
-re-scores or alters a link. The public schema is defined once, here (``COLUMNS``, ``FLAG_BITS``); the schema
-and a generated data dictionary are written into the release so that readers do not need a second copy.
+It reads the internal kept-link Parquet of each period (``<period>/<period>_qc.parquet`` and its manifest)
+and the period's image catalogue. The public schema is defined once, here (``COLUMNS``, ``FLAG_BITS``); the
+schema and a generated data dictionary are written into the release so that readers do not need a second
+copy.
 
 Public outputs carry no local paths and no internal protocol detail. Internal provenance (source paths,
 checksums, protocol ids) goes to a sidecar next to, not inside, the output directory.
@@ -59,7 +64,7 @@ COLUMNS = (
     Column("period", "string", False, "",
            "Processing period (YYYYMM_YYYYMM). Trajectory identifiers are unique only within a period."),
     Column("trajectory_id", "int64", False, "",
-           "Trajectory identifier, unique within the period. A trajectory is the track of one ice feature "
+           "Trajectory identifier, unique within the period. A trajectory is the track of one feature "
            "through consecutive Sentinel-1 scenes."),
     Column("point_index", "int32", False, "",
            "Position along the trajectory: 0 for its first observation, then 1, 2, ... The rows of one "
@@ -89,10 +94,10 @@ COLUMNS = (
            "Bit mask describing the step arriving at this point: "
            + "; ".join(f"bit {bit} {name}" for name, bit in FLAG_BITS.items())
            + ". Flags never split trajectories. Null at point_index 0."),
-    Column("primary", "bool", False, "",
+    Column("is_primary", "bool", False, "",
            "True if the start time of the step arriving at this point (for point_index 0, the point's own "
-           "time) lies in the period's primary window. Selecting primary rows from all periods gives each "
-           "date exactly once; periods overlap by three months and the overlap rows are not primary in the "
+           "time) lies in the period's primary window. Selecting rows with is_primary true from all periods gives each "
+           "date exactly once; periods overlap by three months and the overlap rows are not marked is_primary in the "
            "later period."),
 )
 COLUMN_NAMES = tuple(column.name for column in COLUMNS)
@@ -368,7 +373,7 @@ def _arrays(ctx: _Context, table, *, ends: bool):
         "scene": ctx.catalog.scenes.take(pa.array(scene_pos)),
         "x_m": table["x1_m" if ends else "x0_m"],
         "y_m": table["y1_m" if ends else "y0_m"],
-        "primary": pa.array(primary),
+        "is_primary": pa.array(primary),
     }
     if ends:
         flags = table["qc_flags"].to_numpy().astype(np.int64)
@@ -467,7 +472,7 @@ def build_period(
                     [("time", "ascending"), ("trajectory_id", "ascending"), ("point_index", "ascending")])
                 writer.write_table(chunk, row_group_size=rows_per_group)
                 rows += chunk.num_rows
-                flags_primary = chunk["primary"].to_numpy(zero_copy_only=False)
+                flags_primary = chunk["is_primary"].to_numpy(zero_copy_only=False)
                 primary_rows += int(flags_primary.sum())
                 primary_links += int((flags_primary & (chunk["point_index"].to_numpy() > 0)).sum())
                 span_time = pc.min_max(chunk["time"])
@@ -530,7 +535,7 @@ def data_dictionary() -> str:
         "",
         "## What a row is",
         "",
-        "A row is one **observation** of an ice feature in one Sentinel-1 scene. The observations of a trajectory",
+        "A row is one **observation** of a feature in one Sentinel-1 scene. The observations of a trajectory",
         "share `trajectory_id` and are ordered by `point_index`; consecutive rows are linked by the step that",
         "arrived at the later one (`dx_m`, `dy_m`, `speed_m_per_day` and the other step columns describe the step",
         "from the previous row of the same trajectory, and are null on its first row). Rows are sorted by `time`.",
@@ -550,13 +555,13 @@ def data_dictionary() -> str:
         lines.append(f"| {bit} | `{name}` | {FLAG_DESCRIPTIONS[name]} |")
     lines += [
         "",
-        "## Overlapping periods and `primary`",
+        "## Overlapping periods and `is_primary`",
         "",
         "Processing periods are 15 months long and overlap their neighbours by three months (May to July). All rows",
         "of every period are published. The rule `" + OWNERSHIP_POLICY + "` assigns each step to one period by its",
         "start time: a period owns start times from 1 August of its first year up to (not including) 1 August of",
-        "the next year, and the first period also owns its first three months. `primary` is true on rows that",
-        "belong to that window. To use each date once, keep `primary` rows of all periods. Do not combine non-primary",
+        "the next year, and the first period also owns its first three months. `is_primary` is true on rows that",
+        "belong to that window. To use each date once, keep `is_primary` rows of all periods. Do not combine non-primary",
         "rows with primary rows of the neighbouring period: they are independent processings of the same dates.",
         "",
         "Windows (start inclusive, stop exclusive) are in `manifest.json`.",
@@ -646,7 +651,7 @@ def validate_period(source: Source, catalog_path: Path, output: Path, entry: dic
             raise ValueError(f"{output.name}: schema metadata {key.decode()} differs")
     if parquet.metadata.num_rows != entry["rows"]:
         raise ValueError(f"{output.name}: {parquet.metadata.num_rows} rows, manifest says {entry['rows']}")
-    core = pq.read_table(output, columns=["trajectory_id", "point_index", "time", "primary"])
+    core = pq.read_table(output, columns=["trajectory_id", "point_index", "time", "is_primary"])
     time = core["time"].cast(pa.int64()).to_numpy()
     if (np.diff(time) < 0).any():
         raise ValueError(f"{output.name}: rows are not sorted by time")
@@ -656,7 +661,7 @@ def validate_period(source: Source, catalog_path: Path, output: Path, entry: dic
         raise ValueError(f"{output.name}: point_index is not 0..n-1 within every trajectory")
     if per.num_rows != entry["trajectories"]:
         raise ValueError(f"{output.name}: {per.num_rows} trajectories, manifest says {entry['trajectories']}")
-    primary = core["primary"].to_numpy(zero_copy_only=False)
+    primary = core["is_primary"].to_numpy(zero_copy_only=False)
     if int(primary.sum()) != entry["primary_rows"] or int((primary & (core["point_index"].to_numpy() > 0)).sum()) != entry["primary_steps"]:
         raise ValueError(f"{output.name}: primary counts differ from the manifest")
     del core, per, time
@@ -696,7 +701,7 @@ def validate_period(source: Source, catalog_path: Path, output: Path, entry: dic
     same(col(step, "corr"), col(src, "target_corr").astype(np.float32), "corr")
     same(col(step, "direct_match_share"), col(src, "pair_direct_share").astype(np.float32), "direct_match_share")
     same(col(step, "flags"), col(src, "qc_flags").astype(np.uint8), "flags")
-    same(col(step, "primary"), (start_ms >= w0) & (start_ms < w1), "primary flags")
+    same(col(step, "is_primary"), (start_ms >= w0) & (start_ms < w1), "is_primary flags")
     position = np.searchsorted(catalog.image_ids, col(src, "target_image_id"))
     same(col(step, "scene"), np.asarray(catalog.scenes.take(pa.array(position)).to_pylist(), dtype=object), "scenes")
     # chain: the point before each step is the step's source (position and time)

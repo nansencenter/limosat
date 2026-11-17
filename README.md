@@ -54,9 +54,10 @@ and limitations.
 
 ## Publish the trajectory dataset
 
-`limosat.publish` projects a frozen internal release into the public dataset: one
-Parquet point table per processing period (one row per observation, sorted by
-time, with the Sentinel-1 scene name and a `primary` flag for the period's own
+`limosat.publish` converts the internal database outputs into the public dataset
+format and leaves out everything an ordinary data user does not need. The result is
+one Parquet point table per processing period (one row per observation, sorted by
+time, with the Sentinel-1 scene name and an `is_primary` flag for the period's own
 date window), plus a manifest, a generated data dictionary and checksums. See
 [the published-trajectory format and commands](docs/published_trajectories.md).
 

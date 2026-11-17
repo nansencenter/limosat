@@ -129,7 +129,7 @@ def test_primary_windows_tile_the_ten_periods():
 def test_point_table_rows_flags_and_order(tmp_path):
     manifest, _, _, out = build(tmp_path)
     table = pq.read_table(out / f"limosat_{PERIOD}.parquet").to_pylist()
-    keys = [(r["time"].strftime("%Y-%m-%dT%H:%M"), r["trajectory_id"], r["point_index"], r["primary"]) for r in table]
+    keys = [(r["time"].strftime("%Y-%m-%dT%H:%M"), r["trajectory_id"], r["point_index"], r["is_primary"]) for r in table]
     assert keys == [
         ("2023-07-30T00:00", 10, 0, False), ("2023-07-31T12:00", 10, 1, False), ("2023-08-02T00:00", 10, 2, False),
         ("2023-08-04T00:00", 10, 3, True), ("2023-09-10T00:00", 11, 0, True), ("2023-09-11T00:00", 11, 1, True),
@@ -183,7 +183,7 @@ def test_public_outputs_carry_no_local_paths_or_internal_detail(tmp_path):
     sidecar = json.loads((tmp_path / "out.provenance.json").read_text())
     assert sidecar["periods"][PERIOD]["protocol_id"] == "internal_protocol"
     assert str(source) in sidecar["source_root"] and not (out / "out.provenance.json").exists()
-    assert "`primary`" in (out / "DATA_DICTIONARY.md").read_text()
+    assert "`is_primary`" in (out / "DATA_DICTIONARY.md").read_text()
     assert manifest["totals"] == {"rows": 9, "trajectories": 3, "steps": 6, "primary_rows": 6, "primary_steps": 4}
 
 
