@@ -5,8 +5,8 @@ built for our own analysis and checking. This module turns them into a format fi
 out what an ordinary data user does not need: internal ids and row numbers, quality-control bookkeeping,
 removed links, raw points and local file paths. It never re-scores or alters a link.
 
-The public dataset is a *point table*: one row per observation of a trajectory, carrying the step that
-arrived at it (displacement, speed, interpolation status, correlation, pair statistics and flags), the
+The public dataset is a *point table*: one row per observation of a trajectory, carrying the displacement
+from the previous observation (dx, dy, speed, interpolation status, correlation, pair statistics and flags), the
 Sentinel-1 scene it belongs to, and an ``is_primary`` flag that marks the rows belonging to the period's own
 date window (selecting ``is_primary`` rows from all periods covers each date once). Rows are sorted by time.
 
@@ -42,11 +42,11 @@ PERIOD_PATTERN = re.compile(r"(\d{4})05_(\d{4})07")
 
 FLAG_BITS = {"FEW_NEIGHBOURS": 0, "LOW_PAIR_DIRECT_SHARE": 1, "MASK_FALSE_LAND": 2}
 FLAG_DESCRIPTIONS = {
-    "FEW_NEIGHBOURS": "fewer than 2 other steps of the same scene pair within 30 km",
-    "LOW_PAIR_DIRECT_SHARE": "less than 40% of the steps of the scene pair are direct matches "
-    "(interpolated steps in such pairs are more often wrong; filter direct_match_share for other thresholds)",
-    "MASK_FALSE_LAND": "an end of the step lies in false land of its own scene "
-    "(scenes spanning 180 degrees, where the preprocessing land mask had false land strips over sea ice)",
+    "FEW_NEIGHBOURS": "fewer than 2 other displacements between the same two scenes within 30 km",
+    "LOW_PAIR_DIRECT_SHARE": "less than 40% of the displacements between the same two scenes are direct matches "
+    "(interpolated displacements in such pairs are more often wrong; use direct_match_share for other thresholds)",
+    "MASK_FALSE_LAND": "either end of the displacement lies in false land of its scene's land mask "
+    "(scenes crossing 180 degrees longitude, where the mask wrongly marks strips of sea ice as land)",
 }
 KNOWN_FLAG_MASK = sum(1 << bit for bit in FLAG_BITS.values())
 
@@ -84,18 +84,18 @@ COLUMNS = (
            "Distance from the previous observation divided by the elapsed time. Null at point_index 0."),
     Column("interpolated", "bool", True, "",
            "True if this position was interpolated rather than matched directly. Null at point_index 0."),
-    Column("corr", "float32", True, "",
-           "Template correlation of the match that produced this position (native tracker field, not a "
+    Column("correlation", "float32", True, "",
+           "Correlation of the template match that produced this position (the tracker's own value, not a "
            "calibrated quality score). Null at point_index 0."),
     Column("direct_match_share", "float32", True, "",
-           "Share (0 to 1) of the steps between this scene pair that are direct matches rather than "
+           "Share (0 to 1) of the displacements between the two scenes of this displacement that are direct matches rather than "
            "interpolated. Null at point_index 0."),
     Column("flags", "uint8", True, "",
-           "Bit mask describing the step arriving at this point: "
+           "Bit mask describing the displacement arriving at this observation: "
            + "; ".join(f"bit {bit} {name}" for name, bit in FLAG_BITS.items())
            + ". Flags never split trajectories. Null at point_index 0."),
     Column("is_primary", "bool", False, "",
-           "True if the start time of the step arriving at this point (for point_index 0, the point's own "
+           "True if the start time of the displacement arriving at this observation (for point_index 0, its own "
            "time) lies in the period's primary window. Selecting rows with is_primary true from all periods gives each "
            "date exactly once; periods overlap by three months and the overlap rows are not marked is_primary in the "
            "later period."),
@@ -384,11 +384,11 @@ def _arrays(ctx: _Context, table, *, ends: bool):
             raise ValueError(f"{ctx.period}: target_interpolated is not 0/1")
         values.update(
             dx_m=table["dx_m"], dy_m=table["dy_m"], speed_m_per_day=table["speed_m_per_day"],
-            interpolated=pa.array(interpolated.astype(bool)), corr=table["target_corr"],
+            interpolated=pa.array(interpolated.astype(bool)), correlation=table["target_corr"],
             direct_match_share=table["pair_direct_share"], flags=pa.array(flags.astype(np.uint8)),
         )
     else:
-        for name in ("dx_m", "dy_m", "speed_m_per_day", "interpolated", "corr", "direct_match_share", "flags"):
+        for name in ("dx_m", "dy_m", "speed_m_per_day", "interpolated", "correlation", "direct_match_share", "flags"):
             values[name] = pa.nulls(n, schema.field(name).type)
     columns = [_column(values[name], schema.field(name)) for name in COLUMN_NAMES]
     return pa.Table.from_arrays(columns, schema=pa.schema(list(schema)))
@@ -487,11 +487,11 @@ def build_period(
                 del chunk, pieces, ends, starts
         if end_rows != n_links or start_rows != n_trajectories or rows != n_links + n_trajectories:
             raise ValueError(
-                f"{source.period}: wrote {rows} rows ({end_rows} steps, {start_rows} starts) but the source has "
+                f"{source.period}: wrote {rows} rows ({end_rows} displacements, {start_rows} first observations) but the source has "
                 f"{n_links} links and {n_trajectories} trajectories"
             )
         if primary_links != expected_primary_links:
-            raise ValueError(f"{source.period}: {primary_links} primary steps, expected {expected_primary_links}")
+            raise ValueError(f"{source.period}: {primary_links} primary displacements, expected {expected_primary_links}")
         os.replace(temporary, output)
     except Exception:
         if temporary.exists():
@@ -504,9 +504,9 @@ def build_period(
         "sha256": sha256(output),
         "rows": rows,
         "trajectories": n_trajectories,
-        "steps": n_links,
+        "displacements": n_links,
         "primary_rows": primary_rows,
-        "primary_steps": primary_links,
+        "primary_displacements": primary_links,
         "scenes": int(ctx.used_scenes.sum()),
         "primary_window": {"start": _utc_text(window[0]), "stop_exclusive": _utc_text(window[1])},
         "time_start": _utc_text(_ms_to_datetime(time_min)),
@@ -536,9 +536,11 @@ def data_dictionary() -> str:
         "## What a row is",
         "",
         "A row is one **observation** of a feature in one Sentinel-1 scene. The observations of a trajectory",
-        "share `trajectory_id` and are ordered by `point_index`; consecutive rows are linked by the step that",
-        "arrived at the later one (`dx_m`, `dy_m`, `speed_m_per_day` and the other step columns describe the step",
-        "from the previous row of the same trajectory, and are null on its first row). Rows are sorted by `time`.",
+        "share `trajectory_id` and are ordered by `point_index`. Every row after the first of a trajectory also",
+        "describes the **displacement** from the previous observation of the same trajectory: `dx_m`, `dy_m`,",
+        "`speed_m_per_day` and the properties of that displacement (`interpolated`, `correlation`,",
+        "`direct_match_share`, `flags`). These displacement columns are null on a trajectory's first row.",
+        "Rows are sorted by `time`.",
         "Trajectory identifiers are unique only within a period; use (`period`, `trajectory_id`).",
         "",
         f"Coordinates are {CRS} metres. Times are UTC.",
@@ -558,7 +560,7 @@ def data_dictionary() -> str:
         "## Overlapping periods and `is_primary`",
         "",
         "Processing periods are 15 months long and overlap their neighbours by three months (May to July). All rows",
-        "of every period are published. The rule `" + OWNERSHIP_POLICY + "` assigns each step to one period by its",
+        "of every period are published. The rule `" + OWNERSHIP_POLICY + "` assigns each displacement to one period by its",
         "start time: a period owns start times from 1 August of its first year up to (not including) 1 August of",
         "the next year, and the first period also owns its first three months. `is_primary` is true on rows that",
         "belong to that window. To use each date once, keep `is_primary` rows of all periods. Do not combine non-primary",
@@ -602,12 +604,12 @@ def build(
         "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "crs": CRS,
         "primary": {"policy_id": OWNERSHIP_POLICY,
-                    "definition": "start time of the arriving step (own time for point_index 0) in the period's "
+                    "definition": "start time of the arriving displacement (own time for point_index 0) in the period's "
                     "half-open window"},
         "flag_bits": FLAG_BITS,
         "columns": columns_spec(),
         "files": entries,
-        "totals": {key: sum(e[key] for e in entries) for key in ("rows", "trajectories", "steps", "primary_rows", "primary_steps")},
+        "totals": {key: sum(e[key] for e in entries) for key in ("rows", "trajectories", "displacements", "primary_rows", "primary_displacements")},
     }
     _atomic_write(output_dir / "manifest.json", json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     _atomic_write(output_dir / "DATA_DICTIONARY.md", data_dictionary())
@@ -662,11 +664,11 @@ def validate_period(source: Source, catalog_path: Path, output: Path, entry: dic
     if per.num_rows != entry["trajectories"]:
         raise ValueError(f"{output.name}: {per.num_rows} trajectories, manifest says {entry['trajectories']}")
     primary = core["is_primary"].to_numpy(zero_copy_only=False)
-    if int(primary.sum()) != entry["primary_rows"] or int((primary & (core["point_index"].to_numpy() > 0)).sum()) != entry["primary_steps"]:
+    if int(primary.sum()) != entry["primary_rows"] or int((primary & (core["point_index"].to_numpy() > 0)).sum()) != entry["primary_displacements"]:
         raise ValueError(f"{output.name}: primary counts differ from the manifest")
     del core, per, time
 
-    # Source cross-check on a sample of trajectories: every published step must equal its source link.
+    # Source cross-check on a sample of trajectories: every published displacement must equal its source link.
     catalog = load_catalog(catalog_path)
     window = ownership_window(source.period)
     w0, w1 = _ms(window[0]), _ms(window[1])
@@ -698,22 +700,22 @@ def validate_period(source: Source, catalog_path: Path, output: Path, entry: dic
     same(col(step, "dx_m"), col(src, "dx_m"), "dx"); same(col(step, "dy_m"), col(src, "dy_m"), "dy")
     same(col(step, "speed_m_per_day"), col(src, "speed_m_per_day"), "speed")
     same(col(step, "interpolated"), col(src, "target_interpolated").astype(bool), "interpolated")
-    same(col(step, "corr"), col(src, "target_corr").astype(np.float32), "corr")
+    same(col(step, "correlation"), col(src, "target_corr").astype(np.float32), "correlation")
     same(col(step, "direct_match_share"), col(src, "pair_direct_share").astype(np.float32), "direct_match_share")
     same(col(step, "flags"), col(src, "qc_flags").astype(np.uint8), "flags")
     same(col(step, "is_primary"), (start_ms >= w0) & (start_ms < w1), "is_primary flags")
     position = np.searchsorted(catalog.image_ids, col(src, "target_image_id"))
     same(col(step, "scene"), np.asarray(catalog.scenes.take(pa.array(position)).to_pylist(), dtype=object), "scenes")
-    # chain: the point before each step is the step's source (position and time)
+    # chain: the observation before each displacement is its source (position and time)
     previous = pub.take(pa.array(np.flatnonzero(is_step) - 1))
     same(col(previous, "x_m"), col(src, "x0_m"), "chain x"); same(col(previous, "y_m"), col(src, "y0_m"), "chain y")
     same(previous["time"].cast(pa.int64()).to_numpy(), start_ms, "chain times")
     same(col(previous, "trajectory_id"), col(src, "qc_trajectory_id"), "chain trajectory")
-    # first rows have no step values
-    for name in ("dx_m", "dy_m", "speed_m_per_day", "interpolated", "corr", "direct_match_share", "flags"):
+    # first rows have no displacement values
+    for name in ("dx_m", "dy_m", "speed_m_per_day", "interpolated", "correlation", "direct_match_share", "flags"):
         if first[name].null_count != first.num_rows:
             raise ValueError(f"{output.name}: first observations carry values in {name}")
-    return {"period": source.period, "status": "passed", "rows": entry["rows"], "sampled_steps": int(is_step.sum()),
+    return {"period": source.period, "status": "passed", "rows": entry["rows"], "sampled_displacements": int(is_step.sum()),
             "sample_modulus": sample_modulus}
 
 

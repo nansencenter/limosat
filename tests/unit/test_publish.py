@@ -33,7 +33,7 @@ def utc(text):
 
 # (trajectory, link index, source image, target image, x0, y0, x1, y1, interpolated, corr, share, flags)
 LINKS = [
-    # Trajectory 10 crosses the start of the primary window (1 Aug 2023): its first two steps start before it.
+    # Trajectory 10 crosses the start of the primary window (1 Aug 2023): its first two displacements start before it.
     (10, 0, 1, 2, 0.0, 0.0, 100.0, 0.0, 0, 0.5, 0.9, 0),
     (10, 1, 2, 3, 100.0, 0.0, 200.0, 50.0, 1, 0.6, 0.3, 2),
     (10, 2, 3, 4, 200.0, 50.0, 300.0, 50.0, 0, 0.7, 0.8, 4),
@@ -138,22 +138,22 @@ def test_point_table_rows_flags_and_order(tmp_path):
     assert all(r["period"] == PERIOD for r in table)
     by = {(r["trajectory_id"], r["point_index"]): r for r in table}
     assert by[(10, 0)]["scene"] == scene(1) and by[(10, 3)]["scene"] == scene(4) and by[(12, 1)]["scene"] == scene(8)
-    # first observations have no step values
+    # first observations have no displacement values
     for key in ((10, 0), (11, 0), (12, 0)):
         first = by[key]
         assert all(first[name] is None for name in
-                   ("dx_m", "dy_m", "speed_m_per_day", "interpolated", "corr", "direct_match_share", "flags"))
-    # steps carry the arriving link's values (end point attributes)
+                   ("dx_m", "dy_m", "speed_m_per_day", "interpolated", "correlation", "direct_match_share", "flags"))
+    # displacements carry the arriving link's values (end point attributes)
     step = by[(10, 2)]
     assert (step["x_m"], step["y_m"], step["dx_m"], step["dy_m"]) == (200.0, 50.0, 100.0, 50.0)
     assert step["interpolated"] is True and step["flags"] == 2
-    assert step["corr"] == pytest.approx(0.6) and step["direct_match_share"] == pytest.approx(0.3)
+    assert step["correlation"] == pytest.approx(0.6) and step["direct_match_share"] == pytest.approx(0.3)
     assert by[(10, 1)]["speed_m_per_day"] == pytest.approx(100.0 / 1.5)
     assert by[(10, 3)]["flags"] == 4
     # point_index counts from the trajectory's first kept observation, not from the original link index
     assert [by[(11, i)]["point_index"] for i in range(3)] == [0, 1, 2]
     assert manifest["files"][0]["rows"] == 9 and manifest["files"][0]["trajectories"] == 3
-    assert manifest["files"][0]["steps"] == 6 and manifest["files"][0]["primary_steps"] == 4
+    assert manifest["files"][0]["displacements"] == 6 and manifest["files"][0]["primary_displacements"] == 4
     assert manifest["files"][0]["primary_rows"] == 6 and manifest["files"][0]["scenes"] == 8
 
 
@@ -184,13 +184,13 @@ def test_public_outputs_carry_no_local_paths_or_internal_detail(tmp_path):
     assert sidecar["periods"][PERIOD]["protocol_id"] == "internal_protocol"
     assert str(source) in sidecar["source_root"] and not (out / "out.provenance.json").exists()
     assert "`is_primary`" in (out / "DATA_DICTIONARY.md").read_text()
-    assert manifest["totals"] == {"rows": 9, "trajectories": 3, "steps": 6, "primary_rows": 6, "primary_steps": 4}
+    assert manifest["totals"] == {"rows": 9, "trajectories": 3, "displacements": 6, "primary_rows": 6, "primary_displacements": 4}
 
 
 def test_validate_checks_every_trajectory_against_the_source(tmp_path):
     _, source, catalogs, out = build(tmp_path)
     result = publish.validate(source, catalogs, out, sample_modulus=1)
-    assert result[0]["status"] == "passed" and result[0]["sampled_steps"] == 6
+    assert result[0]["status"] == "passed" and result[0]["sampled_displacements"] == 6
     # a source link that no longer matches the published file is detected
     parquet = source / PERIOD / f"{PERIOD}_qc.parquet"
     table = pq.read_table(parquet)

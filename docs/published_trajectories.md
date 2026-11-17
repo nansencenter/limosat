@@ -7,18 +7,22 @@ It reads each period's internal kept-link Parquet and its manifest plus the peri
 never scores, filters or alters a link. Keep it independent of `limosat.qc`: the public format is a stable
 contract, while the internal files may change.
 
+The result is one Parquet point table per processing period (one row per observation, sorted by time, with
+the Sentinel-1 scene name and an `is_primary` flag for the period's own date window), plus a manifest, a
+generated data dictionary and checksums.
+
 ## Format
 
 One Parquet file per processing period, `limosat_<period>.parquet`, flat in the output folder, and:
 
 - `manifest.json`: schema version, release id, column definitions, flag bits, the primary window of every
-  period, and per file the checksum, size, row, trajectory and step counts, time and spatial bounds.
+  period, and per file the checksum, size, row, trajectory and displacement counts, time and spatial bounds.
 - `DATA_DICTIONARY.md`: generated from the schema constants in `limosat/publish.py`. Do not edit by hand.
 - `checksums.sha256`.
 
-A row is one **observation** of a feature in one Sentinel-1 scene, carrying the step that arrived at it.
+A row is one **observation** of a feature in one Sentinel-1 scene, carrying the displacement from the previous observation.
 A trajectory is the rows with one `trajectory_id` (unique within a period) ordered by `point_index`; the first
-row has `point_index` 0 and null step columns. Rows are sorted by `time`, with time-ordered row groups so
+row has `point_index` 0 and null displacement columns. Rows are sorted by `time`, with time-ordered row groups so
 date queries read few row groups.
 
 | Column | Meaning |
@@ -26,8 +30,8 @@ date queries read few row groups.
 | `period`, `trajectory_id`, `point_index` | identity; use (`period`, `trajectory_id`) across periods |
 | `time`, `scene` | UTC acquisition time and Sentinel-1 product name of the scene |
 | `x_m`, `y_m` | EPSG:3413 position in metres |
-| `dx_m`, `dy_m`, `speed_m_per_day` | step from the previous row of the trajectory |
-| `interpolated`, `corr`, `direct_match_share`, `flags` | properties of the arriving step |
+| `dx_m`, `dy_m`, `speed_m_per_day` | displacement from the previous row of the trajectory |
+| `interpolated`, `correlation`, `direct_match_share`, `flags` | properties of the arriving displacement |
 | `is_primary` | the row lies in the period's own date window |
 
 The full definitions, flag bits and the explanation of `is_primary` are in the generated data dictionary.
@@ -35,10 +39,10 @@ The full definitions, flag bits and the explanation of `is_primary` are in the g
 ### Overlapping periods and `is_primary`
 
 Periods are 15 months long and overlap their neighbours by three months. All rows are published. Rule
-`limosat_release_august_annual_v1` gives each step to one period by its start time: a period owns start times
+`limosat_release_august_annual_v1` gives each displacement to one period by its start time: a period owns start times
 from 1 August of its first year up to 1 August of the next, the first period also owning its first three
 months. `is_primary` is true on rows in that window (for a trajectory's first row, its own time; otherwise the
-start time of the arriving step). Keep `is_primary` rows of all periods to use each date once.
+start time of the arriving displacement). Keep `is_primary` rows of all periods to use each date once.
 
 ## Scene names
 
@@ -60,8 +64,8 @@ python -m limosat.publish build \
 
 `--period YYYYMM_YYYYMM` (repeatable) builds selected periods; `--overwrite` replaces existing files;
 `--skip-source-checksum` skips hashing the sources against their manifests. The build streams month by month
-(about 3 GB of memory for a 52-million-link period) and checks that the row count equals steps plus
-trajectories and that the number of primary steps equals the number of source links starting in the window.
+(about 3 GB of memory for a 52-million-link period) and checks that the row count equals displacements plus
+trajectories and that the number of primary displacements equals the number of source links starting in the window.
 
 Internal provenance (source paths, checksums, protocol ids) is written next to, not inside, the output folder
 as `<output-dir>.provenance.json`. Do not publish it. Public outputs contain no local paths.
@@ -71,7 +75,7 @@ python -m limosat.publish validate --source-root ... --catalog-dir ... --output-
 ```
 
 `validate` re-checks checksums, schema, time order, `point_index`, and the manifest counts for every file,
-and compares every Nth trajectory (default 50, 1 checks all) with the source links: positions, step values,
+and compares every Nth trajectory (default 50, 1 checks all) with the source links: positions, displacement values,
 flags, scenes, chain continuity and `is_primary`.
 
 ## Reader examples
