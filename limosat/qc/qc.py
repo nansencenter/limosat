@@ -40,6 +40,7 @@ from .v3 import score_pair_isolation
 PROTOCOL_ID = "limosat_qc_v1_draft_20261028"
 PROTOCOL_PATH = Path(__file__).resolve().parent / "protocols" / "limosat_qc.json"
 STEPS = ("SPEED", "OPEN_WATER", "LAND", "ISOLATED_UNVERIFIED", "ROGUE_VECTOR", "INTERP_UNSUPPORTED")
+# Bit 2, MASK_FALSE_LAND, is added to a finished release by an amendment (see docs/trajectory_qc.md); this module never sets it.
 FLAG_BITS = {"FEW_NEIGHBOURS": 0, "LOW_PAIR_DIRECT_SHARE": 1}
 
 
