@@ -1,4 +1,14 @@
-"""Pair-field deformation products in explicit SI units."""
+"""Pair-field deformation products in explicit SI units.
+
+Deformation here is computed one image pair at a time, so triangles never cross a pair boundary.
+Sentinel-1 cuts each acquisition (datatake) into frames seconds apart, and frames of one source
+datatake matched to one target datatake share the same interval; computing per image pair leaves
+a gap about one point spacing wide along every frame boundary. For maps or products, group by
+source/target datatake pair and triangulate each group together (see ``by_datatake`` in the
+paper repository, ``src/eloftr_paper/deformation.py``, and its ``analysis/deformation-seams``).
+This module is used only by the older SQLite pipeline (``limosat/stages.py``); the Parquet chain
+does not produce deformation.
+"""
 
 from __future__ import annotations
 
