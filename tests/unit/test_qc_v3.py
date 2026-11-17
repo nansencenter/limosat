@@ -1,0 +1,209 @@
+import numpy as np
+import pandas as pd
+import pytest
+
+from limosat.qc import v3
+from limosat.qc.core import QCConfig
+
+
+pytestmark = pytest.mark.unit
+
+
+def pair_links(size=12, seed=3, noise=40.0, pair=(1, 2), id0=0):
+    rng = np.random.default_rng(seed)
+    axis = np.arange(size, dtype=float) * 5_000.0
+    x, y = (a.ravel() for a in np.meshgrid(axis, axis))
+    u = 6_000.0 + 0.004 * x + rng.normal(0, noise, len(x))
+    v = 2_000.0 - 0.002 * y + rng.normal(0, noise, len(x))
+    n = len(x)
+    return pd.DataFrame({
+        "edge_uid": [f"e{id0 + i}" for i in range(n)],
+        "qc_trajectory_id": id0 + np.arange(n, dtype=np.int64),
+        "source_rowid": 10 * (id0 + np.arange(n)) + 1,
+        "target_rowid": 10 * (id0 + np.arange(n)) + 2,
+        "source_image_id": pair[0], "target_image_id": pair[1],
+        "start_time_utc": pd.Timestamp("2024-03-01", tz="UTC"),
+        "end_time_utc": pd.Timestamp("2024-03-02", tz="UTC"),
+        "x0_m": x, "y0_m": y, "dx_m": u, "dy_m": v, "x1_m": x + u, "y1_m": y + v,
+        "source_interpolated": np.int8(0), "target_interpolated": np.int8(0),
+        "elapsed_seconds": 86_400.0, "speed_m_per_day": np.hypot(u, v), "target_corr": 0.6,
+    })
+
+
+def shift(links, rows, du, dv):
+    links.loc[rows, "dx_m"] += du
+    links.loc[rows, "dy_m"] += dv
+    links["x1_m"] = links.x0_m + links.dx_m
+    links["y1_m"] = links.y0_m + links.dy_m
+    return links
+
+
+def test_isolated_outliers_are_r1_whether_direct_or_interpolated():
+    links = shift(pair_links(), [40, 90], 3_500.0, -2_000.0)
+    links.loc[90, "target_interpolated"] = 1
+    scored = v3.score_links(links, QCConfig(), v3.V3Config())
+    assert set(scored.index[scored.r1]) == {40, 90}
+    assert set(scored.index[scored.r1_interpolated]) == {90}
+
+
+def decided(links):
+    """Score and decide without land or SIC inputs."""
+    scored = v3.score_links(links, QCConfig(), v3.V3Config())
+    for c in ("land", "open_water"):
+        scored[c] = False
+    return v3.apply_exclusions(scored, v3.V3Config())
+
+
+def test_interpolated_link_needs_agreeing_neighbours():
+    links = shift(pair_links(), [70], 1_600.0, 0.0)  # 1.6 km off: beyond the 1 km tolerance, below R1's floor
+    links.loc[[50, 70], "target_interpolated"] = 1
+    links.loc[70, "target_corr"] = 0.2  # weak template match, so the deviation is not accepted as deformation
+    scored = decided(links)
+    assert not scored.loc[50, "interp_unsupported"]  # interpolated, agrees with its field
+    assert scored.loc[70, "interp_unsupported"]
+    assert not scored.loc[scored.direct, "interp_unsupported"].any()  # direct links are never affected
+
+
+def test_sparse_interpolated_link_is_unsupported_and_few_neighbours_flagged():
+    links = pair_links(size=12)
+    far = links.iloc[[0]].copy()
+    far["edge_uid"], far["x0_m"], far["target_interpolated"] = "far", 400_000.0, 1
+    far["x1_m"] = far.x0_m + far.dx_m
+    links = pd.concat([links, far], ignore_index=True)
+    scored = decided(links)
+    row = scored[scored.edge_uid == "far"].iloc[0]
+    assert row.interp_unsupported and row.neighbours_30km == 0
+
+
+def test_residual_in_incoherent_field_is_not_r1():
+    links = shift(pair_links(noise=2_500.0, seed=5), [40], 3_500.0, -2_000.0)
+    scored = v3.score_links(links, QCConfig(), v3.V3Config())
+    assert not scored.loc[40, "r1"]
+
+
+def test_corroborated_outlier_is_not_r1():
+    links = shift(pair_links(), [40, 41], 3_500.0, -2_000.0)  # two neighbours moving together
+    scored = v3.score_links(links, QCConfig(), v3.V3Config())
+    assert not scored.loc[[40, 41], "r1"].any()
+
+
+def test_any_land_cell_excludes_including_the_coastal_band(tmp_path):
+    links = pair_links()
+    inland = np.zeros((100, 100), dtype="float32")
+    inland[:, :10] = 5.0  # x < 5 km: deep land
+    inland[:, 10:12] = 1.0  # 5 km <= x < 7 km: land cells next to the coast
+    np.savez(tmp_path / "land.npz", inland_km=inland, x0=-5_000.0, y1=60_000.0, res=1_000.0)
+    land = v3.LandRaster(tmp_path / "land.npz")
+    decided = v3.decide(v3.score_links(links, QCConfig(), v3.V3Config()), v3.V3Config(), land, None)
+    assert decided.land.equals(decided.x0_m < 7_000)
+    assert (decided.loc[decided.land, "qc3_exclusion"] == "LAND").all()
+    assert (decided.loc[~decided.land, "qc3_exclusion"] == "").all()
+
+
+def test_fallback_sampler_uses_first_product_with_the_day(tmp_path):
+    class Fake:
+        def __init__(self, days, value):
+            self.days, self.value, self.files = days, value, {}
+
+        def _grid(self, day):
+            return 1 if day.strftime("%Y%m%d") in self.days else None
+
+        def sample(self, x, y, times):
+            return np.full(len(x), self.value, dtype="float32")
+
+    times = pd.Series(pd.to_datetime(["2022-01-31", "2022-02-01"], utc=True))
+    sampler = v3.FallbackSicSampler([("asi", Fake({"20220131"}, 0.9)), ("nsidc", Fake({"20220131", "20220201"}, 0.1))])
+    values = sampler.sample(np.zeros(2), np.zeros(2), times)
+    assert values.tolist() == pytest.approx([0.9, 0.1])
+    assert sampler.days_by_product == {"asi": {"2022-01-31"}, "nsidc": {"2022-02-01"}}
+
+
+def test_asi_open_water_keeps_links_without_sic(tmp_path):
+    import rasterio
+    from rasterio.transform import from_origin
+    from pyproj import Transformer
+
+    day = tmp_path / "2024" / "mar"
+    day.mkdir(parents=True)
+    links = pair_links()
+    x, y = Transformer.from_crs("EPSG:3413", "EPSG:3411", always_xy=True).transform(links.x0_m.mean(), links.y0_m.mean())
+    sic = np.full((400, 400), 10, dtype="uint8")  # open water everywhere ...
+    sic[:, 200:] = 120  # ... except a land / missing half
+    tf = from_origin(x - 200 * 3125, y + 200 * 3125, 3125, 3125)
+    for d in ("20240301", "20240302"):
+        with rasterio.open(day / f"asi-AMSR2-n3125-{d}-v5.4.tif", "w", driver="GTiff", height=400, width=400, count=1,
+                           dtype="uint8", crs="EPSG:3411", transform=tf) as dst:
+            dst.write(sic, 1)
+    np.savez(tmp_path / "land.npz", inland_km=np.zeros((10, 10), "float32"), x0=-1e7, y1=1e7, res=1e6)
+    decided = v3.decide(v3.score_links(links, QCConfig(), v3.V3Config()), v3.V3Config(),
+                        v3.LandRaster(tmp_path / "land.npz"), v3.AsiSampler(tmp_path))
+    some = decided.sic_start.notna() | decided.sic_end.notna()
+    assert some.any() and (~some).any()
+    assert decided.loc[some, "open_water"].all() and not decided.loc[~some, "open_water"].any()
+
+
+def test_assign_segments_splits_at_excluded_links_deterministically():
+    t = pd.Timestamp("2024-01-01", tz="UTC")
+    links = pd.DataFrame({
+        "edge_uid": [f"l{i}" for i in range(6)],
+        "qc_trajectory_id": [7] * 6,
+        "start_time_utc": [t + pd.Timedelta(days=i) for i in range(6)],
+        "source_rowid": [1, 2, 3, 4, 5, 6], "target_rowid": [2, 3, 4, 5, 6, 7],
+    })
+    excluded = links.iloc[[2, 4]]
+    kept = v3.assign_segments(links.drop(index=[2, 4]), excluded, base_id=100)
+    assert kept.qc3_segment.tolist() == [0, 0, 1, 2]
+    assert kept.qc3_trajectory_id.tolist() == [7, 7, 100, 101]
+    assert v3.continuity_violations(kept) == 0
+    unsplit = links.assign(qc3_trajectory_id=7)
+    assert v3.continuity_violations(unsplit.drop(index=[2])) == 1
+
+
+def test_isolated_long_interval_or_fast_links_are_excluded(tmp_path):
+    links = pair_links(size=12)
+    far = links.iloc[[0, 1, 2]].copy()
+    far["edge_uid"] = ["slow_far", "long_far", "fast_far"]
+    far["x0_m"] = [400_000.0, 800_000.0, 1_200_000.0]
+    far["x1_m"] = far.x0_m + far.dx_m
+    far["elapsed_seconds"] = [86_400.0, 72 * 3600.0, 86_400.0]
+    far["speed_m_per_day"] = [6_000.0, 6_000.0, 30_000.0]
+    links = pd.concat([links, far], ignore_index=True)
+    np.savez(tmp_path / "land.npz", inland_km=np.zeros((10, 10), "float32"), x0=-1e7, y1=1e7, res=1e6)
+    decided = v3.decide(v3.score_links(links, QCConfig(), v3.V3Config()), v3.V3Config(),
+                        v3.LandRaster(tmp_path / "land.npz"), None)
+    flag = decided.set_index("edge_uid").isolated_unverified
+    assert not flag["slow_far"] and flag["long_far"] and flag["fast_far"]
+    assert not flag[[u for u in flag.index if u.startswith("e")]].any()
+
+
+def test_stored_scoring_can_be_redecided_with_another_tolerance():
+    links = shift(pair_links(), [70], 1_600.0, 0.0)
+    links.loc[70, "target_interpolated"] = 1
+    scored = v3.score_links(links, QCConfig(), v3.V3Config())
+    scored["r1"] = False
+    scored["land"] = False
+    scored["open_water"] = False
+    scored["target_corr"] = 0.2
+    strict = v3.apply_exclusions(scored.copy(), v3.V3Config())
+    loose = v3.apply_exclusions(scored.copy(), v3.V3Config(support_tolerance_m=2_000.0))
+    assert strict.loc[70, "qc3_exclusion"] == "INTERP_UNSUPPORTED"
+    assert loose.loc[70, "qc3_exclusion"] == ""
+
+
+def test_strong_template_match_keeps_moderately_deviating_interpolated_link():
+    links = shift(pair_links(), [70, 71], 1_600.0, 0.0)
+    links.loc[[70, 71], "target_interpolated"] = 1
+    scored = v3.score_links(links, QCConfig(), v3.V3Config())
+    for c in ("r1", "land", "open_water"):
+        scored[c] = False
+    scored["target_corr"] = 0.7
+    scored.loc[71, "target_corr"] = 0.2
+    far = scored.copy()
+    far.loc[70, "support_residual_m"] = 3_500.0
+    out = v3.apply_exclusions(scored.copy(), v3.V3Config())
+    assert out.loc[70, "qc3_exclusion"] == "" and out.loc[71, "qc3_exclusion"] == "INTERP_UNSUPPORTED"
+    assert v3.apply_exclusions(far, v3.V3Config()).loc[70, "qc3_exclusion"] == "INTERP_UNSUPPORTED"
+
+
+def test_bundled_v3_1_protocol_matches_code():
+    v3.validate_v3_protocol(v3.V3Config())
