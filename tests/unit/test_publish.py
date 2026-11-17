@@ -142,14 +142,14 @@ def test_point_table_rows_flags_and_order(tmp_path):
     for key in ((10, 0), (11, 0), (12, 0)):
         first = by[key]
         assert all(first[name] is None for name in
-                   ("dx_m", "dy_m", "speed_m_per_day", "interpolated", "correlation", "direct_match_share", "flags"))
+                   ("dx_m", "dy_m", "speed_m_per_day", "interpolated", "correlation", "direct_match_share", "quality_flags"))
     # displacements carry the arriving link's values (end point attributes)
     step = by[(10, 2)]
     assert (step["x_m"], step["y_m"], step["dx_m"], step["dy_m"]) == (200.0, 50.0, 100.0, 50.0)
-    assert step["interpolated"] is True and step["flags"] == 2
+    assert step["interpolated"] is True and step["quality_flags"] == 2
     assert step["correlation"] == pytest.approx(0.6) and step["direct_match_share"] == pytest.approx(0.3)
     assert by[(10, 1)]["speed_m_per_day"] == pytest.approx(100.0 / 1.5)
-    assert by[(10, 3)]["flags"] == 4
+    assert by[(10, 3)]["quality_flags"] == 4
     # point_index counts from the trajectory's first kept observation, not from the original link index
     assert [by[(11, i)]["point_index"] for i in range(3)] == [0, 1, 2]
     assert manifest["files"][0]["rows"] == 9 and manifest["files"][0]["trajectories"] == 3

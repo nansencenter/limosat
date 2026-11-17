@@ -31,7 +31,7 @@ date queries read few row groups.
 | `time`, `scene` | UTC acquisition time and Sentinel-1 product name of the scene |
 | `x_m`, `y_m` | EPSG:3413 position in metres |
 | `dx_m`, `dy_m`, `speed_m_per_day` | displacement from the previous row of the trajectory |
-| `interpolated`, `correlation`, `direct_match_share`, `flags` | properties of the arriving displacement |
+| `interpolated`, `correlation`, `direct_match_share`, `quality_flags` | properties of the arriving displacement |
 | `is_primary` | the row lies in the period's own date window |
 
 The full definitions, flag bits and the explanation of `is_primary` are in the generated data dictionary.
@@ -76,7 +76,7 @@ python -m limosat.publish validate --source-root ... --catalog-dir ... --output-
 
 `validate` re-checks checksums, schema, time order, `point_index`, and the manifest counts for every file,
 and compares every Nth trajectory (default 50, 1 checks all) with the source links: positions, displacement values,
-flags, scenes, chain continuity and `is_primary`.
+quality flags, scenes, chain continuity and `is_primary`.
 
 ## Reader examples
 

@@ -90,7 +90,7 @@ COLUMNS = (
     Column("direct_match_share", "float32", True, "",
            "Share (0 to 1) of the displacements between the two scenes of this displacement that are direct matches rather than "
            "interpolated. Null at point_index 0."),
-    Column("flags", "uint8", True, "",
+    Column("quality_flags", "uint8", True, "",
            "Bit mask describing the displacement arriving at this observation: "
            + "; ".join(f"bit {bit} {name}" for name, bit in FLAG_BITS.items())
            + ". Flags never split trajectories. Null at point_index 0."),
@@ -385,10 +385,10 @@ def _arrays(ctx: _Context, table, *, ends: bool):
         values.update(
             dx_m=table["dx_m"], dy_m=table["dy_m"], speed_m_per_day=table["speed_m_per_day"],
             interpolated=pa.array(interpolated.astype(bool)), correlation=table["target_corr"],
-            direct_match_share=table["pair_direct_share"], flags=pa.array(flags.astype(np.uint8)),
+            direct_match_share=table["pair_direct_share"], quality_flags=pa.array(flags.astype(np.uint8)),
         )
     else:
-        for name in ("dx_m", "dy_m", "speed_m_per_day", "interpolated", "correlation", "direct_match_share", "flags"):
+        for name in ("dx_m", "dy_m", "speed_m_per_day", "interpolated", "correlation", "direct_match_share", "quality_flags"):
             values[name] = pa.nulls(n, schema.field(name).type)
     columns = [_column(values[name], schema.field(name)) for name in COLUMN_NAMES]
     return pa.Table.from_arrays(columns, schema=pa.schema(list(schema)))
@@ -539,7 +539,7 @@ def data_dictionary() -> str:
         "share `trajectory_id` and are ordered by `point_index`. Every row after the first of a trajectory also",
         "describes the **displacement** from the previous observation of the same trajectory: `dx_m`, `dy_m`,",
         "`speed_m_per_day` and the properties of that displacement (`interpolated`, `correlation`,",
-        "`direct_match_share`, `flags`). These displacement columns are null on a trajectory's first row.",
+        "`direct_match_share`, `quality_flags`). These displacement columns are null on a trajectory's first row.",
         "Rows are sorted by `time`.",
         "Trajectory identifiers are unique only within a period; use (`period`, `trajectory_id`).",
         "",
@@ -702,7 +702,7 @@ def validate_period(source: Source, catalog_path: Path, output: Path, entry: dic
     same(col(step, "interpolated"), col(src, "target_interpolated").astype(bool), "interpolated")
     same(col(step, "correlation"), col(src, "target_corr").astype(np.float32), "correlation")
     same(col(step, "direct_match_share"), col(src, "pair_direct_share").astype(np.float32), "direct_match_share")
-    same(col(step, "flags"), col(src, "qc_flags").astype(np.uint8), "flags")
+    same(col(step, "quality_flags"), col(src, "qc_flags").astype(np.uint8), "quality_flags")
     same(col(step, "is_primary"), (start_ms >= w0) & (start_ms < w1), "is_primary flags")
     position = np.searchsorted(catalog.image_ids, col(src, "target_image_id"))
     same(col(step, "scene"), np.asarray(catalog.scenes.take(pa.array(position)).to_pylist(), dtype=object), "scenes")
@@ -712,7 +712,7 @@ def validate_period(source: Source, catalog_path: Path, output: Path, entry: dic
     same(previous["time"].cast(pa.int64()).to_numpy(), start_ms, "chain times")
     same(col(previous, "trajectory_id"), col(src, "qc_trajectory_id"), "chain trajectory")
     # first rows have no displacement values
-    for name in ("dx_m", "dy_m", "speed_m_per_day", "interpolated", "correlation", "direct_match_share", "flags"):
+    for name in ("dx_m", "dy_m", "speed_m_per_day", "interpolated", "correlation", "direct_match_share", "quality_flags"):
         if first[name].null_count != first.num_rows:
             raise ValueError(f"{output.name}: first observations carry values in {name}")
     return {"period": source.period, "status": "passed", "rows": entry["rows"], "sampled_displacements": int(is_step.sum()),
