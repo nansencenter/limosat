@@ -52,6 +52,15 @@ Rejected vectors split trajectories without deleting keypoints or modifying the
 original database. See the [trajectory QC guide](docs/trajectory_qc.md) for usage
 and limitations.
 
+## Publish the trajectory dataset
+
+`limosat.publish` converts the internal database outputs into the public dataset
+format and leaves out everything an ordinary data user does not need. The result is
+one Parquet point table per processing period (one row per observation, sorted by
+time, with the Sentinel-1 scene name and an `is_primary` flag for the period's own
+date window), plus a manifest, a generated data dictionary and checksums. See
+[the published-trajectory format and commands](docs/published_trajectories.md).
+
 ## License
 
 This project is licensed under the MIT License. See the LICENSE file for details.
