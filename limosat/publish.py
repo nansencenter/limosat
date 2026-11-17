@@ -1,8 +1,17 @@
-"""Materialize a concise scientific Parquet dataset from a frozen QC release.
+"""Publish the LiMOSAT trajectory dataset (schema 2): one Parquet file of observations per period.
 
-This module deliberately consumes the *materialized* QC SQLite output.  It does
-not score trajectories or revisit QC decisions; post-QC trajectory IDs and
-segment boundaries are the source of truth.
+The public dataset is a *point table*: one row per observation of a trajectory, carrying the step that
+arrived at it (displacement, speed, interpolation status, correlation, pair statistics and flags), the
+Sentinel-1 scene it belongs to, and a ``primary`` flag that marks the rows belonging to the period's own
+date window (selecting ``primary`` rows from all periods covers each date once). Rows are sorted by time.
+
+This module only *projects* a frozen internal release. It consumes the internal kept-link Parquet of each
+period (``<period>/<period>_qc.parquet`` and its manifest) and the period's image catalogue, and never
+re-scores or alters a link. The public schema is defined once, here (``COLUMNS``, ``FLAG_BITS``); the schema
+and a generated data dictionary are written into the release so that readers do not need a second copy.
+
+Public outputs carry no local paths and no internal protocol detail. Internal provenance (source paths,
+checksums, protocol ids) goes to a sidecar next to, not inside, the output directory.
 """
 
 from __future__ import annotations
@@ -10,575 +19,742 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
 import os
-import sqlite3
-from collections.abc import Iterator
+import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 
-SCHEMA_VERSION = "1.0.0"
+SCHEMA_VERSION = "2.0.0"
 CRS = "EPSG:3413"
-PUBLIC_COLUMNS = (
-    "trajectory_id",
-    "source_image_id",
-    "target_image_id",
-    "start_time_utc",
-    "end_time_utc",
-    "elapsed_seconds",
-    "x0_m",
-    "y0_m",
-    "x1_m",
-    "y1_m",
-    "dx_m",
-    "dy_m",
-    "distance_m",
-    "speed_m_s",
-    "speed_m_per_day",
-    "source_position_type",
-    "target_position_type",
+OWNERSHIP_POLICY = "limosat_release_august_annual_v1"
+FIRST_PERIOD_YEAR = 2015  # the first period also owns its first three months (from 1 May 2015)
+ROWS_PER_GROUP = 250_000
+PERIOD_PATTERN = re.compile(r"(\d{4})05_(\d{4})07")
+
+FLAG_BITS = {"FEW_NEIGHBOURS": 0, "LOW_PAIR_DIRECT_SHARE": 1, "MASK_FALSE_LAND": 2}
+FLAG_DESCRIPTIONS = {
+    "FEW_NEIGHBOURS": "fewer than 2 other steps of the same scene pair within 30 km",
+    "LOW_PAIR_DIRECT_SHARE": "less than 40% of the steps of the scene pair are direct matches "
+    "(interpolated steps in such pairs are more often wrong; filter direct_match_share for other thresholds)",
+    "MASK_FALSE_LAND": "an end of the step lies in false land of its own scene "
+    "(scenes spanning 180 degrees, where the preprocessing land mask had false land strips over sea ice)",
+}
+KNOWN_FLAG_MASK = sum(1 << bit for bit in FLAG_BITS.values())
+
+
+@dataclass(frozen=True)
+class Column:
+    name: str
+    type: str
+    nullable: bool
+    unit: str
+    description: str
+
+
+COLUMNS = (
+    Column("period", "string", False, "",
+           "Processing period (YYYYMM_YYYYMM). Trajectory identifiers are unique only within a period."),
+    Column("trajectory_id", "int64", False, "",
+           "Trajectory identifier, unique within the period. A trajectory is the track of one ice feature "
+           "through consecutive Sentinel-1 scenes."),
+    Column("point_index", "int32", False, "",
+           "Position along the trajectory: 0 for its first observation, then 1, 2, ... The rows of one "
+           "trajectory form a continuous chain in point_index order."),
+    Column("time", "timestamp_ms_utc", False, "UTC",
+           "Acquisition time of the Sentinel-1 scene of this observation."),
+    Column("scene", "string", False, "",
+           "Sentinel-1 product name of the scene this observation belongs to. For an interpolated position "
+           "it is the scene the position was assigned to."),
+    Column("x_m", "float64", False, "m", "Position, EPSG:3413 x."),
+    Column("y_m", "float64", False, "m", "Position, EPSG:3413 y."),
+    Column("dx_m", "float64", True, "m",
+           "Displacement in x from the previous observation of the trajectory. Null at point_index 0."),
+    Column("dy_m", "float64", True, "m",
+           "Displacement in y from the previous observation of the trajectory. Null at point_index 0."),
+    Column("speed_m_per_day", "float64", True, "m/day",
+           "Distance from the previous observation divided by the elapsed time. Null at point_index 0."),
+    Column("interpolated", "bool", True, "",
+           "True if this position was interpolated rather than matched directly. Null at point_index 0."),
+    Column("corr", "float32", True, "",
+           "Template correlation of the match that produced this position (native tracker field, not a "
+           "calibrated quality score). Null at point_index 0."),
+    Column("direct_match_share", "float32", True, "",
+           "Share (0 to 1) of the steps between this scene pair that are direct matches rather than "
+           "interpolated. Null at point_index 0."),
+    Column("flags", "uint8", True, "",
+           "Bit mask describing the step arriving at this point: "
+           + "; ".join(f"bit {bit} {name}" for name, bit in FLAG_BITS.items())
+           + ". Flags never split trajectories. Null at point_index 0."),
+    Column("primary", "bool", False, "",
+           "True if the start time of the step arriving at this point (for point_index 0, the point's own "
+           "time) lies in the period's primary window. Selecting primary rows from all periods gives each "
+           "date exactly once; periods overlap by three months and the overlap rows are not primary in the "
+           "later period."),
+)
+COLUMN_NAMES = tuple(column.name for column in COLUMNS)
+
+# Columns read from the internal kept-link Parquet.
+SOURCE_COLUMNS = (
+    "qc_trajectory_id", "trajectory_link_index", "source_image_id", "target_image_id",
+    "start_time_utc", "end_time_utc", "x0_m", "y0_m", "x1_m", "y1_m", "dx_m", "dy_m",
+    "speed_m_per_day", "target_interpolated", "target_corr", "pair_direct_share", "qc_flags",
 )
 
 
 def _pyarrow():
     try:
         import pyarrow as pa
+        import pyarrow.compute as pc
+        import pyarrow.dataset as ds
         import pyarrow.parquet as pq
     except ImportError as error:  # pragma: no cover - dependent on environment
         raise RuntimeError(
-            "Publishing requires the optional PyArrow dependency. Install it with "
-            "`conda install -c conda-forge pyarrow` or `pip install pyarrow`."
+            "Publishing requires PyArrow. Install it with `conda install -c conda-forge pyarrow` "
+            "or `pip install pyarrow`."
         ) from error
-    return pa, pq
+    return pa, pc, ds, pq
+
+
+def _arrow_type(name: str):
+    pa, _, _, _ = _pyarrow()
+    return {
+        "string": pa.string(), "int64": pa.int64(), "int32": pa.int32(), "float64": pa.float64(),
+        "float32": pa.float32(), "bool": pa.bool_(), "uint8": pa.uint8(),
+        "timestamp_ms_utc": pa.timestamp("ms", tz="UTC"),
+    }[name]
 
 
 def sha256(path: Path) -> str:
     """Return the SHA-256 checksum of a closed file."""
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(8 << 20), b""):
             digest.update(block)
     return digest.hexdigest()
 
 
-def quote_identifier(value: str) -> str:
-    return '"' + value.replace('"', '""') + '"'
+# --------------------------------------------------------------------------------------------- windows
 
 
-def parse_point_wkt(value: str) -> tuple[float, float]:
-    if not value.startswith("POINT"):
-        raise ValueError(f"Expected POINT WKT, got {value[:40]!r}")
-    values = value[value.find("(") + 1 : value.rfind(")")].strip().split()
-    if len(values) < 2:
-        raise ValueError(f"Malformed POINT WKT: {value!r}")
-    return float(values[0]), float(values[1])
+def ownership_window(period: str) -> tuple[datetime, datetime]:
+    """Half-open UTC window [start, stop) of start times that the period owns (its primary window).
+
+    Periods are 15 months (May to July of the following year) and overlap their neighbours by three
+    months. Period ``YYYY05_YYYY+107`` owns link start times in [1 Aug YYYY, 1 Aug YYYY+1); the first
+    period also owns its first three months. The windows tile May 2015 to July 2025.
+    """
+    match = PERIOD_PATTERN.fullmatch(period)
+    if not match or int(match[2]) != int(match[1]) + 1:
+        raise ValueError(f"Not a LiMOSAT processing period: {period!r}")
+    year = int(match[1])
+    start = datetime(year, 5 if year == FIRST_PERIOD_YEAR else 8, 1, tzinfo=timezone.utc)
+    return start, datetime(year + 1, 8, 1, tzinfo=timezone.utc)
 
 
-def parse_utc(value: str) -> datetime:
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+def _ms(value: datetime) -> int:
+    return int(round(value.timestamp() * 1000))
 
 
 def _utc_text(value: datetime) -> str:
-    return value.isoformat(timespec="microseconds").replace("+00:00", "Z")
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _position_type(interpolated: Any) -> str:
-    return "interpolated" if interpolated else "observed"
+def _ms_to_datetime(value: int) -> datetime:
+    return datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(milliseconds=int(value))
+
+
+def _month_starts(first_ms: int, last_ms: int) -> list[datetime]:
+    cursor = _ms_to_datetime(first_ms).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    last = _ms_to_datetime(last_ms)
+    months = []
+    while cursor <= last:
+        months.append(cursor)
+        cursor = datetime(cursor.year + cursor.month // 12, cursor.month % 12 + 1, 1, tzinfo=timezone.utc)
+    return months
+
+
+# --------------------------------------------------------------------------------------------- catalogue
 
 
 @dataclass(frozen=True)
-class ReleaseSource:
+class Catalog:
     path: Path
-    table: str
-    release_id: str
-    window: str
-    source_sha256: str
-    expected_edges: int
-    break_pairs: frozenset[tuple[int, int]]
+    sha256: str
+    image_ids: np.ndarray
+    scenes: Any  # pyarrow string array, aligned with image_ids
+    time_ms: np.ndarray
 
 
-def _connection(path: Path) -> sqlite3.Connection:
-    if not path.is_file():
-        raise FileNotFoundError(path)
-    wal = Path(str(path) + "-wal")
-    if wal.exists() and wal.stat().st_size:
-        raise ValueError("Source SQLite has an uncheckpointed WAL; close/checkpoint it first")
-    return sqlite3.connect(f"file:{path.resolve()}?mode=ro", uri=True)
+def _epoch_ms(text: str) -> int:
+    parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return _ms(parsed)
 
 
-def _manifest(connection: sqlite3.Connection) -> dict[str, Any]:
-    try:
-        row = connection.execute(
-            "SELECT manifest_json FROM qc_materialization_manifest"
-        ).fetchone()
-    except sqlite3.OperationalError as error:
-        raise ValueError("Source is not a materialized LiMOSAT QC SQLite release") from error
-    if row is None:
-        raise ValueError("Source QC SQLite has no materialization manifest")
-    manifest = json.loads(row[0])
-    required = {
-        "status": "complete",
-        "quick_check": "ok",
-        "invalid_is_last_trajectories": 0,
-        "repeated_trajectory_image_groups": 0,
-    }
-    for field, expected in required.items():
-        if manifest.get(field) != expected:
-            raise ValueError(
-                f"Source QC materialization manifest has {field}={manifest.get(field)!r}; "
-                f"expected {expected!r}"
-            )
-    return manifest
-
-
-def _cleaned_table(connection: sqlite3.Connection) -> str:
-    tables = [
-        row[0]
-        for row in connection.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table' "
-            "AND name LIKE '%__qc' ORDER BY name"
-        )
-    ]
-    if len(tables) != 1:
-        raise ValueError(f"Expected exactly one materialized '*__qc' table, found {tables}")
-    required = {
-        "image_id",
-        "is_last",
-        "trajectory_id",
-        "geometry",
-        "time",
-        "interpolated",
-    }
-    columns = {
-        row[1]
-        for row in connection.execute(f"PRAGMA table_info({quote_identifier(tables[0])})")
-    }
-    missing = required - columns
-    if missing:
-        raise ValueError(f"Cleaned QC table is missing required columns: {sorted(missing)}")
-    return tables[0]
-
-
-def inspect_source(path: Path, release_id: str | None = None) -> ReleaseSource:
-    """Check a frozen QC SQLite release and return immutable source details."""
-    path = path.resolve()
-    with _connection(path) as connection:
-        _manifest(connection)
-        table = _cleaned_table(connection)
-        summary = connection.execute(
-            "SELECT COALESCE(SUM(links), 0), COALESCE(SUM(rejected), 0) "
-            "FROM qc_pair_summary"
-        ).fetchone()
-        expected_edges = int(summary[0] - summary[1])
-        break_pairs = frozenset(
-            (int(source_rowid), int(target_rowid))
-            for source_rowid, target_rowid in connection.execute(
-                "SELECT source_rowid, target_rowid FROM qc_break_assignment"
-            )
-        )
-    window = path.parent.name
-    return ReleaseSource(
-        path=path,
-        table=table,
-        release_id=release_id or path.parent.parent.name,
-        window=window,
-        source_sha256=sha256(path),
-        expected_edges=expected_edges,
-        break_pairs=break_pairs,
+def load_catalog(path: Path) -> Catalog:
+    """Read a period's STAC image catalogue: image id, Sentinel-1 scene name and acquisition time."""
+    pa, _, _, _ = _pyarrow()
+    path = Path(path)
+    features = json.loads(path.read_text())["features"]
+    rows = sorted(
+        (int(f["properties"]["image_id"]), str(f["properties"]["scene_id"]), _epoch_ms(f["properties"]["datetime"]))
+        for f in features
     )
+    ids = np.array([row[0] for row in rows], dtype=np.int64)
+    scenes = [row[1] for row in rows]
+    if len(set(ids.tolist())) != len(ids):
+        raise ValueError(f"Duplicate image ids in catalogue {path.name}")
+    if len(set(scenes)) != len(scenes):
+        raise ValueError(f"Duplicate scene names in catalogue {path.name}")
+    return Catalog(path, sha256(path), ids, pa.array(scenes, type=pa.string()),
+                   np.array([row[2] for row in rows], dtype=np.int64))
 
 
-def _edge_query(table: str) -> str:
-    quoted = quote_identifier(table)
-    return f"""
-        WITH ordered AS (
-            SELECT
-                rowid AS source_rowid,
-                trajectory_id,
-                image_id AS source_image_id,
-                time AS source_time,
-                geometry AS source_geometry,
-                interpolated AS source_interpolated,
-                is_last AS source_is_last,
-                LEAD(rowid) OVER trajectory AS target_rowid,
-                LEAD(image_id) OVER trajectory AS target_image_id,
-                LEAD(time) OVER trajectory AS target_time,
-                LEAD(geometry) OVER trajectory AS target_geometry,
-                LEAD(interpolated) OVER trajectory AS target_interpolated
-            FROM {quoted}
-            WINDOW trajectory AS (
-                PARTITION BY trajectory_id ORDER BY time, image_id, rowid
-            )
-        )
-        SELECT trajectory_id, source_rowid, target_rowid, source_image_id,
-               target_image_id, source_time, target_time, source_geometry,
-               target_geometry, source_interpolated, target_interpolated
-        FROM ordered
-        WHERE target_rowid IS NOT NULL AND source_is_last = 0
-        ORDER BY trajectory_id, source_time, source_image_id, source_rowid
-    """
-
-
-def _public_edge(row: tuple[Any, ...]) -> tuple[dict[str, Any], tuple[int, int]]:
-    (
-        trajectory_id,
-        source_rowid,
-        target_rowid,
-        source_image_id,
-        target_image_id,
-        source_time,
-        target_time,
-        source_geometry,
-        target_geometry,
-        source_interpolated,
-        target_interpolated,
-    ) = row
-    start = parse_utc(source_time)
-    end = parse_utc(target_time)
-    elapsed_seconds = (end - start).total_seconds()
-    if elapsed_seconds <= 0:
+def _lookup(catalog: Catalog, image_ids: np.ndarray, times_ms: np.ndarray) -> np.ndarray:
+    """Catalogue positions of image ids; checks that every id exists and its time matches the data."""
+    position = np.searchsorted(catalog.image_ids, image_ids)
+    safe = np.minimum(position, len(catalog.image_ids) - 1)
+    missing = catalog.image_ids[safe] != image_ids
+    if missing.any():
+        raise ValueError(f"{int(missing.sum())} image ids are not in catalogue {catalog.path.name}")
+    mismatch = catalog.time_ms[safe] != times_ms
+    if mismatch.any():
         raise ValueError(
-            f"Non-positive elapsed time for trajectory {trajectory_id}: "
-            f"{source_time!r} -> {target_time!r}"
+            f"{int(mismatch.sum())} observations have a time different from their catalogue scene "
+            f"({catalog.path.name})"
         )
-    x0, y0 = parse_point_wkt(source_geometry)
-    x1, y1 = parse_point_wkt(target_geometry)
-    dx = x1 - x0
-    dy = y1 - y0
-    distance = math.hypot(dx, dy)
-    public = {
-        "trajectory_id": int(trajectory_id),
-        "source_image_id": int(source_image_id),
-        "target_image_id": int(target_image_id),
-        "start_time_utc": start,
-        "end_time_utc": end,
-        "elapsed_seconds": elapsed_seconds,
-        "x0_m": x0,
-        "y0_m": y0,
-        "x1_m": x1,
-        "y1_m": y1,
-        "dx_m": dx,
-        "dy_m": dy,
-        "distance_m": distance,
-        "speed_m_s": distance / elapsed_seconds,
-        "speed_m_per_day": distance / elapsed_seconds * 86_400.0,
-        "source_position_type": _position_type(source_interpolated),
-        "target_position_type": _position_type(target_interpolated),
-    }
-    return public, (int(source_rowid), int(target_rowid))
+    return safe
 
 
-def public_schema(source: ReleaseSource):
-    pa, _ = _pyarrow()
+def find_catalog(catalog_dir: Path, period: str) -> Path:
+    found = sorted(p for p in Path(catalog_dir).glob(f"{period}_image_catalog_*.json") if not p.name.startswith("._"))
+    if len(found) != 1:
+        raise ValueError(f"Expected one image catalogue for {period} in {catalog_dir}, found {[p.name for p in found]}")
+    return found[0]
+
+
+# --------------------------------------------------------------------------------------------- source
+
+
+@dataclass(frozen=True)
+class Source:
+    period: str
+    parquet: Path
+    manifest_path: Path
+    manifest: dict[str, Any]
+
+
+def find_sources(source_root: Path, periods: list[str] | None = None) -> list[Source]:
+    source_root = Path(source_root)
+    names = periods or sorted(
+        p.name for p in source_root.iterdir()
+        if p.is_dir() and re.fullmatch(r"\d{6}_\d{6}", p.name) and not p.name.startswith("._")
+    )
+    if not names:
+        raise ValueError(f"No period folders under {source_root}")
+    return [inspect_source(source_root / name / f"{name}_qc.parquet") for name in names]
+
+
+def inspect_source(parquet: Path, verify_checksum: bool = False) -> Source:
+    """Check an internal kept-link Parquet and its manifest."""
+    _, _, _, pq = _pyarrow()
+    parquet = Path(parquet)
+    period = parquet.parent.name
+    ownership_window(period)  # validates the name
+    manifest_path = parquet.with_suffix(".manifest.json")
+    if not parquet.is_file() or not manifest_path.is_file():
+        raise FileNotFoundError(f"Need {parquet} and {manifest_path.name}")
+    manifest = json.loads(manifest_path.read_text())
+    if manifest.get("status") != "complete" or manifest.get("continuity_violations") != 0:
+        raise ValueError(f"{period}: source is not complete with zero continuity violations")
+    if manifest.get("period") != period:
+        raise ValueError(f"{period}: manifest period {manifest.get('period')!r} differs")
+    schema = pq.ParquetFile(parquet).schema_arrow
+    missing = set(SOURCE_COLUMNS) - set(schema.names)
+    if missing:
+        raise ValueError(f"{period}: source lacks columns {sorted(missing)}")
+    rows = pq.ParquetFile(parquet).metadata.num_rows
+    if manifest.get("kept_links") not in (None, rows):
+        raise ValueError(f"{period}: manifest kept_links {manifest.get('kept_links')} != {rows} rows")
+    if verify_checksum:
+        expected = (manifest.get("outputs") or {}).get(parquet.name)
+        if expected and sha256(parquet) != expected:
+            raise ValueError(f"{period}: source Parquet checksum differs from its manifest")
+    return Source(period, parquet, manifest_path, manifest)
+
+
+# --------------------------------------------------------------------------------------------- schema
+
+
+def public_schema(release_id: str | None = None, period: str | None = None):
+    pa, _, _, _ = _pyarrow()
     fields = [
-        pa.field("trajectory_id", pa.int64()),
-        pa.field("source_image_id", pa.int64()),
-        pa.field("target_image_id", pa.int64()),
-        pa.field("start_time_utc", pa.timestamp("us", tz="UTC")),
-        pa.field("end_time_utc", pa.timestamp("us", tz="UTC")),
-        pa.field("elapsed_seconds", pa.float64()),
-        pa.field("x0_m", pa.float64()),
-        pa.field("y0_m", pa.float64()),
-        pa.field("x1_m", pa.float64()),
-        pa.field("y1_m", pa.float64()),
-        pa.field("dx_m", pa.float64()),
-        pa.field("dy_m", pa.float64()),
-        pa.field("distance_m", pa.float64()),
-        pa.field("speed_m_s", pa.float64()),
-        pa.field("speed_m_per_day", pa.float64()),
-        pa.field("source_position_type", pa.string()),
-        pa.field("target_position_type", pa.string()),
+        pa.field(c.name, _arrow_type(c.type), nullable=c.nullable,
+                 metadata={b"unit": c.unit.encode(), b"description": c.description.encode()})
+        for c in COLUMNS
     ]
     metadata = {
         b"limosat.schema_version": SCHEMA_VERSION.encode(),
-        b"limosat.release_id": source.release_id.encode(),
-        b"limosat.source_window": source.window.encode(),
         b"limosat.crs": CRS.encode(),
         b"limosat.coordinate_units": b"metres",
-        b"limosat.time_units": b"UTC timestamps; elapsed_seconds in seconds",
-        b"limosat.source_sqlite_sha256": source.source_sha256.encode(),
+        b"limosat.time_units": b"UTC timestamps (millisecond); speed in metres per day",
+        b"limosat.flag_bits": json.dumps(FLAG_BITS).encode(),
+        b"limosat.primary_policy": OWNERSHIP_POLICY.encode(),
     }
+    if release_id:
+        metadata[b"limosat.release_id"] = release_id.encode()
+    if period:
+        start, stop = ownership_window(period)
+        metadata[b"limosat.period"] = period.encode()
+        metadata[b"limosat.primary_window"] = json.dumps(
+            {"start": _utc_text(start), "stop_exclusive": _utc_text(stop)}).encode()
     return pa.schema(fields, metadata=metadata)
 
 
-def _default_output(path: Path) -> Path:
-    window = path.parent.name
-    return path.parent / f"{window}_qc_publish.parquet"
+def columns_spec() -> list[dict[str, Any]]:
+    return [dict(name=c.name, type=c.type, nullable=c.nullable, unit=c.unit, description=c.description) for c in COLUMNS]
 
 
-def _default_manifest(output: Path) -> Path:
-    return output.with_suffix(".manifest.json")
+# --------------------------------------------------------------------------------------------- building
 
 
-def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    if temporary.exists():
-        raise FileExistsError(temporary)
-    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-    os.replace(temporary, path)
+@dataclass
+class _Context:
+    period: str
+    catalog: Catalog
+    traj_ids: np.ndarray  # sorted trajectory ids of the source
+    first_index: np.ndarray  # first trajectory_link_index of each trajectory
+    window_ms: tuple[int, int]
+    schema: Any
+    used_scenes: np.ndarray
 
 
-def _bounds_update(bounds: dict[str, float | None], public: dict[str, Any]) -> None:
-    for key, values in {
-        "min_x_m": (public["x0_m"], public["x1_m"]),
-        "max_x_m": (public["x0_m"], public["x1_m"]),
-        "min_y_m": (public["y0_m"], public["y1_m"]),
-        "max_y_m": (public["y0_m"], public["y1_m"]),
-    }.items():
-        value = min(values) if key.startswith("min") else max(values)
-        bounds[key] = value if bounds[key] is None else (
-            min(bounds[key], value) if key.startswith("min") else max(bounds[key], value)
-        )
+def _column(value, field):
+    if value.type != field.type:
+        value = value.cast(field.type, safe=False)
+    return value
 
 
-def _manifest_payload(
-    source: ReleaseSource,
-    output: Path,
-    row_count: int,
-    trajectory_ids: set[int],
-    start_time: datetime | None,
-    end_time: datetime | None,
-    bounds: dict[str, float | None],
-) -> dict[str, Any]:
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "release_id": source.release_id,
-        "source_window": source.window,
-        "input_sqlite": str(source.path),
-        "input_sqlite_sha256": source.source_sha256,
-        "output_parquet": str(output),
-        "output_parquet_sha256": sha256(output),
-        "row_count": row_count,
-        "trajectory_count": len(trajectory_ids),
-        "time_bounds_utc": {
-            "start": _utc_text(start_time) if start_time else None,
-            "end": _utc_text(end_time) if end_time else None,
-        },
-        "spatial_bounds_epsg_3413_m": bounds,
-        "validation": {
-            "status": "passed",
-            "expected_accepted_edge_count": source.expected_edges,
-            "actual_accepted_edge_count": row_count,
-            "no_invalid_trajectory_continuity": True,
-            "no_edge_across_qc_break": True,
-        },
+def _arrays(ctx: _Context, table, *, ends: bool):
+    """Public columns for the end points (``ends``) or the start points of a table of source links."""
+    pa, pc, _, _ = _pyarrow()
+    n = table.num_rows
+    for name in ("qc_trajectory_id", "trajectory_link_index", "source_image_id", "target_image_id",
+                 "start_time_utc", "end_time_utc", "x0_m", "y0_m", "x1_m", "y1_m", "target_interpolated", "qc_flags"):
+        if table[name].null_count:
+            raise ValueError(f"{ctx.period}: nulls in source column {name}")
+    pos = np.searchsorted(ctx.traj_ids, table["qc_trajectory_id"].to_numpy())
+    first = ctx.first_index[pos]
+    link = table["trajectory_link_index"].to_numpy().astype(np.int64)
+    start_ms = table["start_time_utc"].cast(pa.int64()).to_numpy()
+    end_ms = table["end_time_utc"].cast(pa.int64()).to_numpy()
+    primary = (start_ms >= ctx.window_ms[0]) & (start_ms < ctx.window_ms[1])
+    side = "target" if ends else "source"
+    images = table[f"{side}_image_id"].to_numpy()
+    when = end_ms if ends else start_ms
+    scene_pos = _lookup(ctx.catalog, images, when)
+    ctx.used_scenes[scene_pos] = True
+    schema = ctx.schema
+    values = {
+        "period": pa.repeat(pa.scalar(ctx.period), n),
+        "trajectory_id": table["qc_trajectory_id"],
+        "point_index": pa.array((link - first + 1) if ends else np.zeros(n, dtype=np.int64)),
+        "time": table["end_time_utc" if ends else "start_time_utc"],
+        "scene": ctx.catalog.scenes.take(pa.array(scene_pos)),
+        "x_m": table["x1_m" if ends else "x0_m"],
+        "y_m": table["y1_m" if ends else "y0_m"],
+        "primary": pa.array(primary),
     }
+    if ends:
+        flags = table["qc_flags"].to_numpy().astype(np.int64)
+        if (flags & ~KNOWN_FLAG_MASK).any():
+            raise ValueError(f"{ctx.period}: qc_flags carries bits other than {FLAG_BITS}")
+        interpolated = table["target_interpolated"].to_numpy()
+        if interpolated.size and not np.isin(interpolated, (0, 1)).all():
+            raise ValueError(f"{ctx.period}: target_interpolated is not 0/1")
+        values.update(
+            dx_m=table["dx_m"], dy_m=table["dy_m"], speed_m_per_day=table["speed_m_per_day"],
+            interpolated=pa.array(interpolated.astype(bool)), corr=table["target_corr"],
+            direct_match_share=table["pair_direct_share"], flags=pa.array(flags.astype(np.uint8)),
+        )
+    else:
+        for name in ("dx_m", "dy_m", "speed_m_per_day", "interpolated", "corr", "direct_match_share", "flags"):
+            values[name] = pa.nulls(n, schema.field(name).type)
+    columns = [_column(values[name], schema.field(name)) for name in COLUMN_NAMES]
+    return pa.Table.from_arrays(columns, schema=pa.schema(list(schema)))
 
 
-def publish(
-    input_sqlite: Path,
-    output: Path | None = None,
-    manifest: Path | None = None,
-    release_id: str | None = None,
-    batch_size: int = 100_000,
+def _time_filter(field: str, lo: datetime, hi: datetime):
+    pa, _, ds, _ = _pyarrow()
+    kind = pa.timestamp("ms", tz="UTC")
+    return (ds.field(field) >= pa.scalar(lo, type=kind)) & (ds.field(field) < pa.scalar(hi, type=kind))
+
+
+def build_period(
+    source: Source,
+    catalog_path: Path,
+    output: Path,
+    release_id: str,
+    overwrite: bool = False,
+    rows_per_group: int = ROWS_PER_GROUP,
 ) -> dict[str, Any]:
-    """Write one public edge dataset and its adjacent checked manifest."""
-    if batch_size < 1:
-        raise ValueError("batch_size must be positive")
-    source = inspect_source(input_sqlite, release_id)
-    output = (output or _default_output(source.path)).resolve()
-    manifest = (manifest or _default_manifest(output)).resolve()
-    if output.exists():
+    """Write one period's public Parquet. Streams month by month; returns the manifest entry."""
+    pa, pc, ds, pq = _pyarrow()
+    output = Path(output)
+    if output.exists() and not overwrite:
         raise FileExistsError(output)
-    if manifest.exists():
-        raise FileExistsError(manifest)
     temporary = output.with_suffix(output.suffix + ".tmp")
     if temporary.exists():
         raise FileExistsError(temporary)
     output.parent.mkdir(parents=True, exist_ok=True)
-    pa, pq = _pyarrow()
-    schema = public_schema(source)
-    row_count = 0
-    trajectory_ids: set[int] = set()
-    start_time: datetime | None = None
-    end_time: datetime | None = None
-    bounds: dict[str, float | None] = {
-        "min_x_m": None, "max_x_m": None, "min_y_m": None, "max_y_m": None,
-    }
-    current_trajectory: int | None = None
-    previous_target: tuple[Any, ...] | None = None
+    catalog = load_catalog(catalog_path)
+    window = ownership_window(source.period)
+    window_ms = (_ms(window[0]), _ms(window[1]))
+
+    # Pass 1: per-trajectory first link index (point_index offsets), counts and time bounds.
+    head = pq.read_table(source.parquet, columns=["qc_trajectory_id", "trajectory_link_index", "start_time_utc", "end_time_utc"])
+    for name in head.column_names:
+        if head[name].null_count:
+            raise ValueError(f"{source.period}: nulls in source column {name}")
+    n_links = head.num_rows
+    grouped = head.group_by("qc_trajectory_id").aggregate([
+        ("trajectory_link_index", "min"), ("trajectory_link_index", "max"), ("trajectory_link_index", "count")
+    ]).sort_by("qc_trajectory_id")
+    traj_ids = grouped["qc_trajectory_id"].to_numpy()
+    first_index = grouped["trajectory_link_index_min"].to_numpy().astype(np.int64)
+    span = grouped["trajectory_link_index_max"].to_numpy().astype(np.int64) - first_index + 1
+    if not np.array_equal(span, grouped["trajectory_link_index_count"].to_numpy().astype(np.int64)):
+        raise ValueError(f"{source.period}: link indices of a trajectory are not consecutive")
+    start_ms = head["start_time_utc"].cast(pa.int64()).to_numpy()
+    end_ms = head["end_time_utc"].cast(pa.int64()).to_numpy()
+    expected_primary_links = int(((start_ms >= window_ms[0]) & (start_ms < window_ms[1])).sum())
+    first_ms, last_ms = int(start_ms.min()), int(end_ms.max())
+    n_trajectories = len(traj_ids)
+    del head, grouped, start_ms, end_ms
+
+    ctx = _Context(source.period, catalog, traj_ids, first_index, window_ms, public_schema(release_id, source.period),
+                   np.zeros(len(catalog.image_ids), dtype=bool))
+    dataset = ds.dataset(source.parquet, format="parquet")
+    rows = primary_rows = primary_links = end_rows = start_rows = 0
+    time_min = time_max = None
+    bounds = {"x_min": None, "x_max": None, "y_min": None, "y_max": None}
+    months = _month_starts(first_ms, last_ms)
     try:
-        with _connection(source.path) as connection, pq.ParquetWriter(
-            temporary, schema, compression="zstd"
-        ) as writer:
-            cursor = connection.execute(_edge_query(source.table))
-            while rows := cursor.fetchmany(batch_size):
-                public_rows: list[dict[str, Any]] = []
-                for row in rows:
-                    public, pair = _public_edge(row)
-                    if pair in source.break_pairs:
-                        raise ValueError("QC break was selected for publication")
-                    trajectory_id = public["trajectory_id"]
-                    source_endpoint = (
-                        public["source_image_id"], public["start_time_utc"],
-                        public["x0_m"], public["y0_m"], public["source_position_type"],
-                    )
-                    if trajectory_id == current_trajectory and source_endpoint != previous_target:
-                        raise ValueError(
-                            f"Invalid trajectory continuity for post-QC trajectory {trajectory_id}"
-                        )
-                    current_trajectory = trajectory_id
-                    previous_target = (
-                        public["target_image_id"], public["end_time_utc"],
-                        public["x1_m"], public["y1_m"], public["target_position_type"],
-                    )
-                    public_rows.append(public)
-                    row_count += 1
-                    trajectory_ids.add(trajectory_id)
-                    start_time = public["start_time_utc"] if start_time is None else min(
-                        start_time, public["start_time_utc"]
-                    )
-                    end_time = public["end_time_utc"] if end_time is None else max(
-                        end_time, public["end_time_utc"]
-                    )
-                    _bounds_update(bounds, public)
-                writer.write_table(pa.Table.from_pylist(public_rows, schema=schema))
-        if row_count != source.expected_edges:
+        with pq.ParquetWriter(temporary, ctx.schema, compression="zstd") as writer:
+            for lo in months:
+                hi = datetime(lo.year + lo.month // 12, lo.month % 12 + 1, 1, tzinfo=timezone.utc)
+                pieces = []
+                ends = dataset.to_table(columns=list(SOURCE_COLUMNS), filter=_time_filter("end_time_utc", lo, hi))
+                if ends.num_rows:
+                    pieces.append(_arrays(ctx, ends, ends=True))
+                    end_rows += ends.num_rows
+                starts = dataset.to_table(columns=list(SOURCE_COLUMNS), filter=_time_filter("start_time_utc", lo, hi))
+                if starts.num_rows:
+                    pos = np.searchsorted(ctx.traj_ids, starts["qc_trajectory_id"].to_numpy())
+                    is_first = starts["trajectory_link_index"].to_numpy().astype(np.int64) == ctx.first_index[pos]
+                    starts = starts.filter(pa.array(is_first))
+                    if starts.num_rows:
+                        pieces.append(_arrays(ctx, starts, ends=False))
+                        start_rows += starts.num_rows
+                if not pieces:
+                    continue
+                chunk = pa.concat_tables(pieces).sort_by(
+                    [("time", "ascending"), ("trajectory_id", "ascending"), ("point_index", "ascending")])
+                writer.write_table(chunk, row_group_size=rows_per_group)
+                rows += chunk.num_rows
+                flags_primary = chunk["primary"].to_numpy(zero_copy_only=False)
+                primary_rows += int(flags_primary.sum())
+                primary_links += int((flags_primary & (chunk["point_index"].to_numpy() > 0)).sum())
+                span_time = pc.min_max(chunk["time"])
+                lo_t, hi_t = _ms(span_time["min"].as_py()), _ms(span_time["max"].as_py())
+                time_min = lo_t if time_min is None else min(time_min, lo_t)
+                time_max = hi_t if time_max is None else max(time_max, hi_t)
+                for axis in ("x", "y"):
+                    span_axis = pc.min_max(chunk[f"{axis}_m"])
+                    low, high = span_axis["min"].as_py(), span_axis["max"].as_py()
+                    bounds[f"{axis}_min"] = low if bounds[f"{axis}_min"] is None else min(bounds[f"{axis}_min"], low)
+                    bounds[f"{axis}_max"] = high if bounds[f"{axis}_max"] is None else max(bounds[f"{axis}_max"], high)
+                del chunk, pieces, ends, starts
+        if end_rows != n_links or start_rows != n_trajectories or rows != n_links + n_trajectories:
             raise ValueError(
-                f"Published {row_count} edges but QC input expects {source.expected_edges}"
+                f"{source.period}: wrote {rows} rows ({end_rows} steps, {start_rows} starts) but the source has "
+                f"{n_links} links and {n_trajectories} trajectories"
             )
-        if sha256(source.path) != source.source_sha256:
-            raise ValueError("Source SQLite checksum changed while publishing")
+        if primary_links != expected_primary_links:
+            raise ValueError(f"{source.period}: {primary_links} primary steps, expected {expected_primary_links}")
         os.replace(temporary, output)
-        result = _manifest_payload(
-            source, output, row_count, trajectory_ids, start_time, end_time, bounds
-        )
-        _atomic_write_json(manifest, result)
-        return result
     except Exception:
         if temporary.exists():
             temporary.unlink()
         raise
-
-
-def _parquet_rows(path: Path, batch_size: int) -> Iterator[dict[str, Any]]:
-    _, pq = _pyarrow()
-    parquet = pq.ParquetFile(path)
-    for batch in parquet.iter_batches(batch_size=batch_size, columns=list(PUBLIC_COLUMNS)):
-        yield from batch.to_pylist()
-
-
-def validate(
-    input_sqlite: Path,
-    output: Path | None = None,
-    release_id: str | None = None,
-    batch_size: int = 100_000,
-) -> dict[str, Any]:
-    """Validate an existing Parquet dataset row-for-row against its QC SQLite input."""
-    source = inspect_source(input_sqlite, release_id)
-    output = (output or _default_output(source.path)).resolve()
-    if not output.is_file():
-        raise FileNotFoundError(output)
-    pa, pq = _pyarrow()
-    schema = pq.ParquetFile(output).schema_arrow
-    if tuple(schema.names) != PUBLIC_COLUMNS:
-        raise ValueError("Parquet public column order does not match the publishing schema")
-    metadata = schema.metadata or {}
-    expected_metadata = public_schema(source).metadata or {}
-    for key, value in expected_metadata.items():
-        if metadata.get(key) != value:
-            raise ValueError(f"Parquet schema metadata mismatch for {key.decode()}")
-
-    parquet_rows = _parquet_rows(output, batch_size)
-    row_count = 0
-    trajectory_ids: set[int] = set()
-    current_trajectory: int | None = None
-    previous_target: tuple[Any, ...] | None = None
-    with _connection(source.path) as connection:
-        for source_row in connection.execute(_edge_query(source.table)):
-            expected, pair = _public_edge(source_row)
-            if pair in source.break_pairs:
-                raise ValueError("QC break was selected for publication")
-            try:
-                actual = next(parquet_rows)
-            except StopIteration as error:
-                raise ValueError("Parquet has fewer rows than the QC input expects") from error
-            if actual != expected:
-                raise ValueError(f"Parquet row {row_count} does not match its QC SQLite edge")
-            trajectory_id = expected["trajectory_id"]
-            source_endpoint = (
-                expected["source_image_id"], expected["start_time_utc"], expected["x0_m"],
-                expected["y0_m"], expected["source_position_type"],
-            )
-            if trajectory_id == current_trajectory and source_endpoint != previous_target:
-                raise ValueError(f"Invalid trajectory continuity for {trajectory_id}")
-            current_trajectory = trajectory_id
-            previous_target = (
-                expected["target_image_id"], expected["end_time_utc"], expected["x1_m"],
-                expected["y1_m"], expected["target_position_type"],
-            )
-            row_count += 1
-            trajectory_ids.add(trajectory_id)
-    try:
-        next(parquet_rows)
-    except StopIteration:
-        pass
-    else:
-        raise ValueError("Parquet has more rows than the QC input expects")
-    if row_count != source.expected_edges:
-        raise ValueError(
-            f"Validated {row_count} edges but QC input expects {source.expected_edges}"
-        )
     return {
-        "status": "passed",
-        "input_sqlite": str(source.path),
-        "output_parquet": str(output),
-        "row_count": row_count,
-        "trajectory_count": len(trajectory_ids),
-        "expected_accepted_edge_count": source.expected_edges,
-        "no_invalid_trajectory_continuity": True,
-        "no_edge_across_qc_break": True,
+        "period": source.period,
+        "file": output.name,
+        "bytes": output.stat().st_size,
+        "sha256": sha256(output),
+        "rows": rows,
+        "trajectories": n_trajectories,
+        "steps": n_links,
+        "primary_rows": primary_rows,
+        "primary_steps": primary_links,
+        "scenes": int(ctx.used_scenes.sum()),
+        "primary_window": {"start": _utc_text(window[0]), "stop_exclusive": _utc_text(window[1])},
+        "time_start": _utc_text(_ms_to_datetime(time_min)),
+        "time_end": _utc_text(_ms_to_datetime(time_max)),
+        "bounds_epsg3413_m": bounds,
+        "_provenance": {
+            "source_parquet": str(source.parquet),
+            "source_manifest": str(source.manifest_path),
+            "source_manifest_sha256": sha256(source.manifest_path),
+            "source_parquet_sha256_in_manifest": (source.manifest.get("outputs") or {}).get(source.parquet.name),
+            "protocol_id": source.manifest.get("protocol_id"),
+            "protocol_sha256": source.manifest.get("protocol_sha256"),
+            "links_before_filtering": source.manifest.get("input_links"),
+            "catalog": str(catalog.path),
+            "catalog_sha256": catalog.sha256,
+        },
     }
 
 
-def discover(release_root: Path) -> list[Path]:
-    """Find frozen QC SQLite releases, excluding macOS sidecar files."""
-    return sorted(
-        path for path in release_root.rglob("*_qc.sqlite")
-        if not path.name.startswith("._") and path.is_file()
-    )
+def data_dictionary() -> str:
+    """Markdown data dictionary generated from the schema constants."""
+    lines = [
+        f"# LiMOSAT trajectory dataset: data dictionary (schema {SCHEMA_VERSION})",
+        "",
+        "Generated by `limosat.publish` from the schema definition. One Parquet file per processing period.",
+        "",
+        "## What a row is",
+        "",
+        "A row is one **observation** of an ice feature in one Sentinel-1 scene. The observations of a trajectory",
+        "share `trajectory_id` and are ordered by `point_index`; consecutive rows are linked by the step that",
+        "arrived at the later one (`dx_m`, `dy_m`, `speed_m_per_day` and the other step columns describe the step",
+        "from the previous row of the same trajectory, and are null on its first row). Rows are sorted by `time`.",
+        "Trajectory identifiers are unique only within a period; use (`period`, `trajectory_id`).",
+        "",
+        f"Coordinates are {CRS} metres. Times are UTC.",
+        "",
+        "## Columns",
+        "",
+        "| Column | Type | Unit | Nullable | Description |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for c in COLUMNS:
+        lines.append(f"| `{c.name}` | {c.type} | {c.unit} | {'yes' if c.nullable else 'no'} | {c.description} |")
+    lines += ["", "## Flags", "", "| Bit | Name | Meaning |", "| --- | --- | --- |"]
+    for name, bit in FLAG_BITS.items():
+        lines.append(f"| {bit} | `{name}` | {FLAG_DESCRIPTIONS[name]} |")
+    lines += [
+        "",
+        "## Overlapping periods and `primary`",
+        "",
+        "Processing periods are 15 months long and overlap their neighbours by three months (May to July). All rows",
+        "of every period are published. The rule `" + OWNERSHIP_POLICY + "` assigns each step to one period by its",
+        "start time: a period owns start times from 1 August of its first year up to (not including) 1 August of",
+        "the next year, and the first period also owns its first three months. `primary` is true on rows that",
+        "belong to that window. To use each date once, keep `primary` rows of all periods. Do not combine non-primary",
+        "rows with primary rows of the neighbouring period: they are independent processings of the same dates.",
+        "",
+        "Windows (start inclusive, stop exclusive) are in `manifest.json`.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(text)
+    os.replace(temporary, path)
+
+
+def build(
+    source_root: Path,
+    catalog_dir: Path,
+    output_dir: Path,
+    release_id: str,
+    periods: list[str] | None = None,
+    overwrite: bool = False,
+    verify_source: bool = True,
+) -> dict[str, Any]:
+    """Publish every (or the selected) period of an internal release into a flat output directory."""
+    source_root, catalog_dir, output_dir = Path(source_root), Path(catalog_dir), Path(output_dir)
+    sources = find_sources(source_root, periods)
+    if verify_source:
+        sources = [inspect_source(s.parquet, verify_checksum=True) for s in sources]
+    output_dir.mkdir(parents=True, exist_ok=True)
+    entries = []
+    for source in sources:
+        output = output_dir / f"limosat_{source.period}.parquet"
+        entries.append(build_period(source, find_catalog(catalog_dir, source.period), output, release_id, overwrite))
+    provenance = {entry["period"]: entry.pop("_provenance") for entry in entries}
+    manifest = {
+        "schema_version": SCHEMA_VERSION,
+        "release_id": release_id,
+        "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "crs": CRS,
+        "primary": {"policy_id": OWNERSHIP_POLICY,
+                    "definition": "start time of the arriving step (own time for point_index 0) in the period's "
+                    "half-open window"},
+        "flag_bits": FLAG_BITS,
+        "columns": columns_spec(),
+        "files": entries,
+        "totals": {key: sum(e[key] for e in entries) for key in ("rows", "trajectories", "steps", "primary_rows", "primary_steps")},
+    }
+    _atomic_write(output_dir / "manifest.json", json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    _atomic_write(output_dir / "DATA_DICTIONARY.md", data_dictionary())
+    _atomic_write(output_dir / "checksums.sha256", "".join(f"{e['sha256']}  {e['file']}\n" for e in entries))
+    sidecar = output_dir.with_name(output_dir.name + ".provenance.json")
+    _atomic_write(sidecar, json.dumps({"release_id": release_id, "source_root": str(source_root), "periods": provenance},
+                                      indent=2, sort_keys=True) + "\n")
+    return manifest
+
+
+# --------------------------------------------------------------------------------------------- validation
+
+
+def _read_sample(path: Path, columns: list[str], key: str, modulus: int):
+    """Rows whose trajectory key is divisible by ``modulus``, read row group by row group."""
+    pa, _, _, pq = _pyarrow()
+    parquet = pq.ParquetFile(path)
+    pieces = []
+    for index in range(parquet.num_row_groups):
+        group = parquet.read_row_group(index, columns=columns)
+        mask = (group[key].to_numpy() % modulus) == 0
+        if mask.any():
+            pieces.append(group.filter(pa.array(mask)))
+    return pa.concat_tables(pieces) if pieces else parquet.schema_arrow.empty_table().select(columns)
+
+
+def validate_period(source: Source, catalog_path: Path, output: Path, entry: dict[str, Any], release_id: str,
+                    sample_modulus: int = 50) -> dict[str, Any]:
+    """Check a published file against the manifest entry and, on a sample of trajectories, against the source."""
+    pa, pc, _, pq = _pyarrow()
+    output = Path(output)
+    if sha256(output) != entry["sha256"]:
+        raise ValueError(f"{output.name}: checksum differs from the manifest")
+    parquet = pq.ParquetFile(output)
+    expected = public_schema(release_id, source.period)
+    if [(f.name, f.type, f.nullable) for f in parquet.schema_arrow] != [(f.name, f.type, f.nullable) for f in expected]:
+        raise ValueError(f"{output.name}: columns differ from the schema")
+    metadata = parquet.schema_arrow.metadata or {}
+    for key, value in (expected.metadata or {}).items():
+        if metadata.get(key) != value:
+            raise ValueError(f"{output.name}: schema metadata {key.decode()} differs")
+    if parquet.metadata.num_rows != entry["rows"]:
+        raise ValueError(f"{output.name}: {parquet.metadata.num_rows} rows, manifest says {entry['rows']}")
+    core = pq.read_table(output, columns=["trajectory_id", "point_index", "time", "primary"])
+    time = core["time"].cast(pa.int64()).to_numpy()
+    if (np.diff(time) < 0).any():
+        raise ValueError(f"{output.name}: rows are not sorted by time")
+    per = core.group_by("trajectory_id").aggregate([("point_index", "min"), ("point_index", "max"), ("point_index", "count")])
+    if (per["point_index_min"].to_numpy() != 0).any() or \
+            (per["point_index_max"].to_numpy().astype(np.int64) + 1 != per["point_index_count"].to_numpy()).any():
+        raise ValueError(f"{output.name}: point_index is not 0..n-1 within every trajectory")
+    if per.num_rows != entry["trajectories"]:
+        raise ValueError(f"{output.name}: {per.num_rows} trajectories, manifest says {entry['trajectories']}")
+    primary = core["primary"].to_numpy(zero_copy_only=False)
+    if int(primary.sum()) != entry["primary_rows"] or int((primary & (core["point_index"].to_numpy() > 0)).sum()) != entry["primary_steps"]:
+        raise ValueError(f"{output.name}: primary counts differ from the manifest")
+    del core, per, time
+
+    # Source cross-check on a sample of trajectories: every published step must equal its source link.
+    catalog = load_catalog(catalog_path)
+    window = ownership_window(source.period)
+    w0, w1 = _ms(window[0]), _ms(window[1])
+    src = _read_sample(source.parquet, list(SOURCE_COLUMNS), "qc_trajectory_id", sample_modulus)
+    pub = _read_sample(output, list(COLUMN_NAMES), "trajectory_id", sample_modulus)
+
+    def col(table, name):
+        return table[name].to_numpy(zero_copy_only=False)
+
+    s_order = np.lexsort((col(src, "trajectory_link_index"), col(src, "qc_trajectory_id")))
+    p_order = np.lexsort((col(pub, "point_index"), col(pub, "trajectory_id")))
+    src, pub = src.take(pa.array(s_order)), pub.take(pa.array(p_order))
+    if pub.num_rows != src.num_rows + len(set(col(src, "qc_trajectory_id").tolist())):
+        raise ValueError(f"{output.name}: sampled row count is not links + trajectories")
+    p_idx = col(pub, "point_index")
+    is_step = p_idx > 0
+    step = pub.filter(pa.array(is_step))
+    first = pub.filter(pa.array(~is_step))
+    start_ms = src["start_time_utc"].cast(pa.int64()).to_numpy()
+    end_ms = src["end_time_utc"].cast(pa.int64()).to_numpy()
+
+    def same(a, b, name):
+        if not np.array_equal(np.asarray(a), np.asarray(b), equal_nan=np.asarray(a).dtype.kind == "f"):
+            raise ValueError(f"{output.name}: sampled {name} differ from the source")
+
+    same(col(step, "trajectory_id"), col(src, "qc_trajectory_id"), "trajectory ids")
+    same(step["time"].cast(pa.int64()).to_numpy(), end_ms, "end times")
+    same(col(step, "x_m"), col(src, "x1_m"), "x"); same(col(step, "y_m"), col(src, "y1_m"), "y")
+    same(col(step, "dx_m"), col(src, "dx_m"), "dx"); same(col(step, "dy_m"), col(src, "dy_m"), "dy")
+    same(col(step, "speed_m_per_day"), col(src, "speed_m_per_day"), "speed")
+    same(col(step, "interpolated"), col(src, "target_interpolated").astype(bool), "interpolated")
+    same(col(step, "corr"), col(src, "target_corr").astype(np.float32), "corr")
+    same(col(step, "direct_match_share"), col(src, "pair_direct_share").astype(np.float32), "direct_match_share")
+    same(col(step, "flags"), col(src, "qc_flags").astype(np.uint8), "flags")
+    same(col(step, "primary"), (start_ms >= w0) & (start_ms < w1), "primary flags")
+    position = np.searchsorted(catalog.image_ids, col(src, "target_image_id"))
+    same(col(step, "scene"), np.asarray(catalog.scenes.take(pa.array(position)).to_pylist(), dtype=object), "scenes")
+    # chain: the point before each step is the step's source (position and time)
+    previous = pub.take(pa.array(np.flatnonzero(is_step) - 1))
+    same(col(previous, "x_m"), col(src, "x0_m"), "chain x"); same(col(previous, "y_m"), col(src, "y0_m"), "chain y")
+    same(previous["time"].cast(pa.int64()).to_numpy(), start_ms, "chain times")
+    same(col(previous, "trajectory_id"), col(src, "qc_trajectory_id"), "chain trajectory")
+    # first rows have no step values
+    for name in ("dx_m", "dy_m", "speed_m_per_day", "interpolated", "corr", "direct_match_share", "flags"):
+        if first[name].null_count != first.num_rows:
+            raise ValueError(f"{output.name}: first observations carry values in {name}")
+    return {"period": source.period, "status": "passed", "rows": entry["rows"], "sampled_steps": int(is_step.sum()),
+            "sample_modulus": sample_modulus}
+
+
+def validate(source_root: Path, catalog_dir: Path, output_dir: Path, sample_modulus: int = 50) -> list[dict[str, Any]]:
+    output_dir = Path(output_dir)
+    manifest = json.loads((output_dir / "manifest.json").read_text())
+    results = []
+    for entry in manifest["files"]:
+        period = entry["period"]
+        source = inspect_source(Path(source_root) / period / f"{period}_qc.parquet")
+        results.append(validate_period(source, find_catalog(catalog_dir, period), output_dir / entry["file"],
+                                       entry, manifest["release_id"], sample_modulus))
+    return results
+
+
+# --------------------------------------------------------------------------------------------- CLI
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("one", "validate"):
+    for name in ("build", "validate"):
         command = commands.add_parser(name)
-        command.add_argument("--input", type=Path, required=True)
-        command.add_argument("--output", type=Path)
-        command.add_argument("--release-id")
-        command.add_argument("--batch-size", type=int, default=100_000)
-        if name == "one":
-            command.add_argument("--manifest", type=Path)
-    for name in ("all", "validate-all"):
-        command = commands.add_parser(name)
-        command.add_argument("--release-root", type=Path, required=True)
-        command.add_argument("--release-id")
-        command.add_argument("--batch-size", type=int, default=100_000)
+        command.add_argument("--source-root", type=Path, required=True,
+                             help="internal release folder holding <period>/<period>_qc.parquet")
+        command.add_argument("--catalog-dir", type=Path, required=True, help="folder of <period>_image_catalog_*.json")
+        command.add_argument("--output-dir", type=Path, required=True)
+        if name == "build":
+            command.add_argument("--release-id", required=True)
+            command.add_argument("--period", action="append", dest="periods")
+            command.add_argument("--overwrite", action="store_true")
+            command.add_argument("--skip-source-checksum", action="store_true",
+                                 help="do not hash the source Parquet files against their manifests")
+        else:
+            command.add_argument("--sample-modulus", type=int, default=50,
+                                 help="check every Nth trajectory against the source (1 checks all)")
     return parser
 
 
 def main(argv: list[str] | None = None) -> None:
     args = _parser().parse_args(argv)
-    if args.command == "one":
-        result = publish(args.input, args.output, args.manifest, args.release_id, args.batch_size)
-    elif args.command == "validate":
-        result = validate(args.input, args.output, args.release_id, args.batch_size)
+    if args.command == "build":
+        result = build(args.source_root, args.catalog_dir, args.output_dir, args.release_id, args.periods,
+                       args.overwrite, not args.skip_source_checksum)
     else:
-        inputs = discover(args.release_root)
-        if not inputs:
-            raise ValueError(f"No eligible '*_qc.sqlite' files under {args.release_root}")
-        operation = publish if args.command == "all" else validate
-        result = [
-            operation(path, release_id=args.release_id or args.release_root.name, batch_size=args.batch_size)
-            for path in inputs
-        ]
+        result = validate(args.source_root, args.catalog_dir, args.output_dir, args.sample_modulus)
     print(json.dumps(result, indent=2, sort_keys=True, default=str))
 
 

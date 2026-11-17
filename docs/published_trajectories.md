@@ -1,87 +1,88 @@
-# Published trajectory extensions
+# Published trajectory dataset
 
-`limosat.publish` creates the sole public scientific dataset for a frozen LiMOSAT
-QC SQLite release: one Parquet file of accepted, consecutive trajectory
-extensions. It uses the post-QC trajectory identifiers and segment boundaries
-already materialized by `limosat.qc`; it does not apply or expose QC decisions.
+`limosat.publish` turns a frozen internal release into the public LiMOSAT trajectory dataset (schema 2).
+It only projects existing results: it reads each period's internal kept-link Parquet and its manifest plus
+the period's image catalogue, and never scores, filters or alters a link. Keep it independent of
+`limosat.qc`: the public format is a stable contract, while the internal files may change.
 
-The coordinate reference system is EPSG:3413 and all coordinate and displacement
-values are metres. Times are UTC Parquet timestamps. The Parquet schema metadata
-records the release ID, source window, CRS, units, schema version, and SHA-256 of
-the frozen QC SQLite input. The adjacent `*.manifest.json` records input/output
-checksums, counts, bounds, and validation results.
+## Format
 
-## Data dictionary (schema v1.0.0)
+One Parquet file per processing period, `limosat_<period>.parquet`, flat in the output folder, and:
 
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `trajectory_id` | int64 | Stable post-QC trajectory segment identifier. |
-| `source_image_id`, `target_image_id` | int64 | Consecutive source and target image identifiers. |
-| `start_time_utc`, `end_time_utc` | timestamp[us, UTC] | Endpoint acquisition times. |
-| `elapsed_seconds` | float64 | `end_time_utc - start_time_utc`, in seconds. |
-| `x0_m`, `y0_m`, `x1_m`, `y1_m` | float64 | Source and target EPSG:3413 coordinates, in metres. |
-| `dx_m`, `dy_m` | float64 | Target minus source displacement, in metres. |
-| `distance_m` | float64 | Euclidean displacement magnitude, in metres. |
-| `speed_m_s` | float64 | `distance_m / elapsed_seconds`. |
-| `speed_m_per_day` | float64 | Speed scaled to metres per day. |
-| `source_position_type`, `target_position_type` | string | `observed` or `interpolated` endpoint status. |
+- `manifest.json`: schema version, release id, column definitions, flag bits, the `primary` window of every
+  period, and per file the checksum, size, row, trajectory and step counts, time and spatial bounds.
+- `DATA_DICTIONARY.md`: generated from the schema constants in `limosat/publish.py`. Do not edit by hand.
+- `checksums.sha256`.
 
-## Publishing and validation
+A row is one **observation** of an ice feature in one Sentinel-1 scene, carrying the step that arrived at it.
+A trajectory is the rows with one `trajectory_id` (unique within a period) ordered by `point_index`; the first
+row has `point_index` 0 and null step columns. Rows are sorted by `time`, with time-ordered row groups so
+date queries read few row groups.
 
-Install the optional writer dependency once in the active environment:
+| Column | Meaning |
+| --- | --- |
+| `period`, `trajectory_id`, `point_index` | identity; use (`period`, `trajectory_id`) across periods |
+| `time`, `scene` | UTC acquisition time and Sentinel-1 product name of the scene |
+| `x_m`, `y_m` | EPSG:3413 position in metres |
+| `dx_m`, `dy_m`, `speed_m_per_day` | step from the previous row of the trajectory |
+| `interpolated`, `corr`, `direct_match_share`, `flags` | properties of the arriving step |
+| `primary` | the row lies in the period's own date window |
 
-```bash
-conda install -c conda-forge pyarrow
-```
+The full definitions, flag bits and the explanation of `primary` are in the generated data dictionary.
 
-Publish one selected frozen release (the Parquet and manifest are written beside
-the SQLite input):
+### Overlapping periods and `primary`
 
-```bash
-python -m limosat.publish one \
-  --input /Volumes/KINGSTON/arktalas/qc/releases/20260908_v1/201905_202007/201905_202007_qc.sqlite
-```
+Periods are 15 months long and overlap their neighbours by three months. All rows are published. Rule
+`limosat_release_august_annual_v1` gives each step to one period by its start time: a period owns start times
+from 1 August of its first year up to 1 August of the next, the first period also owning its first three
+months. `primary` is true on rows in that window (for a trajectory's first row, its own time; otherwise the
+start time of the arriving step). Keep `primary` rows of all periods to use each date once.
 
-Discover and publish every eligible frozen QC SQLite release under the root:
+## Scene names
 
-```bash
-python -m limosat.publish all \
-  --release-root /Volumes/KINGSTON/arktalas/qc/releases/20260908_v1
-```
+The scene name comes from the period's image catalogue (`<period>_image_catalog_*.json`, written by
+`limosat.catalog`, which numbers images by acquisition time then file name). `publish` checks that every image
+id exists in the catalogue and that its time equals the observation time, so a wrong catalogue fails the build.
 
-Validate an existing output row-for-row against its QC SQLite input:
+## Build and validate
+
+Install PyArrow in the active environment (`pip install pyarrow`, or conda-forge), then:
 
 ```bash
-python -m limosat.publish validate-all \
-  --release-root /Volumes/KINGSTON/arktalas/qc/releases/20260908_v1
+python -m limosat.publish build \
+  --source-root /path/to/internal/release \        # <period>/<period>_qc.parquet + manifest
+  --catalog-dir /path/to/image_catalogs \
+  --output-dir /path/to/staging/public_v2 \
+  --release-id <public release id>
 ```
 
-The validation checks the QC release gate, expected accepted-edge count,
-trajectory continuity, and that no output edge matches a recorded QC break.
+`--period YYYYMM_YYYYMM` (repeatable) builds selected periods; `--overwrite` replaces existing files;
+`--skip-source-checksum` skips hashing the sources against their manifests. The build streams month by month
+(about 3 GB of memory for a 52-million-link period) and checks that the row count equals steps plus
+trajectories and that the number of `primary` steps equals the number of source links starting in the window.
+
+Internal provenance (source paths, checksums, protocol ids) is written next to, not inside, the output folder
+as `<output-dir>.provenance.json`. Do not publish it. Public outputs contain no local paths.
+
+```bash
+python -m limosat.publish validate --source-root ... --catalog-dir ... --output-dir ... --sample-modulus 50
+```
+
+`validate` re-checks checksums, schema, time order, `point_index`, and the manifest counts for every file,
+and compares every Nth trajectory (default 50, 1 checks all) with the source links: positions, step values,
+flags, scenes, chain continuity and `primary`.
 
 ## Reader examples
 
 ```python
-# PyArrow
-import pyarrow.parquet as pq
-table = pq.read_table("201905_202007_qc_publish.parquet")
-metadata = table.schema.metadata
+import pandas as pd
+frame = pd.read_parquet("limosat_202305_202407.parquet")
+once = frame[frame.primary]                       # each date once across periods
+trajectory = frame[(frame.trajectory_id == 401)].sort_values("point_index")
 ```
 
 ```sql
--- DuckDB
-SELECT AVG(speed_m_per_day)
-FROM read_parquet('201905_202007_qc_publish.parquet');
-```
-
-```python
-# Pandas
-import pandas as pd
-frame = pd.read_parquet("201905_202007_qc_publish.parquet")
-```
-
-```r
-# R (arrow)
-library(arrow)
-trajectory_extensions <- read_parquet("201905_202007_qc_publish.parquet")
+-- DuckDB. PRIMARY is a reserved SQL word, so the column must be quoted.
+SELECT date_trunc('month', time) AS month, avg(speed_m_per_day)
+FROM read_parquet('limosat_*.parquet') WHERE "primary" AND point_index > 0 GROUP BY 1;
 ```

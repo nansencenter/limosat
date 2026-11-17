@@ -52,12 +52,13 @@ Rejected vectors split trajectories without deleting keypoints or modifying the
 original database. See the [trajectory QC guide](docs/trajectory_qc.md) for usage
 and limitations.
 
-## Publish frozen QC releases
+## Publish the trajectory dataset
 
-The compact public trajectory-extension dataset is generated only after QC
-materialization. It is an ordinary Parquet table (not GeoParquet) containing
-accepted consecutive trajectory extensions and an adjacent integrity manifest.
-See [the published-trajectory data dictionary and commands](docs/published_trajectories.md).
+`limosat.publish` projects a frozen internal release into the public dataset: one
+Parquet point table per processing period (one row per observation, sorted by
+time, with the Sentinel-1 scene name and a `primary` flag for the period's own
+date window), plus a manifest, a generated data dictionary and checksums. See
+[the published-trajectory format and commands](docs/published_trajectories.md).
 
 ## License
 
