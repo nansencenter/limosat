@@ -188,6 +188,9 @@ def prepare_recovery_targets(
     request_plan: str | Path | None = None,
 ) -> dict:
     """Select frozen source positions, optionally from an explicit pair request plan."""
+    if config.trajectories.merge_radius_m is not None:
+        # A merged trajectory looks like a lost one here; passes would revive it.
+        raise NotImplementedError("continuation passes do not yet support merge_radius_m")
     primary_root = Path(primary_composition)
     primary_manifest_path = primary_root / "composition-manifest-v1.json"
     primary_manifest = json.loads(

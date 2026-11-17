@@ -52,7 +52,8 @@ def compose_primary_parquet(
     points_path = output / "trajectory-points-v1.parquet"
     extensions_path = output / "trajectory-extensions-qc-v1.parquet"
     manifest_path = output / "composition-manifest-v1.json"
-    for path in (points_path, extensions_path, manifest_path):
+    merges_path = output / "trajectory-merges-v1.parquet"
+    for path in (points_path, extensions_path, manifest_path, merges_path):
         if path.exists():
             raise FileExistsError(path)
 
@@ -98,6 +99,7 @@ def compose_primary_parquet(
     extension_count = 0
     point_states: Counter[str] = Counter()
     qc_statuses: Counter[str] = Counter()
+    merge_rows: list[dict] = []
     try:
         for batch in iter_global_trajectory_batches(
             edges,
@@ -133,12 +135,28 @@ def compose_primary_parquet(
                 )
                 extension_count += len(scored)
                 qc_statuses.update(value.qc_status for value in scored)
+            merge_rows.extend(
+                {"trajectory_id": event.trajectory_id, "merged_into": event.merged_into,
+                 "image_id": event.image_id, "time_utc": event.time_utc,
+                 "separation_m": event.separation_m}
+                for event in batch.merges
+            )
         point_writer.close()
         point_writer = None
         extension_writer.close()
         extension_writer = None
         os.replace(points_temporary, points_path)
         os.replace(extensions_temporary, extensions_path)
+        if config.trajectories.merge_radius_m is not None:
+            merge_schema = pa.schema([
+                ("trajectory_id", pa.string()), ("merged_into", pa.string()),
+                ("image_id", pa.string()), ("time_utc", pa.timestamp("us", tz="UTC")),
+                ("separation_m", pa.float64()),
+            ])
+            merges_temporary = _temporary(merges_path)
+            pq.write_table(pa.Table.from_pylist(merge_rows, schema=merge_schema),
+                           merges_temporary, compression="zstd")
+            os.replace(merges_temporary, merges_path)
     finally:
         if point_writer is not None:
             point_writer.close()
@@ -184,10 +202,14 @@ def compose_primary_parquet(
             "trajectory_point_states": dict(sorted(point_states.items())),
             "trajectory_extensions": extension_count,
             "extension_qc_status": dict(sorted(qc_statuses.items())),
+            **({"trajectory_merges": len(merge_rows)}
+               if config.trajectories.merge_radius_m is not None else {}),
         },
         "products": {
             "trajectory_points": _file_record(points_path),
             "trajectory_extensions": _file_record(extensions_path),
+            **({"trajectory_merges": _file_record(merges_path)}
+               if config.trajectories.merge_radius_m is not None else {}),
         },
     }
     temporary_manifest = _temporary(manifest_path)

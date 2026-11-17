@@ -104,11 +104,23 @@ class TrajectoryExtension:
 
 
 @dataclass(frozen=True)
+class MergeEvent:
+    """A trajectory ended because another one occupies the same ice (merge_radius_m)."""
+
+    trajectory_id: str
+    merged_into: str
+    image_id: str
+    time_utc: datetime
+    separation_m: float
+
+
+@dataclass(frozen=True)
 class TrajectoryBatch:
     """Per-image points and their directly measured incoming extensions."""
 
     points: tuple[TrajectoryPoint, ...]
     extensions: tuple[TrajectoryExtension, ...]
+    merges: tuple[MergeEvent, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -203,6 +215,9 @@ def iter_global_trajectory_batches(
 
     positions: list[dict[str, np.ndarray]] = [dict() for _ in ordered_images]
     identities: set[str] = set()
+    observations: dict[str, int] = {}
+    merged: set[str] = set()
+    merge_radius = trajectory_config.merge_radius_m
     last_use: dict[int, int] = {}
     for source, target, _edge in indexed:
         last_use[source] = max(last_use.get(source, target), target)
@@ -210,6 +225,7 @@ def iter_global_trajectory_batches(
     for step, image in enumerate(ordered_images):
         points: list[TrajectoryPoint] = []
         extensions: list[TrajectoryExtension] = []
+        merges: list[MergeEvent] = []
         if step:
             incoming = incoming_by_target.get(step, ())
             eligible = sorted(
@@ -217,7 +233,7 @@ def iter_global_trajectory_batches(
                     identity
                     for source_step, _target_step, _edge in incoming
                     for identity in positions[source_step]
-                }
+                } - merged
             )
             target_validity = (
                 target_validity_factory(image)
@@ -280,6 +296,22 @@ def iter_global_trajectory_batches(
                     )
                 )
 
+        if merge_radius is not None and len(positions[step]) > 1:
+            merges = _merge_duplicates(
+                positions[step], points, observations, merge_radius, image
+            )
+            if merges:
+                ended = {event.trajectory_id for event in merges}
+                merged.update(ended)
+                points = [point for point in points if point.trajectory_id not in ended]
+                extensions = [
+                    extension for extension in extensions
+                    if extension.trajectory_id not in ended
+                ]
+        for point in points:
+            if point.available:
+                observations[point.trajectory_id] = observations.get(point.trajectory_id, 0) + 1
+
         if trajectory_config.add_as_coverage_enters:
             candidates = _outgoing_primary_points(indexed, step)
             if seed_filter_factory is not None and len(candidates):
@@ -297,6 +329,7 @@ def iter_global_trajectory_batches(
                     continue
                 identities.add(identity)
                 positions[step][identity] = xy
+                observations[identity] = 1
                 points.append(
                     _point(identity, image, "created", "seed_grid", xy, None)
                 )
@@ -311,6 +344,7 @@ def iter_global_trajectory_batches(
                     ),
                 )
             ),
+            merges=tuple(sorted(merges, key=lambda event: event.trajectory_id)),
         )
         for source_step, target_step in tuple(last_use.items()):
             if target_step == step:
@@ -705,6 +739,41 @@ def audit_trajectory_convergence(
             ),
         )
     )
+
+
+def _merge_duplicates(
+    current: dict[str, np.ndarray],
+    points: Sequence[TrajectoryPoint],
+    observations: dict[str, int],
+    radius_m: float,
+    image: ImageRecord,
+) -> list[MergeEvent]:
+    """End all but one trajectory of each cluster of positions within ``radius_m`` in
+    this image; ``current`` loses the ended ones. The survivor has the longest
+    history, then the convergence-audit order."""
+    identities = sorted(current)
+    coordinates = np.vstack([current[identity] for identity in identities])
+    pairs = cKDTree(coordinates).query_pairs(radius_m, output_type="ndarray")
+    if not len(pairs):
+        return []
+    by_identity = {point.trajectory_id: point for point in points}
+    counts = {identity: observations.get(identity, 0) + 1 for identity in identities}
+    events: list[MergeEvent] = []
+    for cluster in _index_clusters(len(identities), pairs):
+        ranked = sorted(
+            cluster,
+            key=lambda index: _convergence_rank(by_identity[identities[index]], counts),
+        )
+        winner = identities[ranked[0]]
+        for index in ranked[1:]:
+            loser = identities[index]
+            events.append(MergeEvent(
+                trajectory_id=loser, merged_into=winner, image_id=image.image_id,
+                time_utc=image.time_utc,
+                separation_m=float(np.linalg.norm(coordinates[index] - coordinates[ranked[0]])),
+            ))
+            del current[loser]
+    return events
 
 
 def _convergence_rank(

@@ -349,11 +349,28 @@ def sample_field_with_fallback(
         recovered = sample_field(fallback, np.asarray(query_xy_m)[missing],
                                  maximum_triangle_edge_m)
         original = _merge_samples(original, missing, recovered)
-    if field_config is not None and field_config.gap_filling:
-        original = fill_gaps(baseline, original, query_xy_m, field_config, gap_matches)
     if field_config is not None and field_config.shear_point_estimates:
+        # One rule for every point: interpolate where the nodes agree; use the point's
+        # own matches where they disagree or the field has a hole; bridge what is left
+        # with a rigid triangle (the only estimate not resting on nearby matches).
         original = refine_shear_samples(baseline, original, query_xy_m, field_config, gap_matches)
+        if field_config.gap_fill_rigid_edge_m is not None:
+            original = _fill_rigid(baseline, original, query_xy_m, field_config)
+    elif field_config is not None and field_config.gap_filling:
+        original = fill_gaps(baseline, original, query_xy_m, field_config, gap_matches)
     return original
+
+
+def _fill_rigid(field, samples, query_xy_m, config):
+    query = np.asarray(query_xy_m, dtype=np.float64)
+    missing = np.flatnonzero(~samples.available)
+    if not len(missing):
+        return samples
+    rigid = sample_field(
+        field, query[missing], config.maximum_triangle_edge_m,
+        rigid=(config.gap_fill_rigid_edge_m, config.gap_fill_rigid_spread_m),
+    )
+    return _merge_samples(samples, missing, rigid)
 
 
 def node_triangle_spread(field: DisplacementField, query_xy_m: np.ndarray) -> np.ndarray:
@@ -383,7 +400,7 @@ def refine_shear_samples(
     matches: MotionMatches | None,
 ) -> FieldSamples:
     """Replace a sample by the point's own estimate where the field's nodes disagree
-    more than the point's matches do.
+    more than the point's matches do, and give one to points without a sample.
 
     Linear interpolation between three nodes up to ``maximum_triangle_edge_m`` apart
     blends the two sides of a lead or shear line between them. The point-local
@@ -397,11 +414,11 @@ def refine_shear_samples(
     if matches is None or not len(matches):
         return samples
     query = np.asarray(query_xy_m, dtype=np.float64)
-    rows = np.flatnonzero(samples.available)
-    if not len(rows):
-        return samples
-    spread = node_triangle_spread(field, query[rows])
-    rows, spread = rows[np.isfinite(spread)], spread[np.isfinite(spread)]
+    spread = np.full(len(query), np.inf)  # a point without a sample: any estimate wins
+    sampled = np.flatnonzero(samples.available)
+    spread[sampled] = node_triangle_spread(field, query[sampled])
+    rows = np.flatnonzero(~np.isnan(spread))
+    spread = spread[rows]
     if not len(rows):
         return samples
     estimate = estimate_points(

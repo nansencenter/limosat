@@ -155,7 +155,8 @@ PY
     run_json "$control/primary-compose.json" \
       limosat compose-parquet "$LIMOSAT_CONFIG" "$outputs/primary-composition"
     echo "$(date -u +%FT%TZ) primary composed" >> "$ledger"
-    submit pass 1
+    # STOP_AFTER=primary-compose: composition tests that need no continuation passes.
+    [[ "${LIMOSAT_STOP_AFTER:-}" == primary-compose ]] || submit pass 1
     ;;
   pass)
     n="$LIMOSAT_PASS"

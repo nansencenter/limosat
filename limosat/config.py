@@ -156,7 +156,9 @@ class FieldConfig:
     # disagree by more than the point's own point-local estimate (gap_fill_point_*
     # settings) disagrees with its matches (its maximum residual), that estimate is used
     # instead; in coherent ice the interpolation, whose errors neighbouring points share,
-    # is kept. No threshold of its own. Needs every raw match of each pair at composition.
+    # is kept. No threshold of its own. Points without a sample get their own estimate
+    # too, before any rigid-triangle bridge (gap filling then trusts nearby matches
+    # first). Needs every raw match of each pair at composition.
     # Tested November 2026 on the Jan-Apr 2020 stored pairs: displacement at MOSAiC and
     # IABP buoys, p90 152 -> 124 m (median 352 -> 88 m where the nodes disagree by more
     # than 1 km); deformation of MOSAiC buoy triangles, median error 2-4 km 0.0122 ->
@@ -373,10 +375,21 @@ class TrajectoryConfig:
     add_as_coverage_enters: bool = True
     new_point_exclusion_radius_m: float = 2_000.0
     convergence_audit_radius_m: float | None = None
+    # Merge duplicate trajectories (off by default). When the positions of two or more
+    # trajectories in one image lie within this distance (chained), only the one with the
+    # longest history continues (then more selected matches, lower residual, identity, as
+    # in the convergence audit); the others end there and are recorded in
+    # trajectory-merges-v1.parquet. Duplicates arise when a lost trajectory's reseeded
+    # replacement and the old trajectory, continued later, both persist: in Jan-Apr 2020,
+    # 91 % of trajectories < 1 km apart were already that close when first in one image
+    # (median 0.39 km) and kept their separation (median change 20 m over ~39 days).
+    merge_radius_m: float | None = None
 
     def __post_init__(self) -> None:
         if self.new_point_exclusion_radius_m <= 0:
             raise ValueError("new_point_exclusion_radius_m must be positive")
+        if self.merge_radius_m is not None and not 0 < self.merge_radius_m < self.new_point_exclusion_radius_m:
+            raise ValueError("merge_radius_m must be positive and below new_point_exclusion_radius_m")
         if (
             self.convergence_audit_radius_m is not None
             and self.convergence_audit_radius_m <= 0
@@ -446,6 +459,9 @@ class RunConfig:
         if not self.field.shear_point_estimates:
             # Preserve the identity of existing configurations without shear point estimates.
             values["field"].pop("shear_point_estimates")
+        if self.trajectories.merge_radius_m is None:
+            # Preserve the identity of existing configurations without merging.
+            values["trajectories"].pop("merge_radius_m")
         if not self.field.gap_filling:
             # Preserve the identity of existing configurations without gap filling.
             for name in GAP_FILL_SETTINGS:

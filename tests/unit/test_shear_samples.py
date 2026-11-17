@@ -78,3 +78,20 @@ def test_shear_point_estimates_configuration():
         replace(shear, retain_pair_matches=False)
     with pytest.raises(ValueError, match="gap_fill_point"):
         FieldConfig(shear_point_estimates=True)
+
+
+def test_points_in_field_holes_use_their_own_matches_before_a_rigid_bridge():
+    config = FieldConfig(**SHEAR)
+    matches = _matches(seed=12, count=20_000, shear_x=18_000.0)
+    field = _field(matches, config)
+    hole = np.hypot(*(field.source_xy_m - [18_000.0, 20_000.0]).T) < 3_000.0
+    holed = field.with_available(field.available & ~hole)
+    query = np.array([[17_300.0, 20_000.0], [18_700.0, 20_500.0]])
+    assert not sample_field(holed, query, config.maximum_triangle_edge_m).available.any()
+    kept = gap_matches(holed, matches, config)
+    sampled = sample_field_with_fallback(holed, None, query, config.maximum_triangle_edge_m,
+                                         field_config=config, gap_matches=kept)
+    own = estimate_points(kept, query, 12, 8, 3_000.0, 500.0)
+    assert own["available"].all()
+    np.testing.assert_allclose(sampled.displacement_m, own["displacement_m"])
+    np.testing.assert_allclose(sampled.displacement_m, _truth(query), atol=100.0)
