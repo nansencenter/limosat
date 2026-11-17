@@ -70,6 +70,7 @@ EXCLUDED_SETTINGS = {
         "missing_node_fallback", "gap_fill_rigid_edge_m", "gap_fill_rigid_spread_m",
         "gap_fill_point_neighbour_count", "gap_fill_point_minimum_agreeing_matches",
         "gap_fill_point_neighbour_distance_m", "gap_fill_point_agreement_distance_m",
+        "shear_point_estimates",
     ),
     "routing": (
         "planning_grid_spacing_m", "targeted_recovery",

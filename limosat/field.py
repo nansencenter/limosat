@@ -169,8 +169,9 @@ def field_edge_with_fallback(
 def gap_matches(
     field: DisplacementField, matches: MotionMatches, config: FieldConfig
 ) -> MotionMatches:
-    """The raw matches point-local gap filling can use, so composition need not hold
-    every match of every pair.
+    """The raw matches point-local estimates can use, so composition need not hold
+    every match of every pair. With shear point estimates every sample may need its
+    own estimate, so all matches are kept (without their tile indices).
 
     A point lacks a usable triangle only if a corner of its field grid cell is a
     failed node or lies outside the field (a regular grid cell of accepted nodes
@@ -180,6 +181,8 @@ def gap_matches(
     """
     if not len(matches):
         return matches
+    if config.shear_point_estimates:
+        return _without_tiles(matches.source_xy_m, matches.target_xy_m, matches.score)
     rows = field.grid_row - field.grid_row.min() + 1
     columns = field.grid_column - field.grid_column.min() + 1
     present = np.zeros((rows.max() + 2, columns.max() + 2), dtype=bool)
@@ -204,6 +207,13 @@ def gap_matches(
         matches.source_xy_m[near], matches.target_xy_m[near], matches.score[near],
         matches.source_tile[near], matches.target_tile[near],
     )
+
+
+def _without_tiles(source: np.ndarray, target: np.ndarray, score: np.ndarray) -> MotionMatches:
+    """Matches for point estimates, which never read tile indices: those are a
+    zero-stride view, so they take no memory."""
+    zeros = np.broadcast_to(np.int32(0), (len(score),))
+    return MotionMatches(source, target, score, zeros, zeros)
 
 
 def weighted_geometric_median(vectors: np.ndarray, weights: np.ndarray) -> np.ndarray:
@@ -330,7 +340,8 @@ def sample_field_with_fallback(
     """Preserve all supported baseline samples; use fallback only for gaps.
 
     With gap filling configured (``field_config``), points still without a sample
-    are filled by ``fill_gaps``.
+    are filled by ``fill_gaps``; with shear point estimates, samples whose nodes
+    disagree are then refined by ``refine_shear_samples``.
     """
     original = sample_field(baseline, query_xy_m, maximum_triangle_edge_m)
     if fallback is not None and not original.available.all():
@@ -340,7 +351,72 @@ def sample_field_with_fallback(
         original = _merge_samples(original, missing, recovered)
     if field_config is not None and field_config.gap_filling:
         original = fill_gaps(baseline, original, query_xy_m, field_config, gap_matches)
+    if field_config is not None and field_config.shear_point_estimates:
+        original = refine_shear_samples(baseline, original, query_xy_m, field_config, gap_matches)
     return original
+
+
+def node_triangle_spread(field: DisplacementField, query_xy_m: np.ndarray) -> np.ndarray:
+    """For each point, the largest difference between the displacements of the three
+    accepted nodes of the Delaunay triangle containing it (NaN outside the nodes' hull)."""
+    query = np.asarray(query_xy_m, dtype=np.float64)
+    spread = np.full(len(query), np.nan)
+    valid = field.available & np.isfinite(field.displacement_m).all(axis=1)
+    if valid.sum() < 3 or not len(query):
+        return spread
+    try:
+        triangulation = Delaunay(field.source_xy_m[valid])
+    except QhullError:
+        return spread
+    simplex = triangulation.find_simplex(query)
+    inside = simplex >= 0
+    vectors = field.displacement_m[valid][triangulation.simplices[simplex[inside]]]
+    spread[inside] = _maximum_edge(vectors)
+    return spread
+
+
+def refine_shear_samples(
+    field: DisplacementField,
+    samples: FieldSamples,
+    query_xy_m: np.ndarray,
+    config: FieldConfig,
+    matches: MotionMatches | None,
+) -> FieldSamples:
+    """Replace a sample by the point's own estimate where the field's nodes disagree
+    more than the point's matches do.
+
+    Linear interpolation between three nodes up to ``maximum_triangle_edge_m`` apart
+    blends the two sides of a lead or shear line between them. The point-local
+    estimate (``estimate_points`` with the ``gap_fill_point_*`` settings) uses the
+    matches on the point's own side; its maximum residual measures how well those
+    matches agree. Where the node triangle's displacement spread exceeds that
+    residual, the nodes disagree more than the measurement noise allows and the
+    point estimate is used; elsewhere the interpolated sample, whose error
+    neighbouring points share, is kept. No threshold of its own.
+    """
+    if matches is None or not len(matches):
+        return samples
+    query = np.asarray(query_xy_m, dtype=np.float64)
+    rows = np.flatnonzero(samples.available)
+    if not len(rows):
+        return samples
+    spread = node_triangle_spread(field, query[rows])
+    rows, spread = rows[np.isfinite(spread)], spread[np.isfinite(spread)]
+    if not len(rows):
+        return samples
+    estimate = estimate_points(
+        matches, query[rows],
+        config.gap_fill_point_neighbour_count,
+        config.gap_fill_point_minimum_agreeing_matches,
+        config.gap_fill_point_neighbour_distance_m,
+        config.gap_fill_point_agreement_distance_m,
+    )
+    use = estimate["available"] & (spread > estimate["maximum_residual_m"])
+    return _merge_samples(samples, rows, FieldSamples(
+        estimate["displacement_m"], use,
+        estimate["selected_matches"].astype(np.float64),
+        estimate["support_radius_m"], estimate["maximum_residual_m"],
+    ))
 
 
 def fill_gaps(

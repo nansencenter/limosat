@@ -154,7 +154,8 @@ class FieldEdge:
     skipped_images: int = 0
     eligible_trajectory_ids: frozenset[str] | None = None
     fallback_field: DisplacementField | None = None
-    # Raw matches near the field's gaps, kept for point-local gap filling only.
+    # Raw matches kept for point-local estimates: those near the field's gaps for gap
+    # filling, or every match when shear point estimates are on (field.gap_matches).
     gap_matches: MotionMatches | None = None
 
     def __post_init__(self) -> None:

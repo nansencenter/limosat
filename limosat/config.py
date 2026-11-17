@@ -150,14 +150,30 @@ class FieldConfig:
     gap_fill_point_minimum_agreeing_matches: int = 8
     gap_fill_point_neighbour_distance_m: float = 3_000.0
     gap_fill_point_agreement_distance_m: float = 500.0
+    # Shear-zone point estimates (off by default; field.py refine_shear_samples). A point
+    # is normally moved by linear interpolation between three 4 km nodes, which blends the
+    # two sides of a lead or shear line running between them. Where those three nodes
+    # disagree by more than the point's own point-local estimate (gap_fill_point_*
+    # settings) disagrees with its matches (its maximum residual), that estimate is used
+    # instead; in coherent ice the interpolation, whose errors neighbouring points share,
+    # is kept. No threshold of its own. Needs every raw match of each pair at composition.
+    # Tested November 2026 on the Jan-Apr 2020 stored pairs: displacement at MOSAiC and
+    # IABP buoys, p90 152 -> 124 m (median 352 -> 88 m where the nodes disagree by more
+    # than 1 km); deformation of MOSAiC buoy triangles, median error 2-4 km 0.0122 ->
+    # 0.0117 /day, 4-8 km 0.0079 -> 0.0072 /day.
+    shear_point_estimates: bool = False
 
     def __post_init__(self) -> None:
         _require_positive({
             key: value for key, value in asdict(self).items()
-            if key != "missing_node_fallback" and value is not None
+            if key not in ("missing_node_fallback", "shear_point_estimates") and value is not None
         })
         if not isinstance(self.missing_node_fallback, bool):
             raise ValueError("missing_node_fallback must be a boolean")
+        if not isinstance(self.shear_point_estimates, bool):
+            raise ValueError("shear_point_estimates must be a boolean")
+        if self.shear_point_estimates and self.gap_fill_point_neighbour_count is None:
+            raise ValueError("shear_point_estimates requires the gap_fill_point_* settings")
         if self.minimum_agreeing_matches > self.neighbour_count:
             raise ValueError("minimum_agreeing_matches exceeds neighbour_count")
         if (
@@ -416,6 +432,8 @@ class RunConfig:
             raise ValueError("point-local gap filling requires retain_pair_matches")
         if self.field.missing_node_fallback and not self.retain_pair_matches:
             raise ValueError("missing_node_fallback requires retain_pair_matches")
+        if self.field.shear_point_estimates and not self.retain_pair_matches:
+            raise ValueError("shear_point_estimates requires retain_pair_matches")
 
     def to_dict(self) -> dict[str, Any]:
         values = asdict(self)
@@ -425,6 +443,9 @@ class RunConfig:
         if not self.field.missing_node_fallback:
             # Preserve the identity of existing configurations with fallback off.
             values["field"].pop("missing_node_fallback")
+        if not self.field.shear_point_estimates:
+            # Preserve the identity of existing configurations without shear point estimates.
+            values["field"].pop("shear_point_estimates")
         if not self.field.gap_filling:
             # Preserve the identity of existing configurations without gap filling.
             for name in GAP_FILL_SETTINGS:
@@ -514,7 +535,7 @@ def load_config(path: str | Path) -> RunConfig:
     resolved["matcher"] = _construct(MatcherConfig, matcher_values)
     field_values = dict(resolved.get("field", {}))
     legacy_field_keys = {item.name for item in fields(FieldConfig)} - {
-        "missing_node_fallback", *GAP_FILL_SETTINGS
+        "missing_node_fallback", "shear_point_estimates", *GAP_FILL_SETTINGS
     }
     if ("missing_node_fallback" not in field_values
             and legacy_field_keys <= field_values.keys()):
