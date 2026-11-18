@@ -267,3 +267,35 @@ def test_overlap_probe_is_bounded_and_deterministic():
         item.pair.pair_id for item in second["0.900-1.000"]
     ]
     assert len(first["0.900-1.000"]) == 2
+
+
+def test_source_coverage_completion_gives_ice_left_behind_a_pair_forward():
+    # B keeps only its most useful source (cap 1): A2, the more recent and larger one.
+    # A's western ice is imaged again only by B, so without completion no pair leaves A
+    # over it; completion adds A -> B.
+    a = _image("a", 0.0, "a", box(0, 0, 60_000, 40_000))
+    a2 = _image("a2", 0.25, "a2", box(40_000, 0, 100_000, 40_000))
+    b = _image("b", 0.5, "b", box(0, 0, 100_000, 40_000))
+    catalogue = ImageCatalogue([a, a2, b])
+
+    def primary(plan):
+        return {item.pair.pair_id for item in plan.pairs if item.selection == "primary"}
+
+    plain = build_candidate_plan(catalogue, RoutingConfig(primary_maximum_pairs_per_target=1))
+    assert "a__b" not in primary(plain)
+    assert plain.exclusion_counts["primary_pairs_added_for_source_coverage"] == 0
+    completed = build_candidate_plan(catalogue, RoutingConfig(
+        primary_maximum_pairs_per_target=1, source_coverage_completion=True))
+    assert primary(completed) == primary(plain) | {"a__b"}
+    assert completed.exclusion_counts["primary_pairs_added_for_source_coverage"] == 1
+
+
+def test_source_coverage_completion_is_off_by_default_and_keeps_identity():
+    from dataclasses import replace
+    from limosat.config import RunConfig
+    base = RunConfig("run", "catalogue", "database", "output")
+    assert "source_coverage_completion" not in base.to_dict()["routing"]
+    on = replace(base, routing=RoutingConfig(source_coverage_completion=True))
+    assert on.sha256 != base.sha256
+    with pytest.raises(ValueError, match="source_coverage_minimum_cells"):
+        RoutingConfig(source_coverage_minimum_cells=0)

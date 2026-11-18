@@ -244,8 +244,26 @@ class RoutingConfig:
     # 45% fewer matcher tiles than no check.
     recovery_minimum_target_valid_fraction: float = 0.3
     recovery_target_valid_window_m: float = 31_000.0
+    # Source-side completion of the primary plan (off by default; planning.py
+    # _complete_source_coverage). The per-target selection keeps, for each target cell,
+    # only the most recent earlier image, assuming the ice was carried into it; when that
+    # step was not planned, a source image's ice has no pair forward and its tracks end
+    # (75-91 % of losses in the January-April 2020 hotspots). With completion, each
+    # source image's planning cells that a later candidate target images but no selected
+    # pair from it reaches get the shortest candidate pair covering most of them, until
+    # fewer than source_coverage_minimum_cells would be added.
+    source_coverage_completion: bool = False
+    source_coverage_minimum_cells: int = 25
 
     def __post_init__(self) -> None:
+        if not isinstance(self.source_coverage_completion, bool):
+            raise ValueError("source_coverage_completion must be a boolean")
+        if (
+            isinstance(self.source_coverage_minimum_cells, bool)
+            or not isinstance(self.source_coverage_minimum_cells, int)
+            or self.source_coverage_minimum_cells < 1
+        ):
+            raise ValueError("source_coverage_minimum_cells must be a positive integer")
         if not 0 < self.planning_grid_spacing_m < float("inf"):
             raise ValueError("planning_grid_spacing_m must be finite and positive")
         if not isinstance(self.coarse_matching, bool):
@@ -487,6 +505,10 @@ class RunConfig:
         if self.routing.coarse_window_stride == 1:
             # Preserve the identity of configurations with one coarse window per tile.
             values["routing"].pop("coarse_window_stride")
+        if not self.routing.source_coverage_completion:
+            # Preserve the identity of configurations without source-side completion.
+            values["routing"].pop("source_coverage_completion")
+            values["routing"].pop("source_coverage_minimum_cells")
         # Recovery target selection decides which losses a recovery pair measures, not
         # how any pair is measured, so it never enters the configuration identity
         # (pair products stay valid when the selection changes). Target manifests

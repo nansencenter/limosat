@@ -80,6 +80,7 @@ EXCLUDED_SETTINGS = {
         "require_orbit_metadata", "primary_maximum_pairs_per_target",
         "candidate_pair_ids", "recovery_target_policy",
         "recovery_minimum_target_valid_fraction", "recovery_target_valid_window_m",
+        "source_coverage_completion", "source_coverage_minimum_cells",
     ),
     "open_water": ("sic_root",),
     "surface": (

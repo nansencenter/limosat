@@ -54,8 +54,13 @@ def run_plan(config: RunConfig, catalogue: ImageCatalogue) -> CandidatePlan:
          image.platform, image.absolute_orbit]
         for image in catalogue.chronological()
     ]
+    routing = asdict(config.routing)
+    if not config.routing.source_coverage_completion:
+        # Plans made before the option existed keep their cache key.
+        routing.pop("source_coverage_completion")
+        routing.pop("source_coverage_minimum_cells")
     digest.update(json.dumps(
-        [records, asdict(config.routing), config.matcher.maximum_speed_m_per_day,
+        [records, routing, config.matcher.maximum_speed_m_per_day,
          config.analysis_epsg],
         sort_keys=True, default=str,
     ).encode("utf-8"))
@@ -227,6 +232,13 @@ def build_candidate_plan(
             primary_pairs_excluded_by_target_maximum += excluded
             targets_affected_by_primary_pair_maximum += int(excluded > 0)
 
+    added_for_source_coverage = 0
+    if config.source_coverage_completion and not config.candidate_pair_ids:
+        added_for_source_coverage = _complete_source_coverage(
+            candidates, primary_ids, footprints, grid_spacing_m,
+            config.source_coverage_minimum_cells,
+        )
+
     ordered = sorted(
         candidates,
         key=lambda item: (
@@ -272,7 +284,8 @@ def build_candidate_plan(
     counts = {
         **exclusions,
         "accepted_candidate_pairs": len(pairs),
-        "primary_pairs_selected_for_cell_coverage": len(primary_ids),
+        "primary_pairs_selected_for_cell_coverage": len(primary_ids) - added_for_source_coverage,
+        "primary_pairs_added_for_source_coverage": added_for_source_coverage,
         "primary_pairs_before_target_maximum": (
             primary_pairs_before_target_maximum
         ),
@@ -432,6 +445,60 @@ def _planning_cells(
         (int(round(x / grid_spacing_m)), int(round(y / grid_spacing_m)))
         for x, y in coordinates
     )
+
+
+def _imaged_cells(source: BaseGeometry, target: BaseGeometry, grid_spacing_m: float):
+    """Planning cells of the source that the target also images (no drift allowance)."""
+    _rows, _columns, coordinates = regular_grid(source.intersection(target).buffer(0), grid_spacing_m)
+    return frozenset(
+        (int(round(x / grid_spacing_m)), int(round(y / grid_spacing_m)))
+        for x, y in coordinates
+    )
+
+
+def _complete_source_coverage(
+    candidates, primary_ids: set[str], footprints, grid_spacing_m: float, minimum_cells: int
+) -> int:
+    """Add primary pairs so that each source image's ice imaged by a later candidate
+    target has a selected pair forward.
+
+    Coverage is judged on the cells both images actually image, not on the drift-buffered
+    cells the per-target selection uses: a buffered cell may claim ice the target never
+    imaged. Per source, repeatedly add the candidate covering most uncovered cells
+    (ties: the shorter interval, then pair ID) until fewer than ``minimum_cells`` would be
+    added. Returns the number of pairs added; ``primary_ids`` is updated in place.
+    """
+    by_source: dict[str, list] = {}
+    for item in candidates:
+        if item[4] is not None:
+            by_source.setdefault(item[0].source.image_id, []).append(item[0])
+    added = 0
+    for source_id in sorted(by_source):
+        pairs = by_source[source_id]
+        imaged = {
+            pair.pair_id: _imaged_cells(
+                footprints[pair.source.image_id], footprints[pair.target.image_id], grid_spacing_m
+            )
+            for pair in pairs
+        }
+        covered: set = set()
+        for pair in pairs:
+            if pair.pair_id in primary_ids:
+                covered |= imaged[pair.pair_id]
+        need = set().union(*imaged.values()) - covered
+        remaining = [pair for pair in pairs if pair.pair_id not in primary_ids]
+        while need and remaining:
+            best = max(
+                remaining,
+                key=lambda pair: (len(imaged[pair.pair_id] & need), -pair.elapsed_seconds, pair.pair_id),
+            )
+            if len(imaged[best.pair_id] & need) < minimum_cells:
+                break
+            primary_ids.add(best.pair_id)
+            need -= imaged[best.pair_id]
+            remaining.remove(best)
+            added += 1
+    return added
 
 
 def _coverage_primary_selection(
