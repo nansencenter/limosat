@@ -52,7 +52,7 @@ id exists in the catalogue and that its time equals the observation time, so a w
 
 ## Build and validate
 
-Install PyArrow in the active environment (`pip install pyarrow`, or conda-forge), then:
+Use the LiMOSAT Conda environment from `environment.yaml`, which includes PyArrow:
 
 ```bash
 python -m limosat.publish build \

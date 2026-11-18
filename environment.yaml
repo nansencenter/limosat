@@ -7,6 +7,7 @@ dependencies:
   - cartopy=0.23.0
   - geopandas
   - gdal 
+  - rasterio
   - netcdf4
   - ca-certificates
   - certifi
@@ -19,6 +20,7 @@ dependencies:
   - numpy
   - opencv
   - pandas
+  - pyarrow
   - pytest
   - pytz
   - scikit-image
