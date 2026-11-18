@@ -1,0 +1,18 @@
+{
+  "description": "Provisional downstream acceptance limits for EfficientLoFTR batch-size experiments on 512-pixel SAR tiles. These are experiment gates, not calibrated geophysical uncertainty bounds.",
+  "limits": {
+    "adjacent_jump_p99_relative_increase": 0.05,
+    "field_availability_difference_fraction": 0.002,
+    "field_vector_maximum_m": 1000.0,
+    "field_vector_p95_m": 40.0,
+    "field_vector_p99_m": 100.0,
+    "trajectory_maximum_m": 1000.0,
+    "trajectory_p95_m": 50.0,
+    "trajectory_p99_m": 150.0,
+    "truth_median_error_increase_m": 10.0,
+    "truth_p90_error_increase_m": 10.0
+  },
+  "outlier_reporting_threshold_m": 250.0,
+  "schema_version": 1,
+  "status": "provisional_pending_multi-pair-validation"
+}

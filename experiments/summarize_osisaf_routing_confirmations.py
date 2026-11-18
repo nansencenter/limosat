@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -31,6 +32,19 @@ def optional_metric(values: dict | None, key: str) -> float:
     return float(values[key])
 
 
+def infer_cluster(manifest: dict) -> str:
+    if manifest.get("cluster"):
+        return str(manifest["cluster"])
+    case_id = manifest["case_id"]
+    if case_id.startswith("nice_"):
+        return "nice_apr27_may02"
+    if case_id == "full70_2020_10107_10217":
+        return "mar27_29_central"
+    if case_id == "full70_2020_9535_9872":
+        return "mar21_26"
+    return case_id
+
+
 def confirmation_row(manifest: dict) -> dict:
     baseline = manifest["baseline"]
     assisted = manifest["osisaf_assisted"]
@@ -38,9 +52,11 @@ def confirmation_row(manifest: dict) -> dict:
     assisted_buoy = assisted.get("buoys")
     baseline_coverage = float(baseline["coverage_after_fold_rejection"])
     assisted_coverage = float(assisted["coverage_after_fold_rejection"])
+    baseline_sources = baseline["routing"]["source_counts"]
     return {
         "case_id": manifest["case_id"],
         "role": manifest["role"],
+        "cluster": infer_cluster(manifest),
         "elapsed_hours": manifest["elapsed_hours"],
         "device": manifest["device"],
         "fallback": manifest["fallback"],
@@ -51,8 +67,10 @@ def confirmation_row(manifest: dict) -> dict:
         "source_tiles": manifest["source_tiles"],
         "physics_clipped_tiles": manifest["physics_clipped_tiles"],
         "baseline_routing_sources": json.dumps(
-            baseline["routing"]["source_counts"], sort_keys=True
+            baseline_sources, sort_keys=True
         ),
+        "baseline_is_direct_phase": set(baseline_sources)
+        == {"coarse_phase_translation"},
         "baseline_matches": baseline["physics_valid_matches"],
         "assisted_matches": assisted["physics_valid_matches"],
         "match_ratio": (
@@ -81,6 +99,138 @@ def confirmation_row(manifest: dict) -> dict:
         "baseline_pair_seconds": baseline["timing_seconds"]["pair_total"],
         "assisted_pair_seconds": assisted["timing_seconds"]["pair_total"],
     }
+
+
+def bootstrap_mean_interval(
+    values: np.ndarray, repetitions: int = 20_000, seed: int = 455
+) -> tuple[float, float]:
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim != 1 or not len(values) or not np.isfinite(values).all():
+        raise ValueError("bootstrap values must be a non-empty finite vector")
+    generator = np.random.default_rng(seed)
+    samples = generator.choice(values, size=(repetitions, len(values)), replace=True)
+    return tuple(np.quantile(samples.mean(axis=1), [0.025, 0.975]))
+
+
+def exact_two_sided_sign_test(wins: int, losses: int) -> float:
+    trials = wins + losses
+    if trials == 0:
+        return np.nan
+    extreme = max(wins, losses)
+    upper_tail = sum(math.comb(trials, value) for value in range(extreme, trials + 1))
+    return min(1.0, 2.0 * upper_tail / (2**trials))
+
+
+def long_gap_statistics(rows: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    cases = rows.loc[
+        (rows["elapsed_hours"] >= 30) & rows["baseline_is_direct_phase"]
+    ].copy()
+    if cases["case_id"].duplicated().any():
+        duplicates = cases.loc[cases["case_id"].duplicated(), "case_id"].tolist()
+        raise ValueError(f"duplicate direct-phase cases: {duplicates}")
+    cases = cases.sort_values(["elapsed_hours", "case_id"]).reset_index(drop=True)
+    clusters = (
+        cases.groupby("cluster", as_index=False)
+        .agg(
+            cases=("case_id", "size"),
+            minimum_elapsed_hours=("elapsed_hours", "min"),
+            maximum_elapsed_hours=("elapsed_hours", "max"),
+            mean_coverage_change_percentage_points=(
+                "coverage_change_percentage_points",
+                "mean",
+            ),
+            mean_match_ratio=("match_ratio", "mean"),
+            mean_osi455_available_tile_fraction=(
+                "osi455_available_tile_fraction",
+                "mean",
+            ),
+        )
+        .sort_values("cluster")
+        .reset_index(drop=True)
+    )
+    changes = cases["coverage_change_percentage_points"]
+    cluster_changes = clusters["mean_coverage_change_percentage_points"].to_numpy()
+    ci_low, ci_high = bootstrap_mean_interval(cluster_changes)
+    case_wins = int((changes > 1e-9).sum())
+    case_losses = int((changes < -1e-9).sum())
+    cluster_wins = int((cluster_changes > 1e-9).sum())
+    cluster_losses = int((cluster_changes < -1e-9).sum())
+    both_buoy = cases.loc[
+        cases["baseline_buoy_median_error_m"].notna()
+        & cases["assisted_buoy_median_error_m"].notna()
+    ]
+    statistics = {
+        "cases": len(cases),
+        "clusters": len(clusters),
+        "minimum_elapsed_hours": float(cases["elapsed_hours"].min()),
+        "maximum_elapsed_hours": float(cases["elapsed_hours"].max()),
+        "coverage_increased_cases": case_wins,
+        "coverage_unchanged_cases": int((changes.abs() <= 1e-9).sum()),
+        "coverage_decreased_cases": case_losses,
+        "case_level_two_sided_sign_test_p": exact_two_sided_sign_test(
+            case_wins, case_losses
+        ),
+        "cluster_coverage_increased": cluster_wins,
+        "cluster_coverage_unchanged": int((np.abs(cluster_changes) <= 1e-9).sum()),
+        "cluster_coverage_decreased": cluster_losses,
+        "cluster_level_two_sided_sign_test_p": exact_two_sided_sign_test(
+            cluster_wins, cluster_losses
+        ),
+        "median_coverage_change_percentage_points": float(changes.median()),
+        "cluster_balanced_mean_coverage_change_percentage_points": float(
+            cluster_changes.mean()
+        ),
+        "cluster_bootstrap_95ci_low_percentage_points": float(ci_low),
+        "cluster_bootstrap_95ci_high_percentage_points": float(ci_high),
+        "case_buoy_available_baseline": int(cases["baseline_buoys_available"].sum()),
+        "case_buoy_available_assisted": int(cases["assisted_buoys_available"].sum()),
+        "case_buoy_within_2km_baseline": int(cases["baseline_buoys_within_2km"].sum()),
+        "case_buoy_within_2km_assisted": int(cases["assisted_buoys_within_2km"].sum()),
+        "cases_with_buoy_estimates_from_both": len(both_buoy),
+        "assisted_lower_buoy_median_error_cases": int(
+            (
+                both_buoy["assisted_buoy_median_error_m"]
+                < both_buoy["baseline_buoy_median_error_m"]
+            ).sum()
+        ),
+    }
+    return cases, clusters, statistics
+
+
+def agreement_statistics(cases: pd.DataFrame, pair_summary: pd.DataFrame) -> pd.DataFrame:
+    metrics = pair_summary[
+        ["case_id", "phase_response", "phase_osi455_median_distance_km"]
+    ]
+    joined = cases.merge(metrics, on="case_id", how="left", validate="one_to_one")
+    distance = joined["phase_osi455_median_distance_km"]
+    joined["routing_agreement"] = pd.cut(
+        distance,
+        [-np.inf, 5.0, 20.0, np.inf],
+        labels=("agree_le_5km", "differ_5_to_20km", "differ_gt_20km"),
+    ).astype(object)
+    joined.loc[distance.isna(), "routing_agreement"] = "osi_unavailable_at_buoy"
+    return (
+        joined.groupby("routing_agreement", as_index=False)
+        .agg(
+            cases=("case_id", "size"),
+            coverage_increased_cases=(
+                "coverage_change_percentage_points",
+                lambda values: int((values > 1e-9).sum()),
+            ),
+            median_coverage_change_percentage_points=(
+                "coverage_change_percentage_points",
+                "median",
+            ),
+            mean_coverage_change_percentage_points=(
+                "coverage_change_percentage_points",
+                "mean",
+            ),
+            baseline_case_buoys_available=("baseline_buoys_available", "sum"),
+            assisted_case_buoys_available=("assisted_buoys_available", "sum"),
+        )
+        .sort_values("routing_agreement")
+        .reset_index(drop=True)
+    )
 
 
 def routing_provenance_metrics(path: Path) -> dict:
@@ -131,14 +281,23 @@ def main() -> int:
     rows = pd.DataFrame(records)
     rows = rows.sort_values(["elapsed_hours", "case_id"]).reset_index(drop=True)
     rows.to_csv(args.root / "confirmation_summary.csv", index=False)
-    display = rows[
+    long_cases, clusters, statistics = long_gap_statistics(rows)
+    long_cases.to_csv(args.root / "long_gap_case_summary.csv", index=False)
+    clusters.to_csv(args.root / "long_gap_cluster_summary.csv", index=False)
+    pair_summary_path = args.root.parent / "pair_summary.csv"
+    agreement = agreement_statistics(
+        long_cases, pd.read_csv(pair_summary_path)
+    )
+    agreement.to_csv(args.root / "long_gap_agreement_summary.csv", index=False)
+    (args.root / "long_gap_statistics.json").write_text(
+        json.dumps(statistics, indent=2) + "\n"
+    )
+    display = long_cases[
         [
             "case_id",
-            "role",
+            "cluster",
             "elapsed_hours",
             "osi455_available_tile_fraction",
-            "osi455_wind_involved_fraction_of_available",
-            "osi455_median_accumulated_uncertainty_km",
             "baseline_coverage",
             "assisted_coverage",
             "coverage_change_percentage_points",
@@ -152,18 +311,58 @@ def main() -> int:
         [
             "# OSI-455 MPS routing confirmations",
             "",
-            "Four preselected mechanistic cases were run with the same EfficientLoFTR "
-            "matcher and field estimator. Only target-tile centres changed: OSI-455 "
-            "where strictly available, same-centre otherwise.",
+            f"{statistics['cases']} matched >=30-hour pairs from "
+            f"{statistics['clusters']} independent sequence/components were run with "
+            "the same EfficientLoFTR matcher and field estimator. Only target-tile "
+            "centres changed: direct phase correlation in the baseline; OSI-455 where "
+            "strictly available and same-centre otherwise in the assisted arm.",
+            "",
+            "## Main result",
+            "",
+            f"- Field coverage increased in {statistics['coverage_increased_cases']}/"
+            f"{statistics['cases']} cases, was unchanged in "
+            f"{statistics['coverage_unchanged_cases']}, and decreased in "
+            f"{statistics['coverage_decreased_cases']}.",
+            f"- Median case-level coverage change was "
+            f"{statistics['median_coverage_change_percentage_points']:.2f} percentage "
+            "points.",
+            f"- The component-balanced mean was "
+            f"{statistics['cluster_balanced_mean_coverage_change_percentage_points']:.2f} "
+            "percentage points (component bootstrap 95% interval "
+            f"{statistics['cluster_bootstrap_95ci_low_percentage_points']:.2f} to "
+            f"{statistics['cluster_bootstrap_95ci_high_percentage_points']:.2f}).",
+            f"- Directional consistency was suggestive rather than conventionally "
+            f"significant: {statistics['cluster_coverage_increased']}/"
+            f"{statistics['clusters']} component means increased "
+            f"(two-sided sign-test p="
+            f"{statistics['cluster_level_two_sided_sign_test_p']:.3f}).",
+            f"- Available case-buoy evaluations changed from "
+            f"{statistics['case_buoy_available_baseline']} to "
+            f"{statistics['case_buoy_available_assisted']}; evaluations within 2 km "
+            f"changed from {statistics['case_buoy_within_2km_baseline']} to "
+            f"{statistics['case_buoy_within_2km_assisted']}.",
+            f"- Where both arms produced buoy estimates, OSI routing had lower median "
+            f"error in {statistics['assisted_lower_buoy_median_error_cases']}/"
+            f"{statistics['cases_with_buoy_estimates_from_both']} cases.",
+            "",
+            "## Observable phase/OSI agreement",
+            "",
+            "This is an exploratory post-hoc stratification using information available "
+            "at inference time; it was not used to select the frozen expansion.",
+            "",
+            markdown_table(agreement),
             "",
             markdown_table(display),
             "",
             "## Guardrails",
             "",
-            "- These cases confirm mechanism and compute cost; they are not an independent accuracy test.",
+            "- The 11-pair expansion was frozen using only duration and shared-buoy availability before its matching results were inspected.",
+            "- The extra edges overlap two 2020 components and one N-ICE component; uncertainty is therefore resampled over components, not individual pairs or buoys.",
+            "- Case-buoy totals are descriptive and not independent; one pair contributes 88 observations.",
             "- OSI-455 availability is strict at every integrated daily step; no nearest-valid spatial filling was used.",
-            "- The baseline for the 71.6-hour case is inherited SAR-field routing; the other baselines use global phase correlation.",
+            "- Every pair in the main result uses a direct global phase-correlation baseline. The older inherited-field diagnostic remains in confirmation_summary.csv but is excluded.",
             "- Accepted vectors remain SAR-to-SAR EfficientLoFTR matches and the unchanged local consensus field.",
+            "- This is an Arctic 2015/2020 experiment, not Antarctic validation; MIZ and fast-ice sample sizes remain inadequate for conclusions.",
         ]
     )
     (args.root / "REPORT.md").write_text(report + "\n")

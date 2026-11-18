@@ -1,0 +1,17 @@
+{
+  "experiment_id": "osisaf405_antarctic_routing_20260831",
+  "selection_frozen_utc": "2026-08-31T00:00:00Z",
+  "selection_rule": "All four pre-existing held-out test cases in the 13-24 June Weddell validation fixture; no OSI-405-d or EfficientLoFTR outcome was inspected before selection.",
+  "gap_cases_csv": "/Users/seachu/projects/limosat-antarctica/data/experiments/weddell_drift_prior_validation_20260613_24/gap_cases.csv",
+  "scene_inventory_csv": "/Users/seachu/projects/limosat-antarctica/data/experiments/weddell_drift_prior_validation_20260613_24/reference_scene_inventory.csv",
+  "direct_sar_truth_csv": "/Users/seachu/projects/limosat-antarctica/data/experiments/weddell_drift_prior_validation_20260613_24/direct_sar_endpoint_truth.csv",
+  "case_ids": ["test_24h", "test_48h", "test_72h", "test_96h"],
+  "primary_long_gap_case_ids": ["test_48h", "test_72h", "test_96h"],
+  "analysis_epsg": 3412,
+  "maximum_speed_km_per_day": 30.0,
+  "osi_product": "OSI-405-d v3.1 merged AMSR2+ASCAT Southern Hemisphere",
+  "osi_temporal_policy": "For each trailing noon-to-noon segment, divide its daily OSI 48-hour displacement by its cell-specific duration and integrate only the SAR-overlap hours.",
+  "assisted_missing_policy": "Use direct phase-correlation displacement when OSI-405-d is unavailable at a source tile.",
+  "truth_policy": "Use the pre-existing spatially stratified direct-SAR endpoint fixture (target correlation >= 0.30, maximum 300 rows per case). This is a regional reproducibility reference derived from LiMOSAT/SAR, not independent accuracy truth.",
+  "independent_truth_limitation": "The available AWI buoys are at 62-63 S and do not overlap these SAR pairs near 74 S."
+}
