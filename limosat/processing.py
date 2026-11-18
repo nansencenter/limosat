@@ -15,6 +15,58 @@ from skimage.transform import AffineTransform
 from .utils import log_execution_time, logger
 from .keypoints import Keypoints
 
+_PEAK_GRID = np.array(
+    [(col, row) for row in (-1.0, 0.0, 1.0) for col in (-1.0, 0.0, 1.0)]
+)
+_PEAK_QUADRATIC_PINV = np.linalg.pinv(
+    np.column_stack(
+        (
+            _PEAK_GRID[:, 0] ** 2,
+            _PEAK_GRID[:, 0] * _PEAK_GRID[:, 1],
+            _PEAK_GRID[:, 1] ** 2,
+            _PEAK_GRID[:, 0],
+            _PEAK_GRID[:, 1],
+            np.ones(9),
+        )
+    )
+)
+
+
+def refine_correlation_peak_quadratic(response, peak_colrow):
+    """Return a guarded fractional offset from a discrete correlation peak."""
+    peak_col, peak_row = map(int, peak_colrow)
+    if (
+        peak_col <= 0
+        or peak_row <= 0
+        or peak_col >= response.shape[1] - 1
+        or peak_row >= response.shape[0] - 1
+    ):
+        return 0.0, 0.0, "response_boundary"
+
+    neighbourhood = np.asarray(
+        response[peak_row - 1 : peak_row + 2, peak_col - 1 : peak_col + 2],
+        dtype=np.float64,
+    )
+    if neighbourhood.shape != (3, 3) or not np.isfinite(neighbourhood).all():
+        return 0.0, 0.0, "invalid_neighbourhood"
+
+    a, b, c, d, e, _ = _PEAK_QUADRATIC_PINV @ neighbourhood.ravel()
+    hessian = np.array(((2.0 * a, b), (b, 2.0 * c)))
+    if np.max(np.linalg.eigvalsh(hessian)) >= -1e-12:
+        return 0.0, 0.0, "non_concave"
+
+    try:
+        delta_col, delta_row = np.linalg.solve(hessian, -np.array((d, e)))
+    except np.linalg.LinAlgError:
+        return 0.0, 0.0, "singular"
+    if (
+        not np.isfinite((delta_col, delta_row)).all()
+        or abs(delta_col) > 1.0
+        or abs(delta_row) > 1.0
+    ):
+        return 0.0, 0.0, "outside_neighbourhood"
+    return float(delta_col), float(delta_row), "quadratic"
+
 @log_execution_time
 def interpolate_drift(points_poly, points_fg1, points_fg2, img,
                                          max_interpolation_time_gap_hours,
@@ -194,7 +246,8 @@ def pattern_matching(
     hs: int,
     band: str = 's0_HV',
     border_matched: int = 16,
-    border_interpolated: int = 32
+    border_interpolated: int = 32,
+    subpixel_method: str = "none",
 ):
     """
     Perform pattern matching on a single image band with template rotation search.
@@ -210,10 +263,14 @@ def pattern_matching(
         hs (int): Template half-size.
         border_matched (int): Default search border padding.
         border_interpolated (int): Larger search border padding for interpolated points.
+        subpixel_method (str): ``none`` preserves the legacy integer correction;
+            ``quadratic`` uses a guarded two-dimensional fit around the winning peak.
 
     Returns:
         tuple: (corrected_positions_xy, corrected_positions_colsrows, correlation_values)
     """
+    if subpixel_method not in {"none", "quadratic"}:
+        raise ValueError("subpixel_method must be 'none' or 'quadratic'")
     mtype = cv2.TM_CCOEFF_NORMED
     image_band_data = img[band]
 
@@ -319,6 +376,8 @@ def pattern_matching(
         best_dc_for_point = 0
         best_dr_for_point = 0
         best_rotation_offset_for_point = 0.0
+        best_peak_for_point = None
+        best_response_for_point = None
 
         for angle_offset in rotation_angles:
             current_rotation_to_apply = angle_diff + angle_offset
@@ -348,9 +407,20 @@ def pattern_matching(
                 best_dc_for_point = (max_loc_in_result[0] + hs) - (hs + current_border)
                 best_dr_for_point = (max_loc_in_result[1] + hs) - (hs + current_border)
                 best_rotation_offset_for_point = angle_offset # Store the offset that gave the best result
+                best_peak_for_point = max_loc_in_result
+                best_response_for_point = result_match
             
             if angle_offset == 0 and best_corr_for_point >= early_exit_correlation_threshold:
                 break # Early exit if non-rotated version is already good enough
+
+        if subpixel_method == "quadratic" and best_peak_for_point is not None:
+            delta_col, delta_row, _ = refine_correlation_peak_quadratic(
+                best_response_for_point, best_peak_for_point
+            )
+            matched_col = c1_int + best_dc_for_point + delta_col
+            matched_row = r1_int + best_dr_for_point + delta_row
+            best_dc_for_point = matched_col - c1_initial
+            best_dr_for_point = matched_row - r1_initial
 
         results_list.append( (([best_dc_for_point, best_dr_for_point], best_corr_for_point, best_rotation_offset_for_point)) )
 

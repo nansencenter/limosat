@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from shapely.geometry import Point
 
-from tests.helpers_assertions import assert_flags_valid, assert_no_duplicates, assert_time_monotonic
+from tests.helpers_assertions import assert_flags_valid, assert_no_duplicates
 
 
 @pytest.mark.unit

@@ -10,6 +10,7 @@ import geopandas as gpd
 from nansat import NSR
 from .utils import log_execution_time
 
+
 class Keypoints(gpd.GeoDataFrame):
     srs = NSR(3413)
 
@@ -42,7 +43,7 @@ class Keypoints(gpd.GeoDataFrame):
                 'stopped': [],
                 'converged_to': [],
             }
-            super().__init__(empty_data)
+            super().__init__(empty_data, geometry='geometry')
             if 'image_id' in self.columns:
                 self['image_id'] = self['image_id'].astype('int32')
             if 'is_last' in self.columns:

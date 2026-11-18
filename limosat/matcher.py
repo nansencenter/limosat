@@ -12,6 +12,10 @@ from matplotlib import pyplot as plt
 from collections import defaultdict
 from .utils import log_execution_time, logger
 
+# Keep physical inputs in metres, but condition model fitting in kilometres.
+_METRES_PER_KILOMETRE = 1000.0
+
+
 class Matcher:
     def __init__(self,
                  # General matching parameters
@@ -23,8 +27,6 @@ class Matcher:
                  # Homography estimation parameters
                  model=AffineTransform,
                  model_threshold=10000,
-                 use_model_estimation=True,
-                 estimation_method="USAC_MAGSAC",
                  min_homography_inliers=10,
 
                  # Lowe's ratio test parameter
@@ -46,16 +48,7 @@ class Matcher:
         # Homography estimation parameters
         self.model = model
         self.model_threshold = model_threshold
-        self.use_model_estimation = use_model_estimation
         self.min_homography_inliers = min_homography_inliers
-
-        # Store the method name and get its value
-        if estimation_method.upper() == "DEGENSAC":
-            self.estimation_method_name = "DEGENSAC"
-            self.estimation_method = None
-        else:
-            self.estimation_method_name = estimation_method
-            self.estimation_method = getattr(cv2, estimation_method)
 
         # Additional parameters
         self.lowe_ratio = lowe_ratio
@@ -111,7 +104,7 @@ class Matcher:
             spatial_distance_max=spatial_distance_limit,
             model_threshold=self.model_threshold,
             min_homography_inliers=self.min_homography_inliers,
-            estimation_method=self.estimation_method_name,
+            estimation_method="USAC_MAGSAC",
         )
 
     @log_execution_time
@@ -312,7 +305,6 @@ class Matcher:
                 num_homography_inliers=0,
                 spatial_distance_limit=spatial_distance_limit,
             )
-            if not self.use_model_estimation: return dd_idx0, dd_idx1, None
             return None, None, None
         
         if max_distance_m is not None and np.isfinite(max_distance_m) and max_distance_m >= 0:
@@ -339,12 +331,7 @@ class Matcher:
                 num_homography_inliers=0,
                 spatial_distance_limit=spatial_distance_limit,
             )
-            if not self.use_model_estimation:
-                return md_idx0, md_idx1, None
             return None, None, None
-
-        if not self.use_model_estimation:
-            return md_idx0, md_idx1, None # md_idx0, md_idx1 are the final indices if no model estimation
 
         if md_idx0.size < 4:
             logger.warning("Warning: Insufficient matches for model estimation (minimum 4 required)")
@@ -363,19 +350,29 @@ class Matcher:
         try:
             # H, inliers is your gpi2, applied to md_idx0/md_idx1
             # The `inliers` mask returned by findHomography is relative to the points fed into it (pos0[md_idx0], pos1[md_idx1])
-            if self.estimation_method_name.upper() == "DEGENSAC":
-                try:
-                    import pydegensac
-                    H, inliers_mask_homography_relative = pydegensac.findHomography(pos0[md_idx0], pos1[md_idx1], self.model_threshold)
-                except ImportError:
-                    logger.warning("pydegensac not found, falling back to cv2.USAC_MAGSAC")
-                    self.estimation_method_name = "USAC_MAGSAC"
-                    self.estimation_method = cv2.USAC_MAGSAC
-                    H, inliers_mask_homography_relative = cv2.findHomography(pos0[md_idx0], pos1[md_idx1], 
-                                                                            self.estimation_method, self.model_threshold)
-            else:
-                H, inliers_mask_homography_relative = cv2.findHomography(pos0[md_idx0], pos1[md_idx1], 
-                                                                        self.estimation_method, self.model_threshold)
+            source_model = pos0[md_idx0] / _METRES_PER_KILOMETRE
+            target_model = pos1[md_idx1] / _METRES_PER_KILOMETRE
+            threshold_model = self.model_threshold / _METRES_PER_KILOMETRE
+
+            H, inliers_mask_homography_relative = cv2.findHomography(
+                source_model,
+                target_model,
+                cv2.USAC_MAGSAC,
+                threshold_model,
+            )
+
+            if H is not None:
+                input_to_model = np.diag(
+                    [
+                        1.0 / _METRES_PER_KILOMETRE,
+                        1.0 / _METRES_PER_KILOMETRE,
+                        1.0,
+                    ]
+                )
+                model_to_input = np.diag(
+                    [_METRES_PER_KILOMETRE, _METRES_PER_KILOMETRE, 1.0]
+                )
+                H = model_to_input @ H @ input_to_model
 
             if H is None:
                 logger.warning("Warning: Model estimation failed")
@@ -415,7 +412,7 @@ class Matcher:
             model = self.model(H) # Assuming self.model is AffineTransform class
             residuals = model.residuals(pos0[rc_idx0], pos1[rc_idx1])
             logger.info(
-                f'{self.estimation_method_name}: Found {rc_idx0.size} inliers from {len(matches)} initial candidates.'
+                f'USAC_MAGSAC: Found {rc_idx0.size} inliers from {len(matches)} initial candidates.'
             )
             
             if self.plot:

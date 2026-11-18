@@ -15,7 +15,7 @@ from .utils import extract_date, logger
 
 class Image(Nansat):
     """
-    Extension of Nansat class with extra functionality and transform caching.
+    Extension of Nansat class with extra functionality.
 
     Attributes:
     -----------
@@ -25,11 +25,6 @@ class Image(Nansat):
         Spatial reference system for the image.
     date : datetime
         Date extracted from the file path.
-    _transform_cache : dict
-        Internal cache for transform_points results.
-    _max_cache_entries : int
-        Maximum number of entries allowed in the cache.
-
     Methods:
     --------
     __init__(file_path, srs=NSR(3413)):
@@ -39,7 +34,7 @@ class Image(Nansat):
     poly:
         Performs coordinate transformations and sets up a polygon for the image.
     transform_points(x, y, DstToSrc=0, dst_srs=None):
-        Transforms points with caching for large coordinate arrays.
+        Transforms points between pixel and map coordinates.
     """
 
     def __init__(self, file_path, srs=NSR(3413)):
@@ -54,9 +49,6 @@ class Image(Nansat):
         self.vrt.tps = True # Assuming this is desired behaviour
         self.srs = srs
         self.date = extract_date(file_path)
-        # Initialize cache attributes
-        self._transform_cache = {}
-        self._max_cache_entries = 50  # Limit cache size to prevent excessive memory use
 
     @cached_property
     def orbit_num(self):

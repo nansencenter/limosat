@@ -2,7 +2,7 @@ import os
 import re
 import json
 from datetime import datetime, timezone
-from typing import Iterable, Optional, Literal, List, Dict, Any
+from typing import Iterable, Optional, List, Dict, Any
 import geopandas as gpd
 import pystac
 import shapely
@@ -30,9 +30,6 @@ def _parse_s1_meta(path: str):
     uid = m.group("uid")
     orbit = int(m.group("orbit"))
     return dt, scene_id, uid, orbit
-
-
-GeometryMode = Literal["none", "bbox"]
 
 def build_stac_item_collection(
     files: Iterable[str],

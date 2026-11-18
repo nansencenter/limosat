@@ -17,6 +17,7 @@ def test_convergence_minimal():
             'is_last': [1, 1],
             'stopped': [False, False],
             'converged_to': [None, None],
+            'corr': [0.9, 0.8],
         },
         geometry=[Point(5, 5), Point(6, 5)],
         crs='EPSG:3413',
