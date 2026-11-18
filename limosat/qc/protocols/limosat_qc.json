@@ -31,6 +31,7 @@
   },
   "steps": {
     "0_SPEED": "speed over the actual image gap above max_speed_m_per_day",
+    "0_INVALID_CORR": "target_corr is infinite (flat-window division by zero in the template matcher); a missing correlation (interpolated point) is not removed",
     "1_OPEN_WATER": "SIC < open_water_sic at either endpoint (each endpoint on its own date, nearest cell); links with no SIC value are kept. Product per day: AMSR2 ASI 3.125 km, else AMSR2 ASI 6.25 km, else NOAA/NSIDC CDR v6 25 km",
     "1_LAND": "deeper endpoint at least land_min_inland_km inland on the supplied 1 km inland-distance raster (land where Natural Earth 10 m and OpenStreetMap agree)",
     "2_ISOLATED_UNVERIFIED": "no other surviving link of the image pair within neighbour_radius_m, and a gap longer than isolated_max_hours or a speed above isolated_max_speed_m_per_day",
