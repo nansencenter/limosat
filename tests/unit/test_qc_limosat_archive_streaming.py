@@ -325,13 +325,13 @@ def test_qc_import_does_not_load_image_processing_dependencies():
     assert result.returncode == 0, result.stderr
 
 
-def test_package_cli_completes_with_preserved_source_and_verifiable_manifest(tmp_path):
+def test_archive_cli_completes_with_preserved_source_and_verifiable_manifest(tmp_path):
     source = tmp_path / "source.sqlite"
     fixture_database(source)
     before = streaming.sha256(source)
     output_dir = tmp_path / "qc"
     result = subprocess.run(
-        [sys.executable, "-m", "limosat.qc", "--input", str(source),
+        [sys.executable, "-m", "limosat.qc.archive", "--input", str(source),
          "--table", "fixture", "--input-sha256", before,
          "--configured-speed-m-per-day", "50000", "--output-dir", str(output_dir)],
         capture_output=True, text=True, check=False,
@@ -355,7 +355,7 @@ def test_cli_resume_all_matches_uninterrupted_output(tmp_path):
     streaming.scan_archive(args, config)
 
     result = subprocess.run(
-        [sys.executable, "-m", "limosat.qc", "--input", str(source),
+        [sys.executable, "-m", "limosat.qc.archive", "--input", str(source),
          "--table", "fixture", "--input-sha256", args.input_sha256,
          "--configured-speed-m-per-day", "50000", "--output-dir", str(args.output_dir),
          "--compact-database", str(args.compact_database),
