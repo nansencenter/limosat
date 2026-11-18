@@ -495,11 +495,15 @@ def write_points_sqlite(raw_database: Path, output_dir: Path, period: str, manif
     tmp = out.with_suffix(".sqlite.part")
     tmp.unlink(missing_ok=True)
     points = point_trajectories(output_dir, period, int(manifest["new_trajectory_id_base"]))
-    con = sqlite3.connect(tmp)
+    # URI filenames in ATTACH only work when the main connection itself was opened with uri=True
+    # (some Python builds, e.g. uv's, do not enable them by default)
+    from urllib.parse import quote
+
+    con = sqlite3.connect(f"file:{quote(str(tmp.resolve()))}", uri=True)
     try:
         for pragma in ("journal_mode=OFF", "synchronous=OFF", "temp_store=MEMORY", "cache_size=-400000"):
             con.execute(f"PRAGMA {pragma}")
-        con.execute("ATTACH DATABASE ? AS src", (f"file:{Path(raw_database).resolve()}?mode=ro",))
+        con.execute("ATTACH DATABASE ? AS src", (f"file:{quote(str(Path(raw_database).resolve()))}?mode=ro",))
         table = con.execute("select name, sql from src.sqlite_master where type = 'table'").fetchone()
         name, ddl = table[0], table[1]
         qc_table = f"{name}__qc"
