@@ -268,6 +268,11 @@ class RoutingConfig:
     next_observation_minimum_cells: int = 25
     next_observation_backup_after_hours: float | None = None
     plan_surface_cells: bool = False
+    # Experimental: JSON file {pair_id: [dx_m, dy_m]} of prior displacements (for example
+    # from a coarse drift product). Where a pair has one, matching also evaluates a
+    # "drift_prior" routing hypothesis translated by it and keeps the best hypothesis.
+    # Empty (default) changes nothing.
+    prior_displacement_file: str = ""
 
     def __post_init__(self) -> None:
         if self.primary_selection not in ("target_coverage", "next_observation"):
@@ -655,6 +660,7 @@ _PLANNING_DEFAULTS = {
     "next_observation_minimum_cells": 25,
     "next_observation_backup_after_hours": None,
     "plan_surface_cells": False,
+    "prior_displacement_file": "",
 }
 
 
