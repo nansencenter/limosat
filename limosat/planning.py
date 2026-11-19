@@ -14,7 +14,7 @@ import numpy as np
 from shapely.geometry.base import BaseGeometry
 
 from .catalog import ImageCatalogue, ImagePair, ImageRecord
-from .config import RoutingConfig, RunConfig
+from .config import RoutingConfig, RunConfig, _pop_default_planning
 from .field import regular_grid
 from .imagery import projected_footprint
 
@@ -59,11 +59,21 @@ def run_plan(config: RunConfig, catalogue: ImageCatalogue) -> CandidatePlan:
         # Plans made before the option existed keep their cache key.
         routing.pop("source_coverage_completion")
         routing.pop("source_coverage_minimum_cells")
-    digest.update(json.dumps(
-        [records, routing, config.matcher.maximum_speed_m_per_day,
-         config.analysis_epsg],
-        sort_keys=True, default=str,
-    ).encode("utf-8"))
+    _pop_default_planning(routing, config.routing)
+    key = [records, routing, config.matcher.maximum_speed_m_per_day, config.analysis_epsg]
+    cell_filter = None
+    if config.routing.plan_surface_cells:
+        from .surface import surface_gate
+
+        package_surface = package / "surface.py"
+        digest.update(package_surface.read_bytes())
+        key.append(asdict(config.surface))
+        for name in ("land_raster",):
+            value = getattr(config.surface, name)
+            if value:
+                key.append(hashlib.sha256(Path(value).read_bytes()).hexdigest())
+        cell_filter = _surface_cell_filter(surface_gate(config), config.routing.planning_grid_spacing_m)
+    digest.update(json.dumps(key, sort_keys=True, default=str).encode("utf-8"))
     path = Path(config.output_directory) / "plan-cache" / f"{digest.hexdigest()}.pickle"
     if path.is_file():
         with path.open("rb") as stream:
@@ -73,6 +83,7 @@ def run_plan(config: RunConfig, catalogue: ImageCatalogue) -> CandidatePlan:
         config.routing,
         grid_spacing_m=config.routing.planning_grid_spacing_m,
         maximum_speed_m_per_day=config.matcher.maximum_speed_m_per_day,
+        cell_filter=cell_filter,
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}")
@@ -102,8 +113,14 @@ def build_candidate_plan(
     config: RoutingConfig,
     grid_spacing_m: float = 4_000.0,
     maximum_speed_m_per_day: float = 43_200.0,
+    cell_filter=None,
 ) -> CandidatePlan:
-    """Plan image pairs and retain deterministic exclusion diagnostics."""
+    """Plan image pairs and retain deterministic exclusion diagnostics.
+
+    ``cell_filter(source_image, cells) -> cells`` drops planning cells (for example land
+    and open water) before primary selection; ``None`` keeps them all.
+    """
+    next_observation = config.primary_selection == "next_observation"
     if grid_spacing_m <= 0:
         raise ValueError("grid_spacing_m must be positive")
     if maximum_speed_m_per_day <= 0:
@@ -177,13 +194,19 @@ def build_candidate_plan(
                 overlap >= config.candidate_minimum_overlap_fraction
                 and overlap_area >= config.candidate_minimum_overlap_area_m2
             ):
-                cells = _planning_cells(
-                    source_footprint,
-                    target_footprint,
-                    pair.elapsed_seconds,
-                    grid_spacing_m,
-                    maximum_speed_m_per_day,
+                cells = (
+                    _imaged_cells(source_footprint, target_footprint, grid_spacing_m)
+                    if next_observation else
+                    _planning_cells(
+                        source_footprint,
+                        target_footprint,
+                        pair.elapsed_seconds,
+                        grid_spacing_m,
+                        maximum_speed_m_per_day,
+                    )
                 )
+                if cell_filter is not None:
+                    cells = frozenset(cell_filter(source, cells))
                 if not cells:
                     exclusions["no_planning_cells"] += 1
                     continue
@@ -217,9 +240,16 @@ def build_candidate_plan(
     ] = {}
     for candidate in candidates:
         by_target.setdefault(candidate[0].target.image_id, []).append(candidate)
+    next_observation_counts: dict[str, int] = {}
     if config.candidate_pair_ids:
         primary_ids.update(pair.pair_id for pair, *_rest in candidates)
         primary_pairs_before_target_maximum = len(primary_ids)
+    elif next_observation:
+        next_observation_counts = _next_observation_selection(
+            candidates, primary_ids,
+            config.next_observation_minimum_cells,
+            config.next_observation_backup_after_hours,
+        )
     else:
         for target_candidates in by_target.values():
             selected, unrestricted_count = _coverage_primary_selection(
@@ -284,6 +314,7 @@ def build_candidate_plan(
     counts = {
         **exclusions,
         "accepted_candidate_pairs": len(pairs),
+        **next_observation_counts,
         "primary_pairs_selected_for_cell_coverage": len(primary_ids) - added_for_source_coverage,
         "primary_pairs_added_for_source_coverage": added_for_source_coverage,
         "primary_pairs_before_target_maximum": (
@@ -454,6 +485,74 @@ def _imaged_cells(source: BaseGeometry, target: BaseGeometry, grid_spacing_m: fl
         (int(round(x / grid_spacing_m)), int(round(y / grid_spacing_m)))
         for x, y in coordinates
     )
+
+
+def _surface_cell_filter(gate, grid_spacing_m: float):
+    """``(source_image, cells) -> cells`` keeping cells the gate does not exclude at the
+    source time; one evaluation per source image and cell, cached."""
+    cache: dict[str, dict] = {}
+
+    def keep(source: ImageRecord, cells):
+        if gate is None or not cells:
+            return cells
+        known = cache.setdefault(source.image_id, {})
+        new = [cell for cell in cells if cell not in known]
+        if new:
+            xy = np.asarray(new, dtype=np.float64) * grid_spacing_m
+            excluded = gate.excluded(xy, source.time_utc)
+            known.update(zip(new, (not value for value in excluded)))
+        if len(cache) > 64:
+            cache.pop(next(iter(cache)))
+        return {cell for cell in cells if known[cell]}
+
+    return keep
+
+
+def _next_observation_selection(
+    candidates, primary_ids: set[str], minimum_cells: int, backup_after_hours: float | None
+) -> dict[str, int]:
+    """Keep, per source image, the pairs to the next observation of its cells.
+
+    Candidates carry the cells both images image (after the cell filter). For each source,
+    its candidate pairs are visited in target-time order; a pair is kept when it is the
+    earliest (or, for a backup, the second) observation for at least ``minimum_cells`` of
+    the source's cells. Cells first observed by a kept pair longer than
+    ``backup_after_hours`` also wait for a backup. Returns diagnostic counts; ``primary_ids``
+    is updated in place.
+    """
+    by_source: dict[str, list] = {}
+    for item in candidates:
+        if item[4] is not None:
+            by_source.setdefault(item[0].source.image_id, []).append(item)
+    kept = backups = assigned = imaged_total = unassigned = 0
+    backup_seconds = None if backup_after_hours is None else backup_after_hours * 3_600.0
+    for source_id in sorted(by_source):
+        items = sorted(by_source[source_id], key=lambda item: (item[0].target.time_utc, item[0].pair_id))
+        need = set().union(*(item[4] for item in items))
+        waiting_backup: set = set()
+        for item in items:
+            pair, cells = item[0], item[4]
+            first = cells & need
+            second = cells & waiting_backup
+            if len(first) + len(second) < minimum_cells:
+                continue
+            primary_ids.add(pair.pair_id)
+            kept += 1
+            backups += int(len(first) < minimum_cells)
+            assigned += len(first) + len(second)
+            imaged_total += len(cells)
+            need -= cells
+            waiting_backup -= cells
+            if backup_seconds is not None and pair.elapsed_seconds > backup_seconds:
+                waiting_backup |= first
+        unassigned += len(need)
+    return {
+        "next_observation_pairs": kept,
+        "next_observation_backup_pairs": backups,
+        "next_observation_assigned_cells": assigned,
+        "next_observation_kept_pair_cells": imaged_total,
+        "next_observation_cells_without_pair": unassigned,
+    }
 
 
 def _complete_source_coverage(

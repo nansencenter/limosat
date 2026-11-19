@@ -299,3 +299,57 @@ def test_source_coverage_completion_is_off_by_default_and_keeps_identity():
     assert on.sha256 != base.sha256
     with pytest.raises(ValueError, match="source_coverage_minimum_cells"):
         RoutingConfig(source_coverage_minimum_cells=0)
+
+
+def _primary(plan):
+    return {item.pair.pair_id for item in plan.pairs if item.selection == "primary"}
+
+
+def test_next_observation_sends_each_cell_to_its_next_image():
+    # A's west is next imaged by B (6 h), its east by C (12 h); D (18 h) re-images both
+    # but is never the next observation from A, so A -> D is not kept. B -> D, C -> D are.
+    a = _image("a", 0.0, "a", box(0, 0, 100_000, 40_000))
+    b = _image("b", 0.25, "b", box(0, 0, 50_000, 40_000))
+    c = _image("c", 0.5, "c", box(50_000, 0, 100_000, 40_000))
+    d = _image("d", 0.75, "d", box(0, 0, 100_000, 40_000))
+    plan = build_candidate_plan(ImageCatalogue([a, b, c, d]), RoutingConfig(primary_selection="next_observation"))
+    kept = _primary(plan)
+    assert {"a__b", "a__c", "b__d", "c__d"} <= kept
+    assert "a__d" not in kept
+    assert plan.exclusion_counts["next_observation_backup_pairs"] == 0
+
+
+def test_next_observation_backup_for_long_pairs_and_minimum_cells():
+    a = _image("a", 0.0, "a", box(0, 0, 100_000, 40_000))
+    b = _image("b", 2.0, "b", box(0, 0, 100_000, 40_000))
+    c = _image("c", 3.0, "c", box(0, 0, 100_000, 40_000))
+    sliver = _image("s", 1.0, "s", box(0, 0, 8_000, 40_000))
+    catalogue = ImageCatalogue([a, b, c, sliver])
+    plain = build_candidate_plan(catalogue, RoutingConfig(primary_selection="next_observation"))
+    assert "a__s" not in _primary(plain)            # fewer than 25 cells
+    assert "a__b" in _primary(plain) and "a__c" not in _primary(plain)
+    backed = build_candidate_plan(catalogue, RoutingConfig(
+        primary_selection="next_observation", next_observation_backup_after_hours=30.0))
+    assert {"a__b", "a__c"} <= _primary(backed)      # A -> B is 48 h, so C backs it up
+    assert backed.exclusion_counts["next_observation_backup_pairs"] >= 1
+
+
+def test_next_observation_cell_filter_drops_land():
+    a = _image("a", 0.0, "a", box(0, 0, 100_000, 40_000))
+    b = _image("b", 0.25, "b", box(0, 0, 100_000, 40_000))
+    land = lambda image, cells: {cell for cell in cells if cell[0] * 4_000 < 30_000}  # noqa: E731
+    plan = build_candidate_plan(ImageCatalogue([a, b]), RoutingConfig(primary_selection="next_observation"), cell_filter=land)
+    assert plan.exclusion_counts["next_observation_assigned_cells"] < 8 * 11
+
+
+def test_next_observation_settings_keep_identity_at_defaults():
+    from dataclasses import replace
+    from limosat.config import RunConfig
+    base = RunConfig("run", "catalogue", "database", "output")
+    assert "primary_selection" not in base.to_dict()["routing"]
+    on = replace(base, routing=RoutingConfig(primary_selection="next_observation"))
+    assert on.sha256 != base.sha256
+    with pytest.raises(ValueError, match="source_coverage_completion"):
+        RoutingConfig(primary_selection="next_observation", source_coverage_completion=True)
+    with pytest.raises(ValueError, match="plan_surface_cells"):
+        RunConfig("run", "catalogue", "database", "output", routing=RoutingConfig(plan_surface_cells=True))

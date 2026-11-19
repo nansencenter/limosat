@@ -81,6 +81,8 @@ EXCLUDED_SETTINGS = {
         "candidate_pair_ids", "recovery_target_policy",
         "recovery_minimum_target_valid_fraction", "recovery_target_valid_window_m",
         "source_coverage_completion", "source_coverage_minimum_cells",
+        "primary_selection", "next_observation_minimum_cells",
+        "next_observation_backup_after_hours", "plan_surface_cells",
     ),
     "open_water": ("sic_root",),
     "surface": (

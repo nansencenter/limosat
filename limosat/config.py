@@ -254,8 +254,38 @@ class RoutingConfig:
     # fewer than source_coverage_minimum_cells would be added.
     source_coverage_completion: bool = False
     source_coverage_minimum_cells: int = 25
+    # Next-observation primary selection (planning.py _next_observation_selection), an
+    # alternative to the per-target selection and its completion. Each source image's
+    # planning cells (4 km, imaged by both images, no drift allowance) go to the earliest
+    # later candidate image that images them, so every piece of ice is carried to its next
+    # observation and composition chains the steps. A pair is kept when it is the next
+    # observation for at least next_observation_minimum_cells cells. Cells whose next
+    # observation is more than next_observation_backup_after_hours away (longer pairs
+    # fail more often, mostly in fast drift) also get the following observation as a
+    # backup. plan_surface_cells drops cells that the surface gate excludes at the source
+    # time (land >= land_minimum_inland_km inland, point open water) before planning.
+    primary_selection: Literal["target_coverage", "next_observation"] = "target_coverage"
+    next_observation_minimum_cells: int = 25
+    next_observation_backup_after_hours: float | None = None
+    plan_surface_cells: bool = False
 
     def __post_init__(self) -> None:
+        if self.primary_selection not in ("target_coverage", "next_observation"):
+            raise ValueError("primary_selection must be target_coverage or next_observation")
+        if (
+            isinstance(self.next_observation_minimum_cells, bool)
+            or not isinstance(self.next_observation_minimum_cells, int)
+            or self.next_observation_minimum_cells < 1
+        ):
+            raise ValueError("next_observation_minimum_cells must be a positive integer")
+        if self.next_observation_backup_after_hours is not None and not (
+            0 < self.next_observation_backup_after_hours < float("inf")
+        ):
+            raise ValueError("next_observation_backup_after_hours must be positive")
+        if not isinstance(self.plan_surface_cells, bool):
+            raise ValueError("plan_surface_cells must be a boolean")
+        if self.primary_selection == "next_observation" and self.source_coverage_completion:
+            raise ValueError("source_coverage_completion applies to the target_coverage selection only")
         if not isinstance(self.source_coverage_completion, bool):
             raise ValueError("source_coverage_completion must be a boolean")
         if (
@@ -457,6 +487,8 @@ class RunConfig:
             )
         if not self.catalogue or not self.database or not self.output_directory:
             raise ValueError("catalogue, database, and output_directory are required")
+        if self.routing.plan_surface_cells and not self.surface.enabled:
+            raise ValueError("routing.plan_surface_cells requires surface.land_raster or point SIC")
         if self.matcher.scene_mask_invalid_from == 3 and not self.surface.land_raster:
             raise ValueError("ignoring the scene land mask requires surface.land_raster")
         if self.field.gap_fill_point_neighbour_count is not None and not self.retain_pair_matches:
@@ -509,6 +541,7 @@ class RunConfig:
             # Preserve the identity of configurations without source-side completion.
             values["routing"].pop("source_coverage_completion")
             values["routing"].pop("source_coverage_minimum_cells")
+        _pop_default_planning(values["routing"], self.routing)
         # Recovery target selection decides which losses a recovery pair measures, not
         # how any pair is measured, so it never enters the configuration identity
         # (pair products stay valid when the selection changes). Target manifests
@@ -615,3 +648,19 @@ def _require_positive(values: dict[str, Any]) -> None:
     invalid = [name for name, value in values.items() if float(value) <= 0]
     if invalid:
         raise ValueError(f"values must be positive: {invalid}")
+
+
+_PLANNING_DEFAULTS = {
+    "primary_selection": "target_coverage",
+    "next_observation_minimum_cells": 25,
+    "next_observation_backup_after_hours": None,
+    "plan_surface_cells": False,
+}
+
+
+def _pop_default_planning(values: dict, routing: RoutingConfig) -> None:
+    """Drop next-observation planning settings at their defaults, so configurations
+    made before they existed keep their identity and plan cache key."""
+    for name, default in _PLANNING_DEFAULTS.items():
+        if getattr(routing, name) == default:
+            values.pop(name, None)
