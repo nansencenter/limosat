@@ -251,3 +251,11 @@ def test_data_dictionary_is_generated_from_the_schema():
     for name in publish.FLAG_BITS:
         assert name in text
     assert np.array([c.nullable for c in publish.COLUMNS]).any()
+
+
+@pytest.mark.parametrize("unit", ["ms", "us", "ns"])
+def test_source_time_columns_of_any_unit_give_epoch_milliseconds(unit):
+    import pyarrow as pa
+
+    column = pa.array([1_700_000_000_000], type=pa.int64()).cast(pa.timestamp("ms", tz="UTC")).cast(pa.timestamp(unit, tz="UTC"))
+    assert publish._epoch_ms_array(column).tolist() == [1_700_000_000_000]

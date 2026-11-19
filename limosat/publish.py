@@ -160,6 +160,13 @@ def ownership_window(period: str) -> tuple[datetime, datetime]:
     return start, datetime(year + 1, 8, 1, tzinfo=timezone.utc)
 
 
+def _epoch_ms_array(column) -> np.ndarray:
+    """Epoch milliseconds of a source timestamp column of any unit (the internal QC Parquet is ms or us depending on
+    the writer's library versions); fails rather than silently truncating sub-millisecond values."""
+    pa, _, _, _ = _pyarrow()
+    return column.cast(pa.timestamp("ms", tz="UTC")).cast(pa.int64()).to_numpy()
+
+
 def _ms(value: datetime) -> int:
     return int(round(value.timestamp() * 1000))
 
@@ -356,8 +363,8 @@ def _arrays(ctx: _Context, table, *, ends: bool):
     pos = np.searchsorted(ctx.traj_ids, table["qc_trajectory_id"].to_numpy())
     first = ctx.first_index[pos]
     link = table["trajectory_link_index"].to_numpy().astype(np.int64)
-    start_ms = table["start_time_utc"].cast(pa.int64()).to_numpy()
-    end_ms = table["end_time_utc"].cast(pa.int64()).to_numpy()
+    start_ms = _epoch_ms_array(table["start_time_utc"])
+    end_ms = _epoch_ms_array(table["end_time_utc"])
     primary = (start_ms >= ctx.window_ms[0]) & (start_ms < ctx.window_ms[1])
     side = "target" if ends else "source"
     images = table[f"{side}_image_id"].to_numpy()
@@ -435,8 +442,8 @@ def build_period(
     span = grouped["trajectory_link_index_max"].to_numpy().astype(np.int64) - first_index + 1
     if not np.array_equal(span, grouped["trajectory_link_index_count"].to_numpy().astype(np.int64)):
         raise ValueError(f"{source.period}: link indices of a trajectory are not consecutive")
-    start_ms = head["start_time_utc"].cast(pa.int64()).to_numpy()
-    end_ms = head["end_time_utc"].cast(pa.int64()).to_numpy()
+    start_ms = _epoch_ms_array(head["start_time_utc"])
+    end_ms = _epoch_ms_array(head["end_time_utc"])
     expected_primary_links = int(((start_ms >= window_ms[0]) & (start_ms < window_ms[1])).sum())
     first_ms, last_ms = int(start_ms.min()), int(end_ms.max())
     n_trajectories = len(traj_ids)
@@ -696,8 +703,8 @@ def validate_period(source: Source, catalog_path: Path, output: Path, entry: dic
     is_step = p_idx > 0
     step = pub.filter(pa.array(is_step))
     first = pub.filter(pa.array(~is_step))
-    start_ms = src["start_time_utc"].cast(pa.int64()).to_numpy()
-    end_ms = src["end_time_utc"].cast(pa.int64()).to_numpy()
+    start_ms = _epoch_ms_array(src["start_time_utc"])
+    end_ms = _epoch_ms_array(src["end_time_utc"])
 
     def same(a, b, name):
         if not np.array_equal(np.asarray(a), np.asarray(b), equal_nan=np.asarray(a).dtype.kind == "f"):
