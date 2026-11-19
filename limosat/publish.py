@@ -568,6 +568,15 @@ def data_dictionary() -> str:
         "",
         "Windows (start inclusive, stop exclusive) are in `manifest.json`.",
         "",
+        "## Known data gaps",
+        "",
+        "- **18 to 23 June 2016 and 25 to 26 June 2016:** there are no Sentinel-1 EW scenes in the source archive for",
+        "  these days (checked against the Alaska Satellite Facility and Copernicus Data Space catalogues), so no",
+        "  observations lie on them and the trajectories of the periods `201505_201607` and `201605_201707` have a gap",
+        "  there. It is a gap in the input data, not a processing failure.",
+        "- Sentinel-1B scenes exist only from autumn 2016 until the 23 December 2021 anomaly; coverage and trajectory",
+        "  lengths vary strongly with the acquisition plan (see the accompanying paper).",
+        "",
     ]
     return "\n".join(lines)
 
