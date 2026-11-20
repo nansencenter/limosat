@@ -457,7 +457,7 @@ def build_period(
     bounds = {"x_min": None, "x_max": None, "y_min": None, "y_max": None}
     months = _month_starts(first_ms, last_ms)
     try:
-        with pq.ParquetWriter(temporary, ctx.schema, compression="zstd") as writer:
+        with pq.ParquetWriter(temporary, ctx.schema, compression="gzip", compression_level=6) as writer:
             for lo in months:
                 hi = datetime(lo.year + lo.month // 12, lo.month % 12 + 1, 1, tzinfo=timezone.utc)
                 pieces = []
