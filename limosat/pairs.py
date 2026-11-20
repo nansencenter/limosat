@@ -35,7 +35,6 @@ from .routing import (
     coarse_match_shift,
     coarse_phase_translation,
     residual_edge_correction,
-    targeted_domain,
     tile_shifts,
 )
 from .tile_gates import (
@@ -124,7 +123,6 @@ class PairProcessor:
         pair: ImagePair,
         previous_field: DisplacementField | None = None,
         previous_elapsed_seconds: float | None = None,
-        targeted_positions_xy_m: np.ndarray | None = None,
     ) -> PairResult:
         started = time.perf_counter()
         if self._patch_cache is not None:
@@ -132,7 +130,6 @@ class PairProcessor:
         try:
             return self._process(
                 pair, started, previous_field, previous_elapsed_seconds,
-                targeted_positions_xy_m,
             )
         finally:
             if self._patch_cache is not None:
@@ -144,17 +141,10 @@ class PairProcessor:
         started: float,
         previous_field: DisplacementField | None,
         previous_elapsed_seconds: float | None,
-        targeted_positions_xy_m: np.ndarray | None,
     ) -> PairResult:
         overlap = self._overlap(pair)
         reachable_domain = self._motion_reachable_domain(pair)
         domain = reachable_domain
-        if targeted_positions_xy_m is not None:
-            domain = targeted_domain(
-                targeted_positions_xy_m,
-                self.config.routing.targeted_selection_buffer_m,
-                domain,
-            )
         regions = tile_layout(domain, self.config)
         centers = np.asarray([item.center_xy_m for item in regions], dtype=np.float64)
         diagnostics: dict[str, int | float | str | None] = {

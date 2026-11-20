@@ -230,7 +230,7 @@ def test_compose_uses_pair_products_without_creating_sqlite(tmp_path):
         {"total": 1.0},
         1,
     )
-    PairProductStore(config).save(pair, "primary", False, result)
+    PairProductStore(config).save(pair, result)
 
     output = tmp_path / "parquet-output"
     composed = compose_primary_parquet(config, output)

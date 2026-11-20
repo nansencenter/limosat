@@ -25,13 +25,9 @@ def _layered(config, **matcher):
     return replace(config, matcher=replace(config.matcher, **matcher))
 
 
-def test_default_layout_options_keep_configuration_identity(tmp_path):
+def test_layered_layout_is_opt_in(tmp_path):
     config = _config(tmp_path)
     assert not config.matcher.layered_layout
-    assert not {
-        "tile_grid_offsets", "masked_rematch_target_valid_fraction", "layout_dedup_m",
-        "layout_field_merge", "tile_sampling",
-    } & config.to_dict()["matcher"].keys()
     layered = _layered(config, tile_grid_offsets=[[0, 0], [0.5, 0.5]])
     assert layered.matcher.tile_grid_offsets == DIAGONAL
     assert layered.matcher.layered_layout

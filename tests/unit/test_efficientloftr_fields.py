@@ -16,13 +16,13 @@ from limosat import (
     RoutingConfig,
     RunConfig,
     TrajectoryConfig,
-    build_trajectories,
 )
 from limosat.efficientloftr import speed_limit_mask
 from limosat.field import _weighted_mean, estimate_queries
 from limosat.imagery import _interpolate_grid, north_up_patch, projected_coordinates
 from limosat.pairs import PairProcessor
 from limosat.routing import CoarseTranslation
+from test_trajectories import build_trajectories
 
 
 class TranslationMatcher:

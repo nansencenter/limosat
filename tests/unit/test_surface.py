@@ -51,8 +51,8 @@ def test_point_open_water_keeps_missing_concentration(tmp_path):
     assert excluded.tolist() == [True, False, False]
 
 
-def test_surface_config_off_preserves_identity():
-    assert "surface" not in RunConfig("run", "catalogue", "database", "output").to_dict()
+def test_surface_config_is_off_by_default():
+    assert not RunConfig("run", "catalogue", "database", "output").surface.enabled
     with pytest.raises(ValueError):
         SurfaceConfig(point_open_water_threshold_percent=120.0)
 
@@ -108,7 +108,7 @@ def test_scene_land_mask_can_be_left_to_the_land_raster(tmp_path):
     assert TargetPixelValidity(path).__call__(xy).tolist() == [True, False, True, False]
     assert TargetPixelValidity(path, invalid_from=3)(xy).tolist() == [True, True, True, False]
     base = RunConfig("run", "catalogue", "database", "output")
-    assert "scene_mask_invalid_from" not in base.to_dict()["matcher"]
+    assert base.matcher.scene_mask_invalid_from == 2
     from dataclasses import replace
     with pytest.raises(ValueError):
         replace(base, matcher=replace(base.matcher, scene_mask_invalid_from=3))

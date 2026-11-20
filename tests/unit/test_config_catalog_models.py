@@ -93,16 +93,13 @@ def test_global_planning_defaults_are_explicit():
     assert routing.candidate_maximum_elapsed_hours == 96.0
     assert routing.candidate_minimum_overlap_fraction == 0.05
     assert routing.candidate_minimum_overlap_area_m2 == 1_024_000_000.0
-    assert routing.maximum_recovery_elapsed_hours == 96.0
     assert routing.phase_correlation_failure == "same_center"
     assert routing.phase_correlation_minimum_response == 0.05
     assert routing.next_observation_minimum_cells == 25
     with pytest.raises(ValueError, match="planning_grid_spacing_m"):
         RoutingConfig(planning_grid_spacing_m=0)
     assert RunConfig("run", "catalogue", "database", "output").retain_pair_matches is True
-    assert "missing_node_fallback" not in RunConfig(
-        "run", "catalogue", "database", "output"
-    ).to_dict()["field"]
+    assert RunConfig("run", "catalogue", "database", "output").field.missing_node_fallback is False
     assert RunConfig(
         "run", "catalogue", "database", "output",
         field=FieldConfig(missing_node_fallback=True),
@@ -128,26 +125,6 @@ def test_global_planning_defaults_are_explicit():
             pair_workers=2,
             matcher=MatcherConfig(device="cuda"),
         )
-
-
-@pytest.mark.parametrize("retain_matches", [False, True])
-def test_legacy_config_without_fallback_flag_keeps_disabled_identity(
-    tmp_path, retain_matches
-):
-    legacy = RunConfig(
-        "run", str(tmp_path / "catalogue"), str(tmp_path / "database"),
-        str(tmp_path / "output"),
-        field=FieldConfig(missing_node_fallback=False),
-        retain_pair_matches=retain_matches,
-    )
-    path = tmp_path / "legacy.json"
-    path.write_text(json.dumps(legacy.to_dict()), encoding="utf-8")
-
-    loaded = load_config(path)
-
-    assert loaded.field.missing_node_fallback is False
-    assert loaded.retain_pair_matches is retain_matches
-    assert loaded.sha256 == legacy.sha256
 
 
 def test_enabled_fallback_config_round_trips(tmp_path):

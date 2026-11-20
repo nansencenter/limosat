@@ -6,7 +6,7 @@ import pytest
 from limosat import FieldEdge, TrajectoryConfig
 from limosat.config import RunConfig
 from limosat.trajectory import iter_global_trajectory_batches
-from test_trajectories_deformation import GRID, _field, _images, _settings
+from test_trajectories import GRID, _field, _images, _settings
 
 
 def _converging_edges():
@@ -24,7 +24,6 @@ def _run(radius):
     return list(iter_global_trajectory_batches(
         _converging_edges(), _images(), _settings(),
         TrajectoryConfig(new_point_exclusion_radius_m=500.0, merge_radius_m=radius),
-        gap_rows=False,
     ))
 
 
@@ -48,7 +47,7 @@ def test_merging_ends_one_of_two_tracks_on_the_same_ice():
 
 def test_merge_radius_configuration():
     base = RunConfig("run", "catalogue", "database", "output")
-    assert "merge_radius_m" not in base.to_dict()["trajectories"]
+    assert base.trajectories.merge_radius_m is None
     merged = replace(base, trajectories=TrajectoryConfig(merge_radius_m=500.0))
     assert merged.sha256 != base.sha256
     with pytest.raises(ValueError, match="merge_radius_m"):
@@ -60,7 +59,6 @@ def _run_young(hours):
         _converging_edges(), _images(), _settings(),
         TrajectoryConfig(new_point_exclusion_radius_m=500.0, merge_radius_m=300.0,
                          merge_maximum_younger_age_hours=hours),
-        gap_rows=False,
     ))
 
 

@@ -3,6 +3,7 @@
 #   submit_chain_olivia.sh [--dry-run]   freeze the run environment and submit prepare, which submits the rest
 #   submit_chain_olivia.sh --start-at STAGE   re-freeze an existing run with this checkout (e.g. newer composition
 #       code after STOP_AFTER=primary-pairs) and continue from STAGE; the previous environment is kept beside it
+#   STOP_AFTER=primary-pairs submit_chain_olivia.sh   match only; compose later with --start-at primary-compose
 #   submit_chain_olivia.sh --stage S [--after J] [--pairs N]   (used by running stages) submit one stage, print its ID
 # A GPU stage for N pairs gets ceil(N / PAIRS_PER_GPU_TASK) one-GPU tasks (at most MAXIMUM_GPU_TASKS) and a time
 # limit of twice the expected run time at PAIRS_PER_GPU_HOUR, at least 30 minutes: short requests backfill sooner.
@@ -81,9 +82,6 @@ else
     printf 'export LIMOSAT_OVERLAY=%q\n' "$overlay"
     printf 'export LIMOSAT_PROCESSES_PER_GPU=%q\n' "${PROCESSES_PER_GPU:-10}"
     printf 'export LIMOSAT_SUBMIT=%q\n' "$method_root/scripts/submit_chain_olivia.sh"
-    printf 'export LIMOSAT_MINIMUM_PASS_PAIRS=%q\n' "${MINIMUM_PASS_PAIRS:-50}"
-    printf 'export LIMOSAT_MINIMUM_GAIN_SHARE=%q\n' "${MINIMUM_GAIN_SHARE:-0.3}"
-    printf 'export LIMOSAT_MAXIMUM_PASSES=%q\n' "${MAXIMUM_PASSES:-12}"
     printf 'export LIMOSAT_STOP_AFTER=%q\n' "${STOP_AFTER:-}"
     printf 'GPU_ACCOUNT=%q\nCPU_ACCOUNT=%q\n' "${GPU_ACCOUNT:-nn2993k}" "${CPU_ACCOUNT:-${GPU_ACCOUNT:-nn2993k}}"
     printf 'MAXIMUM_GPU_TASKS=%q\nPAIRS_PER_GPU_TASK=%q\nPAIRS_PER_GPU_HOUR=%q\n' \
@@ -100,7 +98,7 @@ fi
 job_script="$LIMOSAT_METHOD_ROOT/scripts/run_limosat_chain_olivia.sbatch"
 build_command() {
   local name="$1" dependency="$2"
-  command=(sbatch --parsable --nodes=1 --ntasks=1 --job-name="eloftr-$name-p${LIMOSAT_PASS:-0}")
+  command=(sbatch --parsable --nodes=1 --ntasks=1 --job-name="eloftr-$name")
   if [[ "$name" == *-pairs ]]; then
     local tasks=$(( (pairs + PAIRS_PER_GPU_TASK - 1) / PAIRS_PER_GPU_TASK ))
     (( tasks >= 1 )) || tasks=1
@@ -119,7 +117,7 @@ build_command() {
     [[ "$CPU_PARTITION" != accel ]] || command+=(--gpus-per-node=0)
   fi
   [[ -z "$dependency" ]] || command+=(--dependency="afterok:$dependency")
-  command+=(--export="ALL,LIMOSAT_STAGE=$name,LIMOSAT_PASS=${LIMOSAT_PASS:-0}" "$job_script")
+  command+=(--export="ALL,LIMOSAT_STAGE=$name" "$job_script")
 }
 submit_stage() {
   build_command "$1" "$2"
@@ -131,7 +129,7 @@ submit_stage() {
     local submitted
     submitted=$("${command[@]}")
     echo "${submitted%%;*}"
-    echo "$(date -u +%FT%TZ) submitted $1 pass ${LIMOSAT_PASS:-0} job ${submitted%%;*}" >> "$LIMOSAT_RUN_ROOT/control/passes.log"
+    echo "$(date -u +%FT%TZ) submitted $1 job ${submitted%%;*}" >> "$LIMOSAT_RUN_ROOT/control/chain.log"
   fi
 }
 
@@ -145,7 +143,7 @@ if [[ "$dry_run" == 1 ]]; then
   pairs=2418
   submit_stage primary-pairs "<prepare>" > /dev/null
 fi
-echo "ledger=$LIMOSAT_RUN_ROOT/control/passes.log"
+echo "ledger=$LIMOSAT_RUN_ROOT/control/chain.log"
 if [[ "$dry_run" == 1 ]]; then
   rm -f "$LIMOSAT_RUN_ROOT/control/submit.env.dry-run"
   echo "DRY RUN: no jobs submitted"

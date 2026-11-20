@@ -117,7 +117,7 @@ def test_kept_gap_matches_give_the_same_point_estimates():
 
 def test_gap_filling_configuration_identity_and_requirements(tmp_path):
     base = RunConfig("run", "catalogue", "database", "output")
-    assert not any(name.startswith("gap_fill_") for name in base.to_dict()["field"])
+    assert not base.field.gap_filling
     filled = replace(base, field=FieldConfig(**GAP_FILL))
     assert filled.sha256 != base.sha256
     assert filled.to_dict()["field"]["gap_fill_rigid_edge_m"] == 12_800.0

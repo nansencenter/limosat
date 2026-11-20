@@ -8,13 +8,10 @@ from pathlib import Path
 from typing import Sequence
 
 from .catalog import load_catalogue
+from .compose import compose_primary_parquet
 from .config import load_config
-from .finalize import finalize_products
 from .pair_products import PairProductStore
-from .compose import compose_primary_parquet, compose_recovery_parquet
-from .planning import run_plan, recovery_candidates, select_overlap_probe
-from .recovery import prepare_recovery_targets
-from .run import LiMOSATRun
+from .planning import run_plan, select_overlap_probe
 from .stages import RunStages
 from .store import RunStore
 
@@ -23,7 +20,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="limosat")
     commands = parser.add_subparsers(dest="command", required=True)
     run = commands.add_parser(
-        "run", help="run the complete global catalogue workflow"
+        "run", help="prepare, match every primary pair and compose, on one machine"
     )
     run.add_argument("config", type=Path)
     prepare = commands.add_parser(
@@ -31,68 +28,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     prepare.add_argument("config", type=Path)
     pairs = commands.add_parser(
-        "pairs", help="measure one deterministic batch of image pairs"
+        "pairs", help="match one deterministic batch of primary image pairs"
     )
     pairs.add_argument("config", type=Path)
-    pairs.add_argument("--kind", choices=("primary", "recovery"), required=True)
     pairs.add_argument("--batch-index", type=int, default=0)
     pairs.add_argument("--batch-count", type=int, default=1)
-    pairs.add_argument(
-        "--recovery-targets",
-        type=Path,
-        help="SQLite-free recovery targets prepared from primary Parquet output",
-    )
-    compose = commands.add_parser(
-        "compose", help="import completed pair products and compose trajectories"
-    )
-    compose.add_argument("config", type=Path)
-    compose.add_argument("--phase", choices=("primary", "final"), required=True)
     compose_parquet = commands.add_parser(
         "compose-parquet",
         help="compose primary trajectories directly from pair products to Parquet",
     )
     compose_parquet.add_argument("config", type=Path)
     compose_parquet.add_argument("output_directory", type=Path)
-    prepare_recovery = commands.add_parser(
-        "prepare-recovery-parquet",
-        help="derive immutable targeted-recovery coordinates from primary Parquet",
-    )
-    prepare_recovery.add_argument("config", type=Path)
-    prepare_recovery.add_argument("primary_composition_directory", type=Path)
-    prepare_recovery.add_argument("recovery_target_directory", type=Path)
-    prepare_recovery.add_argument(
-        "--requests", type=Path,
-        help="explicit pair and trajectory requests from an adaptive selection round",
-    )
-    compose_recovery = commands.add_parser(
-        "compose-recovery-parquet",
-        help="compose frozen-primary recovery deltas from completed pair products",
-    )
-    compose_recovery.add_argument("config", type=Path)
-    compose_recovery.add_argument("primary_composition_directory", type=Path)
-    compose_recovery.add_argument("recovery_target_directory", type=Path)
-    compose_recovery.add_argument("output_directory", type=Path)
-    merge_base = commands.add_parser(
-        "merge-recovery-base",
-        help="freeze a base plus one recovery composition as the next pass's base",
-    )
-    merge_base.add_argument("config", type=Path)
-    merge_base.add_argument("base_composition_directory", type=Path)
-    merge_base.add_argument("recovery_composition_directory", type=Path)
-    merge_base.add_argument("output_directory", type=Path)
-    merge_base.add_argument("--pass-index", type=int, required=True)
-    annotate = commands.add_parser(
-        "annotate-links",
-        help="write every link with its pass and an along-track consistency check",
-    )
-    annotate.add_argument("config", type=Path)
-    annotate.add_argument("final_base_directory", type=Path)
-    annotate.add_argument("output_directory", type=Path)
-    annotate.add_argument(
-        "--recovery", action="append", default=[], metavar="PASS=DIR",
-        help="recovery composition for a pass missing from the base lineage",
-    )
-    annotate.add_argument("--maximum-neighbour-gap-days", type=float, default=4.0)
     status = commands.add_parser("status", help="show durable local run state")
     status.add_argument("config", type=Path)
     plan = commands.add_parser(
@@ -107,16 +53,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="select a bounded overlap stratum; may be repeated",
     )
     plan.add_argument("--maximum-per-bin", type=int, default=5)
-    finalize = commands.add_parser(
-        "finalize", help="validate and package a completed native run"
-    )
-    finalize.add_argument("config", type=Path)
-    finalize.add_argument(
-        "--skip-parquet",
-        action="store_true",
-        help="write the assessment summary without the optional Parquet export",
-    )
-    finalize.add_argument("--batch-size", type=int, default=100_000)
     return parser
 
 
@@ -124,89 +60,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
     config = load_config(arguments.config)
     if arguments.command == "run":
-        result = LiMOSATRun(config).execute(["limosat", "run", str(arguments.config)])
+        result = RunStages(config).run_all()
     elif arguments.command == "prepare":
         result = RunStages(config).prepare()
     elif arguments.command == "pairs":
         result = RunStages(config).process_pairs(
-            arguments.kind,
-            batch_index=arguments.batch_index,
-            batch_count=arguments.batch_count,
-            recovery_target_directory=(
-                str(arguments.recovery_targets)
-                if arguments.recovery_targets is not None
-                else None
-            ),
-        )
-    elif arguments.command == "compose":
-        result = RunStages(config).compose(
-            arguments.phase,
-            [
-                "limosat",
-                "compose",
-                str(arguments.config),
-                "--phase",
-                arguments.phase,
-            ],
+            batch_index=arguments.batch_index, batch_count=arguments.batch_count
         )
     elif arguments.command == "compose-parquet":
         result = compose_primary_parquet(config, arguments.output_directory)
-    elif arguments.command == "prepare-recovery-parquet":
-        result = prepare_recovery_targets(
-            config,
-            arguments.primary_composition_directory,
-            arguments.recovery_target_directory,
-            request_plan=arguments.requests,
-        )
-    elif arguments.command == "merge-recovery-base":
-        from .compose import merge_recovery_base
-
-        result = merge_recovery_base(
-            config,
-            arguments.base_composition_directory,
-            arguments.recovery_composition_directory,
-            arguments.output_directory,
-            pass_index=arguments.pass_index,
-        )
-    elif arguments.command == "annotate-links":
-        from .annotate import annotate_links
-
-        result = annotate_links(
-            config,
-            arguments.final_base_directory,
-            arguments.output_directory,
-            recovery_compositions=dict(
-                item.split("=", 1) for item in arguments.recovery
-            ),
-            maximum_neighbour_gap_days=arguments.maximum_neighbour_gap_days,
-        )
-    elif arguments.command == "compose-recovery-parquet":
-        result = compose_recovery_parquet(
-            config,
-            arguments.primary_composition_directory,
-            arguments.recovery_target_directory,
-            arguments.output_directory,
-        )
     elif arguments.command == "status":
         result = RunStore(config, read_only=True).status()
-        products = PairProductStore(config)
-        result["pair_products"] = {
-            kind: products.count(kind) for kind in ("primary", "recovery")
-        }
-    elif arguments.command == "finalize":
-        result = finalize_products(
-            config,
-            export_parquet=not arguments.skip_parquet,
-            batch_size=arguments.batch_size,
-        )
+        result["pair_products"] = PairProductStore(config).count()
     else:
         catalogue = load_catalogue(config.catalogue, config.analysis_epsg)
         candidate_plan = run_plan(config, catalogue)
         pairs = candidate_plan.pairs
-        recovery = recovery_candidates(
-            pairs,
-            config.routing.maximum_recovery_elapsed_hours,
-        )
         primary_per_target: dict[str, int] = {}
         for item in pairs:
             if item.selection == "primary":
@@ -227,7 +96,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 primary_per_target.values(), default=0
             ),
             "primary_pairs_per_target_distribution": primary_count_distribution,
-            "eligible_recovery_pairs": len(recovery),
             "planning_counts": candidate_plan.exclusion_counts,
         }
         if arguments.probe_bin:

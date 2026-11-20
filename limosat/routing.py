@@ -1,4 +1,4 @@
-"""Causal routing priors and targeted recovery geometry."""
+"""Causal routing priors: coarse translation and tile shifts."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ from dataclasses import dataclass
 
 import cv2
 import numpy as np
-from shapely import MultiPoint
 from shapely.geometry.base import BaseGeometry
 
 from .config import FieldConfig, MatcherConfig, RoutingConfig
@@ -106,15 +105,6 @@ def coarse_phase_translation(
     if magnitude > maximum_displacement_m:
         displacement *= maximum_displacement_m / magnitude
     return CoarseTranslation(tuple(displacement), float(response), float(overlap.mean()))
-
-
-def targeted_domain(
-    positions_xy_m: np.ndarray, buffer_m: float, overlap: BaseGeometry
-) -> BaseGeometry:
-    points = np.asarray(positions_xy_m, dtype=np.float64)
-    if not len(points):
-        return overlap.intersection(MultiPoint([]))
-    return MultiPoint(points).buffer(buffer_m).intersection(overlap)
 
 
 def residual_edge_correction(

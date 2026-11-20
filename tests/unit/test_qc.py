@@ -20,7 +20,6 @@ def test_basic_qc_rejects_only_hard_speed_and_reviews_local_anomaly():
             TrajectoryExtension(
                 trajectory_id=f"trajectory-{index}",
                 pair_id="a__b",
-                pair_kind="primary",
                 source_image_id="a",
                 target_image_id="b",
                 start_time_utc=START,

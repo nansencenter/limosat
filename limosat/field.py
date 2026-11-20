@@ -148,7 +148,6 @@ def field_edge_with_fallback(
     baseline: DisplacementField,
     matches: MotionMatches,
     config: FieldConfig,
-    **edge_options,
 ) -> FieldEdge:
     """Attach supplemental support without replacing the baseline field."""
     fallback = (
@@ -162,7 +161,6 @@ def field_edge_with_fallback(
             gap_matches(baseline, matches, config)
             if config.gap_fill_point_neighbour_count is not None else None
         ),
-        **edge_options,
     )
 
 

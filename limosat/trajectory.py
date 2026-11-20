@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from datetime import datetime, timezone
 from collections.abc import Callable, Iterator
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import numpy as np
 from scipy.spatial import cKDTree
@@ -31,8 +31,8 @@ class TrajectoryPoint:
     time_utc: datetime
     state: str
     position_basis: str
-    x_m: float | None
-    y_m: float | None
+    x_m: float
+    y_m: float
     source_pair_id: str | None
     selected_matches: float | None = None
     support_radius_m: float | None = None
@@ -42,20 +42,10 @@ class TrajectoryPoint:
         if self.time_utc.tzinfo is None or self.time_utc.utcoffset() is None:
             raise ValueError("trajectory times must be timezone-aware")
         object.__setattr__(self, "time_utc", self.time_utc.astimezone(timezone.utc))
-        if self.state not in {"created", "observed", "dormant", "reappeared"}:
+        if self.state not in {"created", "observed"}:
             raise ValueError(f"unknown trajectory state: {self.state}")
-        if (self.x_m is None) != (self.y_m is None):
-            raise ValueError("trajectory coordinates must both be present or both be NULL")
-        if self.state == "dormant" and self.available:
-            raise ValueError("dormant trajectory coordinates must be NULL")
-        if self.state != "dormant" and not self.available:
-            raise ValueError("measured trajectory states require coordinates")
-        if self.available and not np.isfinite([self.x_m, self.y_m]).all():
-            raise ValueError("measured trajectory coordinates must be finite")
-
-    @property
-    def available(self) -> bool:
-        return self.x_m is not None and self.y_m is not None
+        if not np.isfinite([self.x_m, self.y_m]).all():
+            raise ValueError("trajectory coordinates must be finite")
 
 
 @dataclass(frozen=True)
@@ -64,7 +54,6 @@ class TrajectoryExtension:
 
     trajectory_id: str
     pair_id: str
-    pair_kind: str
     source_image_id: str
     target_image_id: str
     start_time_utc: datetime
@@ -86,8 +75,6 @@ class TrajectoryExtension:
         object.__setattr__(self, "end_time_utc", end)
         if end <= start:
             raise ValueError("trajectory extension time must increase")
-        if self.pair_kind not in {"primary", "recovery"}:
-            raise ValueError(f"unknown trajectory extension kind: {self.pair_kind}")
         if not np.isfinite([self.x0_m, self.y0_m, self.x1_m, self.y1_m]).all():
             raise ValueError("trajectory extension coordinates must be finite")
 
@@ -124,20 +111,6 @@ class TrajectoryBatch:
 
 
 @dataclass(frozen=True)
-class ConvergenceEvent:
-    """Non-destructive evidence that two measured parcel positions converge."""
-
-    image_id: str
-    time_utc: datetime
-    winner_trajectory_id: str
-    candidate_trajectory_id: str
-    separation_m: float
-    audit_radius_m: float
-    winner_observation_count: int
-    candidate_observation_count: int
-
-
-@dataclass(frozen=True)
 class _Continuation:
     source_step: int
     edge: FieldEdge
@@ -145,27 +118,6 @@ class _Continuation:
     selected_matches: float
     support_radius_m: float
     maximum_residual_m: float
-
-
-def compose_global_trajectories(
-    edges: Sequence[FieldEdge],
-    images: Sequence[ImageRecord],
-    field_config: FieldConfig,
-    trajectory_config: TrajectoryConfig,
-    *,
-    target_validity_factory: TargetValidityFactory | None = None,
-    seed_filter_factory: SeedFilterFactory | None = None,
-) -> tuple[TrajectoryPoint, ...]:
-    """Recompose the catalogue without treating compute labels as boundaries."""
-    return tuple(
-        point
-        for batch in iter_global_trajectory_points(
-            edges, images, field_config, trajectory_config,
-            target_validity_factory=target_validity_factory,
-            seed_filter_factory=seed_filter_factory,
-        )
-        for point in batch
-    )
 
 
 def iter_global_trajectory_batches(
@@ -176,14 +128,12 @@ def iter_global_trajectory_batches(
     *,
     target_validity_factory: TargetValidityFactory | None = None,
     seed_filter_factory: SeedFilterFactory | None = None,
-    gap_rows: bool = True,
 ) -> Iterator[TrajectoryBatch]:
     """Yield deterministic points and direct extensions for each image.
 
-    With ``gap_rows`` false no ``dormant`` rows are written. A gap is then
-    implied wherever a primary pair reaches an image from one where the
-    trajectory was measured but the trajectory has no row on that image;
-    ``recovery.prepare_recovery_targets`` derives them that way.
+    At each image a trajectory continues from its most recent position through the best
+    supported incoming primary pair field. Gaps are not stored: a trajectory simply has
+    no row on an image that a pair from its last position reaches without supporting it.
     """
     ordered_images = tuple(
         sorted(images, key=lambda image: (image.time_utc, image.image_id))
@@ -201,14 +151,7 @@ def iter_global_trajectory_batches(
         if source is None or target is None or source >= target:
             raise ValueError("every pair field must point forward between listed images")
         indexed.append((source, target, edge))
-    indexed.sort(
-        key=lambda item: (
-            item[1],
-            item[0],
-            item[2].pair_kind,
-            item[2].field.pair_id,
-        )
-    )
+    indexed.sort(key=lambda item: (item[1], item[0], item[2].field.pair_id))
     incoming_by_target: dict[int, list[tuple[int, int, FieldEdge]]] = {}
     for item in indexed:
         incoming_by_target.setdefault(item[1], []).append(item)
@@ -242,32 +185,23 @@ def iter_global_trajectory_batches(
                 target_validity_factory(image)
                 if target_validity_factory is not None and eligible else None
             )
-            chosen = _choose_continuations(
+            chosen = _supported_continuations(
                 incoming, positions, eligible, field_config,
                 target_validity=target_validity,
             )
             for identity in eligible:
                 continuation = chosen.get(identity)
                 if continuation is None:
-                    if gap_rows:
-                        points.append(
-                            _point(identity, image, "dormant", "missing", None, None)
-                        )
                     continue
                 source_xy = positions[continuation.source_step][identity]
                 xy = source_xy + continuation.displacement_m
                 positions[step][identity] = xy
-                state = (
-                    "reappeared"
-                    if continuation.edge.pair_kind == "recovery"
-                    else "observed"
-                )
                 points.append(
                     _point(
                         identity,
                         image,
-                        state,
-                        f"{continuation.edge.pair_kind}_pair_field",
+                        "observed",
+                        "primary_pair_field",
                         xy,
                         continuation.edge.field.pair_id,
                         continuation.selected_matches,
@@ -280,7 +214,6 @@ def iter_global_trajectory_batches(
                     TrajectoryExtension(
                         trajectory_id=identity,
                         pair_id=continuation.edge.field.pair_id,
-                        pair_kind=continuation.edge.pair_kind,
                         source_image_id=source_image.image_id,
                         target_image_id=image.image_id,
                         start_time_utc=source_image.time_utc,
@@ -289,10 +222,8 @@ def iter_global_trajectory_batches(
                         y0_m=float(source_xy[1]),
                         x1_m=float(xy[0]),
                         y1_m=float(xy[1]),
-                        target_state=state,
-                        target_position_basis=(
-                            f"{continuation.edge.pair_kind}_pair_field"
-                        ),
+                        target_state="observed",
+                        target_position_basis="primary_pair_field",
                         selected_matches=continuation.selected_matches,
                         support_radius_m=continuation.support_radius_m,
                         maximum_residual_m=continuation.maximum_residual_m,
@@ -329,10 +260,9 @@ def iter_global_trajectory_batches(
                     if extension.trajectory_id not in ended
                 ]
         for point in points:
-            if point.available:
-                observations[point.trajectory_id] = observations.get(point.trajectory_id, 0) + 1
-                if young_hours is not None and point.trajectory_id in young_steps:
-                    young_steps[point.trajectory_id].append(step)
+            observations[point.trajectory_id] = observations.get(point.trajectory_id, 0) + 1
+            if young_hours is not None and point.trajectory_id in young_steps:
+                young_steps[point.trajectory_id].append(step)
         if young_hours is not None and young_steps:
             # Forget the history of trajectories too old to be merged.
             limit = young_hours * 3_600.0
@@ -384,394 +314,6 @@ def iter_global_trajectory_batches(
                 positions[source_step].clear()
         if step not in last_use:
             positions[step].clear()
-
-
-def iter_global_trajectory_points(
-    edges: Sequence[FieldEdge],
-    images: Sequence[ImageRecord],
-    field_config: FieldConfig,
-    trajectory_config: TrajectoryConfig,
-    *,
-    target_validity_factory: TargetValidityFactory | None = None,
-    seed_filter_factory: SeedFilterFactory | None = None,
-) -> Iterator[tuple[TrajectoryPoint, ...]]:
-    """Yield deterministic per-image rows while retaining only needed positions."""
-    for batch in iter_global_trajectory_batches(
-        edges, images, field_config, trajectory_config,
-        target_validity_factory=target_validity_factory,
-        seed_filter_factory=seed_filter_factory,
-    ):
-        yield batch.points
-
-
-def build_trajectories(
-    edges: Sequence[FieldEdge],
-    images: Sequence[ImageRecord],
-    field_config: FieldConfig,
-    trajectory_config: TrajectoryConfig,
-    *,
-    target_validity_factory: TargetValidityFactory | None = None,
-    seed_filter_factory: SeedFilterFactory | None = None,
-) -> tuple[TrajectoryPoint, ...]:
-    """Compatibility name for the global catalogue composer."""
-    return compose_global_trajectories(
-        edges, images, field_config, trajectory_config,
-        target_validity_factory=target_validity_factory,
-        seed_filter_factory=seed_filter_factory,
-    )
-
-
-def targeted_recovery_positions(
-    points: Sequence[TrajectoryPoint],
-    source_image_id: str,
-    target_image_id: str,
-) -> np.ndarray:
-    """Return measured source positions for parcels dormant at a later target."""
-    source = {
-        point.trajectory_id: point
-        for point in points
-        if point.image_id == source_image_id and point.available
-    }
-    dormant = {
-        point.trajectory_id
-        for point in points
-        if point.image_id == target_image_id and point.state == "dormant"
-    }
-    selected = [source[identity] for identity in sorted(dormant & source.keys())]
-    if not selected:
-        return np.empty((0, 2), dtype=np.float64)
-    return np.asarray(
-        [[point.x_m, point.y_m] for point in selected], dtype=np.float64
-    )
-
-
-def iter_frozen_primary_augmentation_batches(
-    primary_points_by_image: Iterable[Sequence[TrajectoryPoint]],
-    edges: Sequence[FieldEdge],
-    images: Sequence[ImageRecord],
-    field_config: FieldConfig,
-    *,
-    target_validity_factory: TargetValidityFactory | None = None,
-) -> Iterator[TrajectoryBatch]:
-    """Yield measured point and extension deltas over frozen primary rows.
-
-    A direct reappearance samples only a frozen primary coordinate.  A later
-    primary field can continue only that reappearance-derived coordinate where
-    the frozen primary has no measurement. Recovery fields never consume an
-    augmentation.
-    """
-    ordered_images = tuple(
-        sorted(images, key=lambda image: (image.time_utc, image.image_id))
-    )
-    if not ordered_images:
-        raise ValueError("trajectory augmentation requires catalogue images")
-    image_keys = [image.image_id for image in ordered_images]
-    if len(image_keys) != len(set(image_keys)):
-        raise ValueError("trajectory image identity must be globally unique")
-    image_index = {image_id: index for index, image_id in enumerate(image_keys)}
-
-    primary_by_target: dict[int, list[tuple[int, int, FieldEdge]]] = {}
-    recovery_by_target: dict[int, list[tuple[int, int, FieldEdge]]] = {}
-    primary_last_use: dict[int, int] = {}
-    recovery_last_use: dict[int, int] = {}
-    for edge in edges:
-        source = image_index.get(edge.source_image_id)
-        target = image_index.get(edge.target_image_id)
-        if source is None or target is None or source >= target:
-            raise ValueError("every pair field must point forward between listed images")
-        item = (source, target, edge)
-        if edge.pair_kind == "primary":
-            primary_by_target.setdefault(target, []).append(item)
-            primary_last_use[source] = max(primary_last_use.get(source, target), target)
-        elif edge.pair_kind == "recovery":
-            recovery_by_target.setdefault(target, []).append(item)
-            recovery_last_use[source] = max(
-                recovery_last_use.get(source, target), target
-            )
-        else:
-            raise ValueError(f"unknown pair field kind: {edge.pair_kind}")
-    for incoming in (*primary_by_target.values(), *recovery_by_target.values()):
-        incoming.sort(key=lambda item: (item[0], item[2].field.pair_id))
-
-    frozen_positions: list[dict[str, np.ndarray]] = [
-        {} for _ in ordered_images
-    ]
-    augmented_positions: list[dict[str, np.ndarray]] = [
-        {} for _ in ordered_images
-    ]
-    primary_batches = iter(primary_points_by_image)
-
-    for step, image in enumerate(ordered_images):
-        try:
-            primary_points = tuple(next(primary_batches))
-        except StopIteration as error:
-            raise ValueError(
-                "primary trajectory batches ended before the image chronology"
-            ) from error
-        if any(point.image_id != image.image_id for point in primary_points):
-            raise ValueError("primary trajectory batch does not match image chronology")
-        primary_by_identity = {
-            point.trajectory_id: point for point in primary_points
-        }
-        if len(primary_by_identity) != len(primary_points):
-            raise ValueError("primary trajectory batch contains duplicate identities")
-        if any(
-            point.position_basis in {
-                "recovery_pair_field",
-                "post_reappearance_primary_field",
-            }
-            for point in primary_points
-        ):
-            raise ValueError("trajectory augmentation requires a primary-only catalogue")
-
-        frozen_positions[step] = {
-            identity: np.asarray([point.x_m, point.y_m], dtype=np.float64)
-            for identity, point in primary_by_identity.items()
-            if point.available
-        }
-        measured = {
-            identity for identity, point in primary_by_identity.items()
-            if point.available
-        }
-        updates: dict[str, TrajectoryPoint] = {}
-        extensions: list[TrajectoryExtension] = []
-
-        primary_eligible = sorted({
-            identity
-            for source_step, _target_step, _edge in primary_by_target.get(step, ())
-            for identity in augmented_positions[source_step]
-        } - measured)
-        target_validity = (
-            target_validity_factory(image)
-            if target_validity_factory is not None and primary_eligible else None
-        )
-        primary = _supported_continuations(
-            primary_by_target.get(step, ()),
-            augmented_positions,
-            primary_eligible,
-            field_config,
-            target_validity=target_validity,
-        )
-        for identity, continuation in primary.items():
-            source_xy = augmented_positions[continuation.source_step][identity]
-            xy = source_xy + continuation.displacement_m
-            augmented_positions[step][identity] = xy
-            updates[identity] = _point(
-                identity,
-                image,
-                "observed",
-                "post_reappearance_primary_field",
-                xy,
-                continuation.edge.field.pair_id,
-                continuation.selected_matches,
-                continuation.support_radius_m,
-                continuation.maximum_residual_m,
-            )
-            extensions.append(
-                _augmentation_extension(
-                    identity,
-                    continuation,
-                    ordered_images[continuation.source_step],
-                    image,
-                    source_xy,
-                    xy,
-                    "observed",
-                    "post_reappearance_primary_field",
-                )
-            )
-
-        recovery_eligible = sorted({
-            identity
-            for source_step, _target_step, _edge in recovery_by_target.get(step, ())
-            for identity in frozen_positions[source_step]
-        } - measured - updates.keys())
-        if (
-            target_validity is None
-            and target_validity_factory is not None
-            and recovery_eligible
-        ):
-            target_validity = target_validity_factory(image)
-        recovery = _supported_continuations(
-            recovery_by_target.get(step, ()),
-            frozen_positions,
-            recovery_eligible,
-            field_config,
-            target_validity=target_validity,
-        )
-        for identity, continuation in recovery.items():
-            source_xy = frozen_positions[continuation.source_step][identity]
-            xy = source_xy + continuation.displacement_m
-            augmented_positions[step][identity] = xy
-            updates[identity] = _point(
-                identity,
-                image,
-                "reappeared",
-                "recovery_pair_field",
-                xy,
-                continuation.edge.field.pair_id,
-                continuation.selected_matches,
-                continuation.support_radius_m,
-                continuation.maximum_residual_m,
-            )
-            extensions.append(
-                _augmentation_extension(
-                    identity,
-                    continuation,
-                    ordered_images[continuation.source_step],
-                    image,
-                    source_xy,
-                    xy,
-                    "reappeared",
-                    "recovery_pair_field",
-                )
-            )
-
-        yield TrajectoryBatch(
-            points=tuple(updates[identity] for identity in sorted(updates)),
-            extensions=tuple(
-                sorted(
-                    extensions,
-                    key=lambda extension: (
-                        extension.trajectory_id,
-                        extension.pair_id,
-                    ),
-                )
-            ),
-        )
-
-        for source_step, target_step in tuple(primary_last_use.items()):
-            if target_step == step:
-                augmented_positions[source_step].clear()
-        for source_step, target_step in tuple(recovery_last_use.items()):
-            if target_step == step:
-                frozen_positions[source_step].clear()
-        if step not in primary_last_use:
-            augmented_positions[step].clear()
-        if step not in recovery_last_use:
-            frozen_positions[step].clear()
-
-    try:
-        next(primary_batches)
-    except StopIteration:
-        return
-    raise ValueError("primary trajectory batches exceed the image chronology")
-
-
-def iter_frozen_primary_augmentations(
-    primary_points_by_image: Iterable[Sequence[TrajectoryPoint]],
-    edges: Sequence[FieldEdge],
-    images: Sequence[ImageRecord],
-    field_config: FieldConfig,
-    *,
-    target_validity_factory: TargetValidityFactory | None = None,
-) -> Iterator[tuple[TrajectoryPoint, ...]]:
-    """Compatibility iterator yielding only frozen-primary point updates."""
-    for batch in iter_frozen_primary_augmentation_batches(
-        primary_points_by_image, edges, images, field_config,
-        target_validity_factory=target_validity_factory,
-    ):
-        yield batch.points
-
-
-def _augmentation_extension(
-    identity: str,
-    continuation: _Continuation,
-    source_image: ImageRecord,
-    target_image: ImageRecord,
-    source_xy: np.ndarray,
-    target_xy: np.ndarray,
-    target_state: str,
-    target_position_basis: str,
-) -> TrajectoryExtension:
-    return TrajectoryExtension(
-        trajectory_id=identity,
-        pair_id=continuation.edge.field.pair_id,
-        pair_kind=continuation.edge.pair_kind,
-        source_image_id=source_image.image_id,
-        target_image_id=target_image.image_id,
-        start_time_utc=source_image.time_utc,
-        end_time_utc=target_image.time_utc,
-        x0_m=float(source_xy[0]),
-        y0_m=float(source_xy[1]),
-        x1_m=float(target_xy[0]),
-        y1_m=float(target_xy[1]),
-        target_state=target_state,
-        target_position_basis=target_position_basis,
-        selected_matches=continuation.selected_matches,
-        support_radius_m=continuation.support_radius_m,
-        maximum_residual_m=continuation.maximum_residual_m,
-    )
-
-
-def audit_trajectory_convergence(
-    points: Sequence[TrajectoryPoint], radius_m: float
-) -> tuple[ConvergenceEvent, ...]:
-    """Apply production-style deterministic ranking without merging identities."""
-    if radius_m <= 0:
-        raise ValueError("convergence audit radius must be positive")
-    ordered = sorted(points, key=lambda point: (point.time_utc, point.image_id))
-    observation_count: dict[str, int] = {}
-    events: list[ConvergenceEvent] = []
-    start = 0
-    while start < len(ordered):
-        key = (ordered[start].time_utc, ordered[start].image_id)
-        end = start
-        while end < len(ordered) and (
-            ordered[end].time_utc, ordered[end].image_id
-        ) == key:
-            end += 1
-        frame = ordered[start:end]
-        measured = [point for point in frame if point.available]
-        for point in measured:
-            observation_count[point.trajectory_id] = (
-                observation_count.get(point.trajectory_id, 0) + 1
-            )
-        if len(measured) > 1:
-            coordinates = np.asarray(
-                [[point.x_m, point.y_m] for point in measured], dtype=np.float64
-            )
-            pairs = cKDTree(coordinates).query_pairs(radius_m, output_type="ndarray")
-            for cluster in _index_clusters(len(measured), pairs):
-                ranked = sorted(
-                    cluster,
-                    key=lambda index: _convergence_rank(
-                        measured[index], observation_count
-                    ),
-                )
-                winner = measured[ranked[0]]
-                winner_xy = coordinates[ranked[0]]
-                for index in ranked[1:]:
-                    candidate = measured[index]
-                    events.append(
-                        ConvergenceEvent(
-                            image_id=key[1],
-                            time_utc=key[0],
-                            winner_trajectory_id=winner.trajectory_id,
-                            candidate_trajectory_id=candidate.trajectory_id,
-                            separation_m=float(
-                                np.linalg.norm(coordinates[index] - winner_xy)
-                            ),
-                            audit_radius_m=float(radius_m),
-                            winner_observation_count=observation_count[
-                                winner.trajectory_id
-                            ],
-                            candidate_observation_count=observation_count[
-                                candidate.trajectory_id
-                            ],
-                        )
-                    )
-        start = end
-    return tuple(
-        sorted(
-            events,
-            key=lambda event: (
-                event.time_utc,
-                event.image_id,
-                event.winner_trajectory_id,
-                event.candidate_trajectory_id,
-            ),
-        )
-    )
 
 
 def _merge_duplicates(
@@ -856,32 +398,6 @@ def stable_trajectory_id(seed_image_id: str, xy_m: np.ndarray) -> str:
     return "trj_" + hashlib.sha256(encoded).hexdigest()[:20]
 
 
-def _choose_continuations(
-    incoming: Sequence[tuple[int, int, FieldEdge]],
-    positions: Sequence[dict[str, np.ndarray]],
-    identities: Sequence[str],
-    field_config: FieldConfig,
-    *,
-    target_validity: TargetValidity | None = None,
-) -> dict[str, _Continuation]:
-    primary = _supported_continuations(
-        [item for item in incoming if item[2].pair_kind == "primary"],
-        positions,
-        identities,
-        field_config,
-        target_validity=target_validity,
-    )
-    remaining = [identity for identity in identities if identity not in primary]
-    recovery = _supported_continuations(
-        [item for item in incoming if item[2].pair_kind == "recovery"],
-        positions,
-        remaining,
-        field_config,
-        target_validity=target_validity,
-    )
-    return {**primary, **recovery}
-
-
 def _supported_continuations(
     incoming: Sequence[tuple[int, int, FieldEdge]],
     positions: Sequence[dict[str, np.ndarray]],
@@ -893,10 +409,7 @@ def _supported_continuations(
     chosen: dict[str, _Continuation] = {}
     identity_set = set(identities)
     for source_step, _target_step, edge in incoming:
-        eligible_ids = identity_set.intersection(positions[source_step])
-        if edge.eligible_trajectory_ids is not None:
-            eligible_ids.intersection_update(edge.eligible_trajectory_ids)
-        eligible = sorted(eligible_ids)
+        eligible = sorted(identity_set.intersection(positions[source_step]))
         if not eligible:
             continue
         queries = np.vstack([positions[source_step][identity] for identity in eligible])
@@ -957,7 +470,7 @@ def _outgoing_primary_points(indexed, source_step: int) -> np.ndarray:
     values = [
         edge.field.source_xy_m[edge.field.available]
         for source, _target, edge in indexed
-        if source == source_step and edge.pair_kind == "primary"
+        if source == source_step
     ]
     values = [value for value in values if len(value)]
     return (
@@ -999,8 +512,8 @@ def _point(
         time_utc=image.time_utc,
         state=state,
         position_basis=basis,
-        x_m=None if xy is None else float(xy[0]),
-        y_m=None if xy is None else float(xy[1]),
+        x_m=float(xy[0]),
+        y_m=float(xy[1]),
         source_pair_id=source_pair_id,
         selected_matches=selected,
         support_radius_m=radius,

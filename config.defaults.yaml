@@ -38,6 +38,14 @@ field:
   agreement_distance_m: 1000.0
   maximum_triangle_edge_m: 6400.0
   missing_node_fallback: false  # true requires retain_pair_matches: true
+  # Composition (docs/composition.md): gap filling and shear point estimates.
+  gap_fill_rigid_edge_m: 12800.0
+  gap_fill_rigid_spread_m: 300.0
+  gap_fill_point_neighbour_count: 12
+  gap_fill_point_minimum_agreeing_matches: 8
+  gap_fill_point_neighbour_distance_m: 3000.0
+  gap_fill_point_agreement_distance_m: 500.0
+  shear_point_estimates: true
 
 routing:
   planning_grid_spacing_m: 4000.0
@@ -51,9 +59,6 @@ routing:
   coarse_support_radius_m: 35840.0
   coarse_window_stride: 1  # 3 shares coarse windows (about 1.5x faster pairs)
   residual_edge_recovery: true
-  targeted_recovery: true
-  maximum_recovery_elapsed_hours: 96.0
-  targeted_selection_buffer_m: 6400.0
   candidate_minimum_elapsed_hours: 1.0
   candidate_maximum_elapsed_hours: 96.0
   candidate_minimum_overlap_fraction: 0.05
@@ -84,5 +89,6 @@ surface:
 
 trajectories:
   add_as_coverage_enters: true
-  new_point_exclusion_radius_m: 2000.0
-  convergence_audit_radius_m: null
+  new_point_exclusion_radius_m: 2000.0  # production: 3000.0
+  merge_radius_m: null  # e.g. 250.0 merges duplicate trajectories
+  merge_maximum_younger_age_hours: null  # e.g. 48.0 merges only young duplicates

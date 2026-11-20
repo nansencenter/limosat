@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Literal
 
 import numpy as np
 
@@ -150,25 +149,12 @@ class PairResult:
 @dataclass(frozen=True)
 class FieldEdge:
     field: DisplacementField
-    pair_kind: Literal["primary", "recovery"] = "primary"
-    skipped_images: int = 0
-    eligible_trajectory_ids: frozenset[str] | None = None
     fallback_field: DisplacementField | None = None
     # Raw matches kept for point-local estimates: those near the field's gaps for gap
     # filling, or every match when shear point estimates are on (field.gap_matches).
     gap_matches: MotionMatches | None = None
 
     def __post_init__(self) -> None:
-        if self.pair_kind not in {"primary", "recovery"}:
-            raise ValueError("field pair_kind must be primary or recovery")
-        if self.skipped_images < 0:
-            raise ValueError("skipped_images cannot be negative")
-        if self.pair_kind == "primary" and self.skipped_images:
-            raise ValueError("primary pair fields cannot skip catalogue images")
-        if self.eligible_trajectory_ids is not None:
-            object.__setattr__(
-                self, "eligible_trajectory_ids", frozenset(self.eligible_trajectory_ids)
-            )
         if self.fallback_field is not None:
             fallback = self.fallback_field
             baseline = self.field

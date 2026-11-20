@@ -17,25 +17,15 @@ from .imagery import pass_pixel_validity_factory
 from .surface import seed_filter_factory, surface_gate, surface_validity_factory
 from .models import FieldEdge
 from .pair_products import PAIR_PRODUCT_SCHEMA_VERSION, PairProductStore
-from .planning import run_plan, recovery_candidates
+from .planning import run_plan
 from .qc import QC_PROTOCOL_ID, ExtensionQCConfig, ScoredExtension, score_extensions
-from .recovery import (
-    RecoveryTargetStore,
-    iter_primary_point_batches,
-    load_recovery_target_manifest,
-)
 from .store import file_sha256
-from .trajectory import (
-    TrajectoryPoint,
-    iter_frozen_primary_augmentation_batches,
-    iter_global_trajectory_batches,
-)
+from .trajectory import TrajectoryPoint, iter_global_trajectory_batches
 
 
 COMPOSITION_SCHEMA_VERSION = 1
 TRAJECTORY_POINT_SCHEMA_VERSION = 1
 TRAJECTORY_EXTENSION_SCHEMA_VERSION = 1
-TRAJECTORY_AUGMENTATION_SCHEMA_VERSION = 1
 TARGET_PIXEL_VALIDITY_POLICY = "same_pass_raster_bounds_and_band2_lt2"
 
 
@@ -114,7 +104,6 @@ def compose_primary_parquet(
                 surface_gate(config),
             ),
             seed_filter_factory=seed_filter_factory(surface_gate(config)),
-            gap_rows=False,
         ):
             if batch.points:
                 point_writer.write_table(
@@ -226,265 +215,13 @@ def compose_primary_parquet(
     }
 
 
-def compose_recovery_parquet(
-    config: RunConfig,
-    primary_composition: str | Path,
-    recovery_targets: str | Path,
-    destination: str | Path,
-    *,
-    qc_config: ExtensionQCConfig | None = None,
-) -> dict:
-    """Write frozen-primary recovery deltas without modifying primary artifacts."""
-    pa, pq = _pyarrow()
-    primary_root = Path(primary_composition)
-    targets_root = Path(recovery_targets)
-    output = Path(destination)
-    output.mkdir(parents=True, exist_ok=True)
-    points_path = output / "trajectory-augmentations-v1.parquet"
-    extensions_path = output / "trajectory-augmentation-extensions-qc-v1.parquet"
-    manifest_path = output / "recovery-composition-manifest-v1.json"
-    for path in (points_path, extensions_path, manifest_path):
-        if path.exists():
-            raise FileExistsError(path)
-
-    primary_manifest_path = primary_root / "composition-manifest-v1.json"
-    primary_manifest = json.loads(primary_manifest_path.read_text(encoding="utf-8"))
-    if primary_manifest.get("config_sha256") != config.sha256:
-        raise ValueError("primary composition configuration differs from recovery")
-    if primary_manifest.get("target_pixel_validity") != TARGET_PIXEL_VALIDITY_POLICY:
-        raise ValueError("primary composition lacks target-pixel validity checking")
-    primary_points = primary_root / "trajectory-points-v1.parquet"
-    primary_extensions = primary_root / "trajectory-extensions-qc-v1.parquet"
-    for name, path in (
-        ("trajectory_points", primary_points),
-        ("trajectory_extensions", primary_extensions),
-    ):
-        if file_sha256(path) != primary_manifest["products"][name]["sha256"]:
-            raise ValueError(f"primary {name} failed manifest checksum")
-
-    target_manifest_path = targets_root / "recovery-targets-manifest-v1.json"
-    target_manifest = load_recovery_target_manifest(config, targets_root)
-    if target_manifest.get("primary_composition_manifest_sha256") != file_sha256(
-        primary_manifest_path
-    ):
-        raise ValueError("recovery targets refer to a different primary composition")
-
-    qc = qc_config or ExtensionQCConfig(
-        configured_speed_m_per_day=config.matcher.maximum_speed_m_per_day,
-        hard_speed_m_per_day=max(60_000.0, config.matcher.maximum_speed_m_per_day),
-    )
-    catalogue = load_catalogue(config.catalogue, config.analysis_epsg)
-    plan = run_plan(config, catalogue)
-    primary = tuple(item for item in plan.pairs if item.selection == "primary")
-    eligible = recovery_candidates(
-        plan.pairs, config.routing.maximum_recovery_elapsed_hours
-    )
-    by_pair_id = {item.pair.pair_id: item for item in eligible}
-    if target_manifest.get("eligible_recovery_pairs") != len(eligible):
-        raise ValueError("recovery target plan differs from current eligible pairs")
-    target_pair_ids = [record["pair_id"] for record in target_manifest["pairs"]]
-    if len(target_pair_ids) != len(set(target_pair_ids)):
-        raise ValueError("recovery target manifest contains duplicate pairs")
-    targeted = []
-    for pair_id in target_pair_ids:
-        item = by_pair_id.get(pair_id)
-        if item is None:
-            raise ValueError(f"recovery target is not an eligible candidate: {pair_id}")
-        targeted.append(item)
-
-    products = PairProductStore(config)
-    target_store = RecoveryTargetStore(config, targets_root / "pairs")
-    primary_edges = []
-    recovery_edges = []
-    primary_producers: set[str] = set()
-    primary_schemas: set[int] = set()
-    recovery_producers: set[str] = set()
-    recovery_schemas: set[int] = set()
-    recovery_product_set = hashlib.sha256()
-    target_set = hashlib.sha256()
-    for item, product in zip(primary, _load_primary_products(products, primary)):
-        if product is None:
-            raise RuntimeError(f"primary pair product is missing: {item.pair.pair_id}")
-        primary_producers.add(product.producer_implementation_sha256)
-        primary_schemas.add(product.schema_version)
-        primary_edges.append(field_edge_with_fallback(
-            product.result.field, product.result.matches, config.field
-        ))
-    _check_producers(primary_producers, primary_schemas)
-    target_records = {record["pair_id"]: record for record in target_manifest["pairs"]}
-    for item in targeted:
-        positions = target_store.load(item.pair)
-        if positions is None:
-            raise RuntimeError(f"recovery targets are missing: {item.pair.pair_id}")
-        record = target_records[item.pair.pair_id]
-        _data_path, marker_path = target_store.paths(item.pair.pair_id)
-        if (
-            record.get("target_count") != len(positions)
-            or record.get("marker_sha256") != file_sha256(marker_path)
-        ):
-            raise ValueError(
-                f"recovery target manifest record changed: {item.pair.pair_id}"
-            )
-        target_set.update(item.pair.pair_id.encode("utf-8"))
-        target_set.update(record["marker_sha256"].encode("ascii"))
-        product = products.load(
-            item.pair,
-            "recovery",
-            True,
-            positions,
-            require_current_implementation=False,
-        )
-        if product is None:
-            raise RuntimeError(f"recovery pair product is missing: {item.pair.pair_id}")
-        recovery_producers.add(product.producer_implementation_sha256)
-        recovery_schemas.add(product.schema_version)
-        recovery_product_set.update(item.pair.pair_id.encode("utf-8"))
-        recovery_product_set.update(product.sha256.encode("ascii"))
-        recovery_product_set.update(product.content_sha256.encode("ascii"))
-        recovery_edges.append(
-            field_edge_with_fallback(
-                product.result.field,
-                product.result.matches,
-                config.field,
-                pair_kind="recovery",
-                skipped_images=item.skipped_images,
-                eligible_trajectory_ids=target_store.trajectory_ids(item.pair),
-            )
-        )
-    if target_set.hexdigest() != target_manifest.get("pair_target_set_sha256"):
-        raise ValueError("recovery target set failed manifest checksum")
-    _check_producers(recovery_producers, recovery_schemas, "recovery")
-
-    point_schema = _point_schema(pa, config, "trajectory_augmentations_v1")
-    extension_schema = _extension_schema(
-        pa, config, qc, "trajectory_augmentation_extensions_qc_v1"
-    )
-    point_temporary = _temporary(points_path)
-    extension_temporary = _temporary(extensions_path)
-    point_writer = pq.ParquetWriter(point_temporary, point_schema, compression="zstd")
-    extension_writer = pq.ParquetWriter(
-        extension_temporary, extension_schema, compression="zstd"
-    )
-    point_count = 0
-    extension_count = 0
-    point_states: Counter[str] = Counter()
-    point_bases: Counter[str] = Counter()
-    extension_kinds: Counter[str] = Counter()
-    qc_statuses: Counter[str] = Counter()
-    try:
-        batches = iter_primary_point_batches(
-            primary_points, catalogue.chronological()
-        )
-        for batch in iter_frozen_primary_augmentation_batches(
-            batches,
-            (*primary_edges, *recovery_edges),
-            catalogue.chronological(),
-            config.field,
-            target_validity_factory=surface_validity_factory(
-                pass_pixel_validity_factory(
-                    catalogue.chronological(), config.analysis_epsg,
-                    config.matcher.scene_mask_invalid_from,
-                ),
-                surface_gate(config),
-            ),
-        ):
-            if batch.points:
-                point_writer.write_table(
-                    pa.Table.from_pylist(
-                        [_point_row(point) for point in batch.points],
-                        schema=point_schema,
-                    )
-                )
-                point_count += len(batch.points)
-                point_states.update(point.state for point in batch.points)
-                point_bases.update(point.position_basis for point in batch.points)
-            scored = score_extensions(batch.extensions, qc)
-            if scored:
-                extension_writer.write_table(
-                    pa.Table.from_pylist(
-                        [_extension_row(value) for value in scored],
-                        schema=extension_schema,
-                    )
-                )
-                extension_count += len(scored)
-                extension_kinds.update(value.extension.pair_kind for value in scored)
-                qc_statuses.update(value.qc_status for value in scored)
-        point_writer.close()
-        point_writer = None
-        extension_writer.close()
-        extension_writer = None
-        os.replace(point_temporary, points_path)
-        os.replace(extension_temporary, extensions_path)
-    finally:
-        if point_writer is not None:
-            point_writer.close()
-        if extension_writer is not None:
-            extension_writer.close()
-        point_temporary.unlink(missing_ok=True)
-        extension_temporary.unlink(missing_ok=True)
-
-    manifest = {
-        "composition_schema_version": COMPOSITION_SCHEMA_VERSION,
-        "trajectory_augmentation_schema_version": (
-            TRAJECTORY_AUGMENTATION_SCHEMA_VERSION
-        ),
-        "trajectory_extension_schema_version": TRAJECTORY_EXTENSION_SCHEMA_VERSION,
-        "qc_protocol_id": QC_PROTOCOL_ID,
-        "target_pixel_validity": TARGET_PIXEL_VALIDITY_POLICY,
-        "run_id": config.run_id,
-        "config_sha256": config.sha256,
-        "semantics": "frozen primary rows plus recovery and post-reappearance deltas",
-        "primary_composition_manifest": str(primary_manifest_path),
-        "primary_composition_manifest_sha256": file_sha256(primary_manifest_path),
-        "recovery_target_manifest": str(target_manifest_path),
-        "recovery_target_manifest_sha256": file_sha256(target_manifest_path),
-        "primary_producer_implementation_sha256": (
-            next(iter(primary_producers)) if len(primary_producers) == 1 else None
-        ),
-        "primary_producer_implementation_sha256s": sorted(primary_producers),
-        "recovery_producer_implementation_sha256": (
-            next(iter(recovery_producers)) if len(recovery_producers) == 1 else None
-        ),
-        "recovery_producer_implementation_sha256s": sorted(recovery_producers),
-        "targeted_recovery_pair_products": len(targeted),
-        "recovery_pair_product_set_sha256": recovery_product_set.hexdigest(),
-        "qc": asdict(qc),
-        "counts": {
-            "trajectory_augmentations": point_count,
-            "trajectory_augmentation_states": dict(sorted(point_states.items())),
-            "trajectory_augmentation_position_bases": dict(sorted(point_bases.items())),
-            "trajectory_augmentation_extensions": extension_count,
-            "trajectory_augmentation_extension_kinds": dict(
-                sorted(extension_kinds.items())
-            ),
-            "extension_qc_status": dict(sorted(qc_statuses.items())),
-        },
-        "products": {
-            "trajectory_augmentations": _file_record(points_path),
-            "trajectory_augmentation_extensions": _file_record(extensions_path),
-        },
-    }
-    temporary_manifest = _temporary(manifest_path)
-    temporary_manifest.write_text(
-        json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary_manifest, manifest_path)
-    return {
-        "manifest": str(manifest_path),
-        "trajectory_augmentations": str(points_path),
-        "trajectory_augmentation_extensions": str(extensions_path),
-        "counts": manifest["counts"],
-    }
-
-
-def _check_producers(producer_hashes: set[str], schemas: set[int], kind: str = "primary") -> None:
+def _check_producers(producer_hashes: set[str], schemas: set[int]) -> None:
     """Products from several code versions may be composed together only when their
     shared matching fingerprint vouches for them (schema 3); legacy products must all
     come from one implementation."""
     if len(producer_hashes) > 1 and schemas != {PAIR_PRODUCT_SCHEMA_VERSION}:
         raise ValueError(
-            f"{kind} pair products have multiple producer implementations: "
+            "primary pair products have multiple producer implementations: "
             f"{sorted(producer_hashes)}"
         )
 
@@ -497,9 +234,7 @@ def _load_primary_products(products: PairProductStore, primary, workers: int = 8
     """
 
     def load(item):
-        return products.load(
-            item.pair, "primary", False, require_current_implementation=False
-        )
+        return products.load(item.pair, require_current_implementation=False)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         pending = deque()
@@ -532,7 +267,7 @@ def _extension_row(value: ScoredExtension) -> dict:
     return {
         "trajectory_id": extension.trajectory_id,
         "pair_id": extension.pair_id,
-        "pair_kind": extension.pair_kind,
+        "pair_kind": "primary",
         "source_image_id": extension.source_image_id,
         "target_image_id": extension.target_image_id,
         "start_time_utc": extension.start_time_utc,
@@ -662,136 +397,6 @@ def _metadata(
         **extra,
     }
     return {key.encode(): value.encode() for key, value in values.items()}
-
-
-def merge_recovery_base(
-    config: RunConfig,
-    base_composition: str | Path,
-    recovery_composition: str | Path,
-    destination: str | Path,
-    *,
-    pass_index: int,
-) -> dict:
-    """Freeze a composed base plus one recovery composition as the next pass's base.
-
-    Augmentation rows replace base rows with the same (trajectory, image). They
-    become measured base rows: state ``reappeared`` is relabelled ``observed``
-    and the position basis gains a ``pass<N>_`` prefix, so the next recovery
-    pass may continue them but never mistakes them for its own deltas. Rows are
-    written one row group per image, and the manifest keeps the lineage. The
-    base extensions are carried over unchanged (hard link when possible).
-    """
-    pa, pq = _pyarrow()
-    import pyarrow.compute as pc
-    import numpy as np
-
-    if pass_index < 1:
-        raise ValueError("pass_index counts merged recovery passes from 1")
-    base = Path(base_composition)
-    recovery = Path(recovery_composition)
-    output = Path(destination)
-    base_manifest_path = base / "composition-manifest-v1.json"
-    base_manifest = json.loads(base_manifest_path.read_text(encoding="utf-8"))
-    recovery_manifest_path = recovery / "recovery-composition-manifest-v1.json"
-    recovery_manifest = json.loads(recovery_manifest_path.read_text(encoding="utf-8"))
-    if base_manifest.get("config_sha256") != config.sha256:
-        raise ValueError("base composition configuration differs")
-    if recovery_manifest.get("config_sha256") != config.sha256:
-        raise ValueError("recovery composition configuration differs")
-    if recovery_manifest.get("primary_composition_manifest_sha256") != file_sha256(
-        base_manifest_path
-    ):
-        raise ValueError("recovery composition was not composed on this base")
-    points_path = output / "trajectory-points-v1.parquet"
-    extensions_path = output / "trajectory-extensions-qc-v1.parquet"
-    manifest_path = output / "composition-manifest-v1.json"
-    for path in (points_path, extensions_path, manifest_path):
-        if path.exists():
-            raise FileExistsError(path)
-    output.mkdir(parents=True, exist_ok=True)
-
-    base_points = pq.read_table(base / "trajectory-points-v1.parquet")
-    # Large runs exceed 2 GiB of string data, so concatenate with 64-bit offsets.
-    schema = pa.schema(
-        [field.with_type(pa.large_string()) if field.type == pa.string() else field
-         for field in base_points.schema],
-        metadata=base_points.schema.metadata,
-    )
-    base_points = base_points.cast(schema)
-    augmentation = pq.read_table(
-        recovery / "trajectory-augmentations-v1.parquet"
-    ).select(schema.names).cast(schema.remove_metadata())
-    key = lambda table: pc.binary_join_element_wise(  # noqa: E731
-        table["trajectory_id"], table["image_id"], pa.scalar("|", pa.large_string())
-    )
-    base_points = base_points.filter(
-        pc.invert(pc.is_in(key(base_points), value_set=key(augmentation)))
-    )
-    augmentation = augmentation.set_column(
-        augmentation.schema.get_field_index("state"), "state",
-        pc.if_else(pc.equal(augmentation["state"], "reappeared"),
-                   pa.scalar("observed", pa.large_string()), augmentation["state"]),
-    )
-    augmentation = augmentation.set_column(
-        augmentation.schema.get_field_index("position_basis"), "position_basis",
-        pc.binary_join_element_wise(
-            pa.scalar(f"pass{pass_index}", pa.large_string()),
-            augmentation["position_basis"],
-            pa.scalar("_", pa.large_string()),
-        ),
-    )
-    merged = pa.concat_tables([base_points, augmentation.cast(base_points.schema)])
-    del base_points, augmentation
-    order = pc.sort_indices(
-        merged, [("image_id", "ascending"), ("trajectory_id", "ascending")]
-    ).to_numpy()
-    codes = pc.dictionary_encode(merged["image_id"]).combine_chunks().indices.to_numpy()[order]
-    cuts = np.r_[0, np.flatnonzero(np.diff(codes)) + 1, len(codes)]
-    merged = merged.take(order)
-    temporary = _temporary(points_path)
-    with pq.ParquetWriter(temporary, merged.schema, compression="zstd") as writer:
-        for start, stop in zip(cuts[:-1], cuts[1:]):
-            writer.write_table(merged.slice(start, stop - start), row_group_size=stop - start)
-    os.replace(temporary, points_path)
-    point_states = Counter(merged["state"].to_pylist())
-    row_count = merged.num_rows
-    del merged
-    source_extensions = base / "trajectory-extensions-qc-v1.parquet"
-    try:
-        os.link(source_extensions.resolve(), extensions_path)
-    except OSError:
-        import shutil
-
-        shutil.copyfile(source_extensions, extensions_path)
-    manifest = {
-        **{key_: value for key_, value in base_manifest.items()
-           if key_ not in ("products", "counts", "continuation_lineage")},
-        "counts": {
-            "trajectory_points": row_count,
-            "trajectory_point_states": dict(sorted(point_states.items())),
-        },
-        "continuation_lineage": [
-            *base_manifest.get("continuation_lineage", []),
-            {
-                "pass_index": pass_index,
-                "base_manifest_sha256": file_sha256(base_manifest_path),
-                "recovery_manifest": str(recovery_manifest_path),
-                "recovery_manifest_sha256": file_sha256(recovery_manifest_path),
-            },
-        ],
-        "products": {
-            "trajectory_points": _file_record(points_path),
-            "trajectory_extensions": _file_record(extensions_path),
-        },
-    }
-    temporary_manifest = _temporary(manifest_path)
-    temporary_manifest.write_text(
-        json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary_manifest, manifest_path)
-    return {"manifest": str(manifest_path), "trajectory_points": row_count,
-            "pass_index": pass_index}
 
 
 def _temporary(path: Path) -> Path:

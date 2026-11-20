@@ -7,11 +7,11 @@ from .config import (
     OpenWaterConfig,
     RoutingConfig,
     RunConfig,
+    SurfaceConfig,
     TrajectoryConfig,
     load_config,
 )
 from .models import DisplacementField, FieldEdge, MotionMatches, PairResult
-from .deformation import DeformationCell, deformation_from_field
 from .efficientloftr import EfficientLoFTR
 from .pairs import PairProcessor
 from .pair_products import PairProduct, PairProductStore
@@ -22,23 +22,13 @@ from .planning import (
     plan_candidate_pairs,
     select_overlap_probe,
 )
-from .replay import load_production_field_replay
-from .trajectory import (
-    ConvergenceEvent,
-    TrajectoryPoint,
-    audit_trajectory_convergence,
-    build_trajectories,
-    compose_global_trajectories,
-    iter_frozen_primary_augmentations,
-    iter_global_trajectory_points,
-)
-from .run import LiMOSATRun
+from .trajectory import TrajectoryPoint, iter_global_trajectory_batches
 from .stages import RunStages
 from .store import RunStore
 
 __all__ = [
+    "CandidatePlan",
     "DisplacementField",
-    "DeformationCell",
     "EfficientLoFTR",
     "FieldConfig",
     "FieldEdge",
@@ -46,32 +36,24 @@ __all__ = [
     "ImagePair",
     "ImageRecord",
     "MatcherConfig",
-    "OpenWaterConfig",
-    "LiMOSATRun",
     "MotionMatches",
-    "PairResult",
+    "OpenWaterConfig",
     "PairProcessor",
     "PairProduct",
     "PairProductStore",
-    "CandidatePlan",
-    "ConvergenceEvent",
+    "PairResult",
     "PlannedPair",
     "RoutingConfig",
     "RunConfig",
     "RunStages",
     "RunStore",
+    "SurfaceConfig",
     "TrajectoryConfig",
     "TrajectoryPoint",
-    "build_trajectories",
     "build_candidate_plan",
-    "audit_trajectory_convergence",
-    "compose_global_trajectories",
-    "iter_frozen_primary_augmentations",
-    "iter_global_trajectory_points",
-    "deformation_from_field",
+    "iter_global_trajectory_batches",
     "load_catalogue",
     "load_config",
-    "load_production_field_replay",
     "plan_candidate_pairs",
     "select_overlap_probe",
 ]

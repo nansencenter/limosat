@@ -48,11 +48,14 @@ MATCHING_SETTINGS = {
         "phase_correlation_minimum_response", "residual_edge_recovery",
         "coarse_matching", "coarse_pixel_size_m", "coarse_minimum_matches",
         "coarse_support_radius_m", "coarse_window_stride",
-        "targeted_selection_buffer_m",
     ),
     "open_water": ("enabled", "threshold_percent", "maximum_age_days", "samples_per_axis"),
     "surface": ("land_minimum_inland_km",),
 }
+
+# A former setting of targeted (continuation) matching. Primary products never depended
+# on it, but it is part of the identity of every stored product, so it keeps its value.
+FORMER_MATCHING_SETTINGS = {"targeted_selection_buffer_m": 6_400.0}
 
 # Settings that do not change a pair product: paths (their contents are fingerprinted
 # separately), performance knobs, pair selection and composition.
@@ -73,14 +76,10 @@ EXCLUDED_SETTINGS = {
         "shear_point_estimates",
     ),
     "routing": (
-        "planning_grid_spacing_m", "targeted_recovery",
-        "maximum_recovery_elapsed_hours", "candidate_minimum_elapsed_hours",
+        "planning_grid_spacing_m", "candidate_minimum_elapsed_hours",
         "candidate_maximum_elapsed_hours", "candidate_minimum_overlap_fraction",
         "candidate_minimum_overlap_area_m2", "exclude_same_acquisition_pass",
-        "require_orbit_metadata",
-        "candidate_pair_ids", "recovery_target_policy",
-        "recovery_minimum_target_valid_fraction", "recovery_target_valid_window_m",
-        "next_observation_minimum_cells",
+        "require_orbit_metadata", "candidate_pair_ids", "next_observation_minimum_cells",
         "next_observation_backup_after_hours", "plan_surface_cells",
     ),
     "open_water": ("sic_root",),
@@ -97,6 +96,7 @@ def matching_settings(config) -> dict:
     settings = {"analysis_epsg": values["analysis_epsg"]}
     for section, names in MATCHING_SETTINGS.items():
         settings[section] = {name: values[section][name] for name in names}
+    settings["routing"].update(FORMER_MATCHING_SETTINGS)
     if not config.surface.land_raster:
         # Without a land raster the inland distance threshold has no effect.
         settings["surface"] = {}

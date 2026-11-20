@@ -8,7 +8,6 @@ import pytest
 from limosat import ImageCatalogue, ImageRecord, RoutingConfig, plan_candidate_pairs
 from limosat.planning import (
     build_candidate_plan,
-    recovery_candidates,
     select_overlap_probe,
 )
 
@@ -87,40 +86,6 @@ def test_missing_footprints_do_not_restore_component_boundaries():
 
     assert [item.pair.pair_id for item in planned] == ["a__b"]
     assert planned[0].overlap_fraction is None
-
-
-def test_recovery_candidates_include_all_elapsed_eligible_pairs_recent_first():
-    catalogue = ImageCatalogue(
-        [_image(name, day, name) for day, name in enumerate(("a", "b", "c", "d"))]
-    )
-    planned = plan_candidate_pairs(catalogue, RoutingConfig())
-
-    recovery = recovery_candidates(planned)
-
-    assert [item.pair.pair_id for item in recovery] == [
-        "a__c",
-        "b__d",
-        "a__d",
-    ]
-
-
-def test_recovery_uses_elapsed_time_not_intervening_image_count():
-    catalogue = ImageCatalogue(
-        [_image(name, day, name) for day, name in enumerate(("a", "b", "c", "d"))]
-    )
-    planned = plan_candidate_pairs(catalogue, RoutingConfig())
-
-    long_candidate = next(
-        item for item in planned if item.pair.pair_id == "a__d"
-    )
-
-    assert long_candidate.skipped_images == 2
-    assert recovery_candidates(
-        (long_candidate,), maximum_elapsed_hours=72.0
-    ) == (long_candidate,)
-    assert recovery_candidates(
-        (long_candidate,), maximum_elapsed_hours=71.9
-    ) == ()
 
 
 def test_candidate_plan_requires_fractional_and_absolute_overlap():

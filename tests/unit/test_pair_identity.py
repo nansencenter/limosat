@@ -35,7 +35,7 @@ MATCHING_MODULES = (
     "efficientloftr.py", "field.py", "imagery.py", "models.py", "pairs.py",
     "routing.py", "surface.py", "tile_gates.py",
 )
-MATCHING_MODULES_SHA256 = "026e06e135459eb7c879ad37761468ab6801a53a61b6a20fb49207fdfa925824"
+MATCHING_MODULES_SHA256 = "4dbce451b5fcc268f2b3090e6b2f09b81aa5e51bdfa14d9a166ce1ae5ecaa968"
 
 
 def test_every_configuration_setting_is_classified_for_pair_identity():
@@ -90,10 +90,10 @@ def test_runs_with_one_matching_fingerprint_share_primary_pairs(tmp_path):
         trajectories=TrajectoryConfig(new_point_exclusion_radius_m=3_000.0),
     )
     pair = catalogue(tmp_path).adjacent_pairs("component")[0]
-    saved = PairProductStore(first).save(pair, "primary", False, result(pair))
+    saved = PairProductStore(first).save(pair, result(pair))
     assert saved.path.parent == store / matching_sha256(first) / "primary"
 
-    loaded = PairProductStore(second).load(pair, "primary", False)
+    loaded = PairProductStore(second).load(pair)
     assert loaded is not None and loaded.sha256 == saved.sha256
     metadata = json.loads(saved.path.with_suffix(".json").read_text())
     assert metadata["producer_run_id"] == first.run_id
@@ -101,20 +101,18 @@ def test_runs_with_one_matching_fingerprint_share_primary_pairs(tmp_path):
 
     # Other matching settings use another part of the store: nothing to reuse.
     other = replace(second, field=replace(second.field, agreement_distance_m=50.0))
-    assert PairProductStore(other).load(pair, "primary", False) is None
-    # Recovery products stay with their run.
-    assert PairProductStore(second).kind_root("recovery") == second.pair_products / "recovery"
+    assert PairProductStore(other).load(pair) is None
 
 
 def test_shared_pairs_are_refused_when_a_scene_file_differs(tmp_path):
     store = tmp_path / "store"
     cfg = replace(config(tmp_path), pair_store_directory=str(store))
     pair = catalogue(tmp_path).adjacent_pairs("component")[0]
-    PairProductStore(cfg).save(pair, "primary", False, result(pair))
+    PairProductStore(cfg).save(pair, result(pair))
     with pair.target.path.open("ab") as stream:
         stream.write(b"another version of this scene")
     with pytest.raises(ValueError, match="scene_sha256"):
-        PairProductStore(cfg).load(pair, "primary", False)
+        PairProductStore(cfg).load(pair)
 
 
 def test_scene_checksum_file_is_written_once_and_refuses_changed_scenes(tmp_path):
@@ -150,6 +148,3 @@ def test_compose_mixes_producer_versions_only_under_a_shared_fingerprint():
     _check_producers({"a" * 64}, {2})
     with pytest.raises(ValueError, match="multiple producer implementations"):
         _check_producers({"a" * 64, "b" * 64}, {2, 3})
-    _check_producers({"a" * 64, "b" * 64}, {3}, "recovery")
-    with pytest.raises(ValueError, match="recovery pair products have multiple"):
-        _check_producers({"a" * 64, "b" * 64}, {2}, "recovery")

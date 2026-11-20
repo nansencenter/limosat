@@ -70,7 +70,7 @@ def test_shear_point_estimates_keep_every_match_without_tiles():
 
 def test_shear_point_estimates_configuration():
     base = RunConfig("run", "catalogue", "database", "output", field=FieldConfig(**GAP_FILL))
-    assert "shear_point_estimates" not in base.to_dict()["field"]
+    assert base.field.shear_point_estimates is False
     shear = replace(base, field=FieldConfig(**SHEAR))
     assert shear.sha256 != base.sha256
     assert shear.to_dict()["field"]["shear_point_estimates"] is True

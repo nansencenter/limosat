@@ -1,46 +1,20 @@
-"""Platform-neutral execution stages for pair workers and CPU composition."""
+"""Platform-neutral execution stages: prepare, primary pairs and composition."""
 
 from __future__ import annotations
 
-import sys
-import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, replace
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Sequence
-
-import numpy as np
 
 from .catalog import ImageCatalogue, load_catalogue
+from .compose import compose_primary_parquet
 from .config import RunConfig
-from .deformation import deformation_from_field
 from .efficientloftr import EfficientLoFTR
-from .field import field_edge_with_fallback
-from .imagery import pass_pixel_validity_factory
-from .surface import seed_filter_factory, surface_gate, surface_validity_factory
-from .manifest import write_manifest
-from .models import FieldEdge
 from .pair_identity import write_scene_checksums
-from .pair_products import PAIR_PRODUCT_SCHEMA_VERSION, PairProductStore
-from .pair_queue import loss_targeted_pairs
+from .pair_products import PairProductStore
 from .pairs import PairProcessor
-from .planning import PlannedPair, run_plan, recovery_candidates
-from .recovery import RecoveryTargetStore, load_recovery_target_manifest
+from .planning import PlannedPair, run_plan
 from .store import RunStore
-from .trajectory import (
-    TrajectoryPoint,
-    audit_trajectory_convergence,
-    iter_frozen_primary_augmentations,
-    iter_global_trajectory_points,
-)
-
-
-@dataclass(frozen=True)
-class PairWork:
-    planned: PlannedPair
-    targeted_positions_xy_m: np.ndarray | None = None
 
 
 class RunStages:
@@ -102,466 +76,61 @@ class RunStages:
             "planning_counts": dict(plan.exclusion_counts),
         }
 
-    def process_pairs(
-        self,
-        kind: str,
-        *,
-        batch_index: int = 0,
-        batch_count: int = 1,
-        recovery_target_directory: str | None = None,
-    ) -> dict:
-        """Measure one deterministic batch and publish immutable pair products."""
+    def process_pairs(self, *, batch_index: int = 0, batch_count: int = 1) -> dict:
+        """Measure one deterministic batch of primary pairs and publish immutable products."""
         _validate_batch(batch_index, batch_count)
-        if recovery_target_directory is not None:
-            if kind != "recovery":
-                raise ValueError("recovery targets apply only to recovery pairs")
-            store = None
-            plan = run_plan(self.config, self.catalogue)
-            candidates = recovery_candidates(
-                plan.pairs,
-                self.config.routing.maximum_recovery_elapsed_hours,
-            )
-            target_manifest = load_recovery_target_manifest(
-                self.config, recovery_target_directory
-            )
-            if target_manifest["eligible_recovery_pairs"] != len(candidates):
-                raise ValueError(
-                    "recovery target plan differs from current eligible pairs"
-                )
-            target_pair_ids = {
-                record["pair_id"] for record in target_manifest["pairs"]
-            }
-            eligible_pair_ids = {item.pair.pair_id for item in candidates}
-            if not target_pair_ids <= eligible_pair_ids:
-                raise ValueError(
-                    "recovery target manifest contains an ineligible pair"
-                )
-            targets = RecoveryTargetStore(
-                self.config, Path(recovery_target_directory) / "pairs"
-            )
-            assigned = (
-                item
-                for index, item in enumerate(candidates)
-                if index % batch_count == batch_index
-            )
+        store = RunStore(self.config, read_only=True)
+        primary = self._primary_pairs(store)
+        assigned = [
+            item for index, item in enumerate(primary) if index % batch_count == batch_index
+        ]
 
-            def selected_work():
-                for item in assigned:
-                    if item.pair.pair_id not in target_pair_ids:
-                        continue
-                    positions = targets.load(item.pair)
-                    if positions is None:
-                        raise RuntimeError(
-                            f"recovery targets are missing: {item.pair.pair_id}"
-                        )
-                    yield PairWork(item, positions)
-
-            selected = selected_work()
-        else:
-            store = RunStore(self.config, read_only=True)
-            candidates = self._pair_candidates(store, kind)
-            selected = self._work(
-                store,
-                kind,
-                candidates=candidates,
-                batch_index=batch_index,
-                batch_count=batch_count,
-            )
-
-        def obtain(item: PairWork) -> str:
-            pair = item.planned.pair
-            if store is not None and store.load_field(pair.pair_id) is not None:
-                return "sqlite"
-            completed = self.pair_products.load(
-                pair,
-                kind,
-                kind == "recovery",
-                item.targeted_positions_xy_m,
-            )
-            if completed is not None:
+        def obtain(item: PlannedPair) -> str:
+            pair = item.pair
+            if self.pair_products.load(pair) is not None:
                 return "pair_product"
-            result = self.processor.process(
-                pair,
-                None,
-                None,
-                item.targeted_positions_xy_m,
-            )
-            self.pair_products.save(
-                pair,
-                kind,
-                kind == "recovery",
-                result,
-                item.targeted_positions_xy_m,
-            )
+            self.pair_products.save(pair, self.processor.process(pair))
             return "computed"
 
-        outcomes = _bounded_map(obtain, selected, self.config.pair_workers)
+        outcomes = _bounded_map(obtain, assigned, self.config.pair_workers)
         return {
-            "kind": kind,
             "batch_index": batch_index,
             "batch_count": batch_count,
-            "planned_pairs": len(candidates),
+            "planned_pairs": len(primary),
             "assigned_pairs": len(outcomes),
             "computed_pairs": outcomes.count("computed"),
             "resumed_pair_products": outcomes.count("pair_product"),
-            "resumed_sqlite_pairs": outcomes.count("sqlite"),
         }
 
-    def _import_pair_products(
-        self,
-        store: RunStore,
-        kind: str,
-    ) -> tuple[dict, tuple[PlannedPair, ...]]:
-        """Import verified worker outputs through the single SQLite writer."""
-        imported = 0
-        resumed = 0
-        planned = []
-        missing = []
-        for item in self._work(store, kind):
-            planned.append(item.planned)
-            pair = item.planned.pair
-            field = store.load_field(pair.pair_id)
-            if field is None:
-                product = self.pair_products.load(
-                    pair,
-                    kind,
-                    kind == "recovery",
-                    item.targeted_positions_xy_m,
-                )
-                if product is None:
-                    missing.append(pair.pair_id)
-                    continue
-                if not store.claim_pair(
-                    pair,
-                    item.planned.planning_component_id,
-                    kind,
-                    kind == "recovery",
-                ):
-                    raise RuntimeError(
-                        f"pair completed while the coordinator was importing: {pair.pair_id}"
-                    )
-                result = replace(
-                    product.result,
-                    diagnostics={
-                        **product.result.diagnostics,
-                        "pair_product_schema_version": PAIR_PRODUCT_SCHEMA_VERSION,
-                        "pair_product_sha256": product.sha256,
-                        "pair_product_content_sha256": product.content_sha256,
-                    },
-                )
-                store.save_pair(
-                    pair,
-                    result,
-                    match_count=product.match_count,
-                )
-                field = result.field
-                imported += 1
-            else:
-                resumed += 1
-            if kind == "primary":
-                store.replace_deformation(
-                    pair.pair_id,
-                    deformation_from_field(
-                        field, self.config.field.maximum_triangle_edge_m
-                    ),
-                )
-        if missing:
-            sample = ", ".join(missing[:5])
-            raise RuntimeError(
-                f"{len(missing)} {kind} pair products are incomplete; first: {sample}"
-            )
-        return (
-            {
-                "kind": kind,
-                "expected_pair_fields": len(planned),
-                "imported_pair_products": imported,
-                "resumed_pair_fields": resumed,
-            },
-            tuple(planned),
+    def compose(self, destination: str | Path | None = None) -> dict:
+        """Compose primary trajectories from the pair products into Parquet."""
+        return compose_primary_parquet(
+            self.config,
+            destination or Path(self.config.output_directory) / "primary-composition",
         )
 
-    def compose(
-        self,
-        phase: str,
-        command: Sequence[str] | None = None,
-    ) -> dict:
-        """Stream primary or final global trajectory rows into SQLite."""
-        if phase not in {"primary", "final"}:
-            raise ValueError("composition phase must be primary or final")
-        store = RunStore(self.config)
-        planned = store.planned_pairs(self.catalogue)
-        primary = tuple(item for item in planned if item.selection == "primary")
-        pair_import = {
-            "kind": "recovery" if phase == "final" else "primary",
-            "expected_pair_fields": 0,
-            "imported_pair_products": 0,
-            "resumed_pair_fields": 0,
-        }
-        if phase == "primary":
-            pair_import, _ = self._import_pair_products(store, "primary")
-        self._require_complete(store, "primary", primary)
-        recovery = ()
-        if phase == "final" and self.config.routing.targeted_recovery:
-            pair_import, recovery = self._import_pair_products(
-                store, "recovery"
-            )
-            self._require_complete(
-                store,
-                "recovery",
-                recovery,
-            )
-
-        primary_edges = [
-            self._required_edge(store, item.pair.pair_id) for item in primary
-        ]
-        recovery_edges = []
-        if recovery:
-            recovery_edges.extend(
-                self._required_edge(
-                    store,
-                    item.pair.pair_id,
-                    pair_kind="recovery",
-                    skipped_images=item.skipped_images,
-                )
-                for item in recovery
-            )
-
-        clock = time.perf_counter()
-        retained_points: list[TrajectoryPoint] | None = None
-        restored_augmentations = 0
-        augmentation_counts = {
-            "reappearance": 0,
-            "post_reappearance_primary": 0,
-        }
-        images = self.catalogue.chronological()
-        if phase == "primary":
-            retained_points = (
-                []
-                if self.config.trajectories.convergence_audit_radius_m is not None
-                else None
-            )
-
-            def primary_batches():
-                for batch in iter_global_trajectory_points(
-                    primary_edges,
-                    images,
-                    self.config.field,
-                    self.config.trajectories,
-                    target_validity_factory=surface_validity_factory(
-                        pass_pixel_validity_factory(
-                            images, self.config.analysis_epsg,
-                            self.config.matcher.scene_mask_invalid_from,
-                        ),
-                        surface_gate(self.config),
-                    ),
-                    seed_filter_factory=seed_filter_factory(surface_gate(self.config)),
-                ):
-                    if retained_points is not None:
-                        retained_points.extend(batch)
-                    yield batch
-
-            store.replace_global_trajectory_batches(primary_batches())
-        else:
-            restored_augmentations = store.restore_primary_trajectories()
-            augmentation_counts = store.replace_trajectory_augmentation_batches(
-                iter_frozen_primary_augmentations(
-                    store.iter_global_trajectory_point_batches(images),
-                    (*primary_edges, *recovery_edges),
-                    images,
-                    self.config.field,
-                    target_validity_factory=surface_validity_factory(
-                        pass_pixel_validity_factory(
-                            images, self.config.analysis_epsg,
-                            self.config.matcher.scene_mask_invalid_from,
-                        ),
-                        surface_gate(self.config),
-                    ),
-                )
-            )
-            if self.config.trajectories.convergence_audit_radius_m is not None:
-                retained_points = [
-                    point
-                    for batch in store.iter_global_trajectory_point_batches(images)
-                    for point in batch
-                ]
-        events = (
-            audit_trajectory_convergence(
-                retained_points,
-                self.config.trajectories.convergence_audit_radius_m,
-            )
-            if retained_points is not None
-            else ()
-        )
-        store.replace_convergence_events(events)
-        trajectory_counts = store.trajectory_counts()
-        result = {
-            "phase": phase,
-            "primary_pairs": len(primary),
-            "recovery_pairs": len(recovery),
-            "trajectories": trajectory_counts["trajectories"],
-            "trajectory_points": trajectory_counts["trajectory_points"],
-            "trajectory_states": trajectory_counts["trajectory_states"],
-            "trajectory_augmentations": trajectory_counts[
-                "trajectory_augmentations"
-            ],
-            "restored_augmentations": restored_augmentations,
-            "applied_augmentations": augmentation_counts,
-            "convergence_events": len(events),
-            "composition_seconds": time.perf_counter() - clock,
-            "pair_product_import": pair_import,
-        }
-        if phase == "final":
-            completed_utc = datetime.now(timezone.utc)
-            run = store.run_record()
-            started_utc = datetime.fromisoformat(run["started_utc"])
-            runtime_seconds = (completed_utc - started_utc).total_seconds()
-            path, checksum = write_manifest(
-                self.config,
-                self.catalogue,
-                store,
-                started_utc,
-                completed_utc,
-                runtime_seconds,
-                tuple(command or sys.argv),
-            )
-            store.finish_run(runtime_seconds, path, checksum)
-            result.update(
-                manifest=str(path),
-                manifest_sha256=checksum,
-                runtime_seconds=runtime_seconds,
-            )
-        return result
-
-    def run_all(self, command: Sequence[str] | None = None) -> dict:
+    def run_all(self) -> dict:
         """Run the same stages sequentially on a single machine."""
         try:
             preparation = self.prepare()
-            primary = self.process_pairs("primary")
-            primary_composition = self.compose("primary")
-            recovery = {
-                "computed_pairs": 0,
-                "resumed_pair_products": 0,
-                "resumed_sqlite_pairs": 0,
-            }
-            if self.config.routing.targeted_recovery:
-                recovery = self.process_pairs("recovery")
-            final = self.compose("final", command)
-            return {
-                **final,
-                "candidate_pairs": preparation["candidate_pairs"],
-                "computed_pairs": (
-                    primary["computed_pairs"] + recovery["computed_pairs"]
-                ),
-                "resumed_pairs": (
-                    primary["resumed_pair_products"]
-                    + primary["resumed_sqlite_pairs"]
-                    + recovery["resumed_pair_products"]
-                    + recovery["resumed_sqlite_pairs"]
-                ),
-                "primary_composition_seconds": primary_composition[
-                    "composition_seconds"
-                ],
-            }
+            pairs = self.process_pairs()
+            composition = self.compose()
         except Exception as error:
             RunStore(self.config).fail_run(error)
             raise
+        return {
+            "candidate_pairs": preparation["candidate_pairs"],
+            "primary_pairs": preparation["primary_pairs"],
+            "computed_pairs": pairs["computed_pairs"],
+            "resumed_pairs": pairs["resumed_pair_products"],
+            **composition,
+        }
 
-    def _pair_candidates(
-        self, store: RunStore, kind: str
-    ) -> tuple[PlannedPair, ...]:
-        planned = store.planned_pairs(self.catalogue)
-        if kind == "primary":
-            return tuple(
-                item for item in planned if item.selection == "primary"
-            )
-        if kind != "recovery":
-            raise ValueError("pair kind must be primary or recovery")
-        if not self.config.routing.targeted_recovery:
-            return ()
-        return recovery_candidates(
-            planned,
-            self.config.routing.maximum_recovery_elapsed_hours,
+    def _primary_pairs(self, store: RunStore) -> tuple[PlannedPair, ...]:
+        return tuple(
+            item for item in store.planned_pairs(self.catalogue)
+            if item.selection == "primary"
         )
-
-    def _work(
-        self,
-        store: RunStore,
-        kind: str,
-        *,
-        candidates: Sequence[PlannedPair] | None = None,
-        batch_index: int = 0,
-        batch_count: int = 1,
-    ):
-        candidates = (
-            self._pair_candidates(store, kind)
-            if candidates is None
-            else candidates
-        )
-        assigned = tuple(
-            item
-            for index, item in enumerate(candidates)
-            if index % batch_count == batch_index
-        )
-        if kind == "primary":
-            yield from (PairWork(item) for item in assigned)
-            return
-        by_id = {item.pair.pair_id: item for item in assigned}
-        # Nominate unscheduled losses over every candidate so each batch agrees.
-        if self.config.routing.recovery_target_policy == "all_losses":
-            for pair, positions, _identities in store.iter_targeted_recovery_positions(
-                item.pair for item in candidates
-            ):
-                if pair.pair_id in by_id and len(positions):
-                    yield PairWork(by_id[pair.pair_id], positions)
-            return
-        found = [
-            (pair, positions, identities)
-            for pair, positions, identities in store.iter_targeted_recovery_positions(
-                item.pair for item in candidates
-            )
-            if len(positions)
-        ]
-        selected = loss_targeted_pairs(
-            (pair.pair_id, pair.elapsed_seconds, identities)
-            for pair, _positions, identities in found
-        )
-        for pair, positions, _identities in found:
-            if pair.pair_id in selected and pair.pair_id in by_id:
-                yield PairWork(by_id[pair.pair_id], positions)
-
-    @staticmethod
-    def _required_field(store: RunStore, pair_id: str):
-        field = store.load_field(pair_id)
-        if field is None:
-            raise RuntimeError(f"completed pair field is missing: {pair_id}")
-        return field
-
-    def _required_edge(self, store: RunStore, pair_id: str, **options) -> FieldEdge:
-        field = self._required_field(store, pair_id)
-        if not self.config.field.missing_node_fallback:
-            return FieldEdge(field, **options)
-        matches = store.load_pair_matches(pair_id)
-        if matches is None:
-            raise RuntimeError(f"retained pair matches are missing: {pair_id}")
-        return field_edge_with_fallback(field, matches, self.config.field, **options)
-
-    @staticmethod
-    def _require_complete(
-        store: RunStore,
-        kind: str,
-        planned: Sequence[PlannedPair],
-    ) -> None:
-        complete = store.completed_pair_ids(kind)
-        missing = [
-            item.pair.pair_id
-            for item in planned
-            if item.pair.pair_id not in complete
-        ]
-        if missing:
-            sample = ", ".join(missing[:5])
-            raise RuntimeError(
-                f"{len(missing)} {kind} pair fields are incomplete; first: {sample}"
-            )
 
 
 def _validate_batch(batch_index: int, batch_count: int) -> None:
@@ -572,7 +141,7 @@ def _validate_batch(batch_index: int, batch_count: int) -> None:
 
 
 def _bounded_map(function, values, workers: int) -> tuple[str, ...]:
-    """Map with at most ``workers`` recovery-position arrays resident."""
+    """Map with at most ``workers`` pairs in flight."""
     iterator = iter(values)
     if workers == 1:
         return tuple(function(value) for value in iterator)

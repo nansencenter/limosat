@@ -33,6 +33,9 @@ PAIR_PRODUCT_SCHEMA_VERSION = 3
 LEGACY_PAIR_PRODUCT_SCHEMA_VERSION = 2
 # How long a writer that lost a publication race waits for the winner's marker.
 PUBLICATION_WAIT_SECONDS = 600.0
+# Recorded in every marker; recovery products of the abandoned continuation passes were
+# the only other kind.
+_KIND = "primary"
 
 
 @dataclass(frozen=True)
@@ -51,9 +54,11 @@ class PairProduct:
 class PairProductStore:
     """Write pair results once and validate them before every reuse.
 
-    Primary products live in ``config.pair_store_directory/<matching_sha256>/primary``
-    when a shared store is configured, otherwise in the run's pair-product directory.
-    Recovery products target one run's lost tracks and always stay with the run.
+    Products live in ``config.pair_store_directory/<matching_sha256>/primary`` when a
+    shared store is configured, otherwise in ``<pair_product_directory>/primary``. Every
+    product is a primary product of the whole pair overlap; its marker still records
+    ``kind``, ``targeted`` and ``targeted_positions_sha256`` (always "primary", false and
+    null) so that stored products keep their identity.
     """
 
     def __init__(
@@ -89,12 +94,11 @@ class PairProductStore:
         self.matching_identity
         return self._matching_sha256
 
-    def kind_root(self, kind: str) -> Path:
-        if kind not in {"primary", "recovery"}:
-            raise ValueError("pair kind must be primary or recovery")
-        if kind == "primary" and self.config.pair_store_directory:
-            return Path(self.config.pair_store_directory) / self.matching_sha256 / kind
-        return self.root / kind
+    @property
+    def directory(self) -> Path:
+        if self.config.pair_store_directory:
+            return Path(self.config.pair_store_directory) / self.matching_sha256 / _KIND
+        return self.root / _KIND
 
     def input_checksums(self, pair: ImagePair) -> dict:
         """Content checksums of the per-pair inputs: both scenes and their SIC files."""
@@ -120,10 +124,7 @@ class PairProductStore:
     def save(
         self,
         pair: ImagePair,
-        kind: str,
-        targeted: bool,
         result: PairResult,
-        targeted_positions_xy_m: np.ndarray | None = None,
         *,
         provenance: dict | None = None,
     ) -> PairProduct:
@@ -135,27 +136,17 @@ class PairProductStore:
         unknown = set(provenance or {}) - _PROVENANCE_FIELDS
         if unknown:
             raise ValueError(f"unknown provenance fields: {sorted(unknown)}")
-        self._validate_identity(pair, kind, targeted, result)
-        positions_sha256 = _positions_sha256(targeted_positions_xy_m)
-        if kind == "recovery" and (
-            targeted_positions_xy_m is None or not len(targeted_positions_xy_m)
-        ):
-            raise ValueError("recovery pair products require measured source positions")
+        self._validate_identity(pair, result)
         arrays = _arrays(result, include_matches=self.config.retain_pair_matches)
         content_sha256 = _content_sha256(arrays)
-        existing = self.load(
-            pair,
-            kind,
-            targeted,
-            targeted_positions_xy_m=targeted_positions_xy_m,
-        )
+        existing = self.load(pair)
         if existing is not None:
             # Products are immutable and first-writer-wins: another worker or run with
             # the same fingerprint already measured this pair, so its result is kept.
             return existing
         inputs = self.input_checksums(pair)
 
-        data_path, marker_path = self._paths(pair.pair_id, kind)
+        data_path, marker_path = self._paths(pair.pair_id)
         data_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = data_path.with_name(
             f".{data_path.name}.writing.{os.getpid()}.{uuid.uuid4().hex}"
@@ -172,9 +163,7 @@ class PairProductStore:
             temporary.unlink(missing_ok=True)
         if data_sha256 is None:
             # Another writer published different data first; adopt its product.
-            adopted = self.load(
-                pair, kind, targeted, targeted_positions_xy_m=targeted_positions_xy_m
-            )
+            adopted = self.load(pair)
             if adopted is None:  # pragma: no cover - _publish_data waited for it
                 raise RuntimeError(f"pair product was not published: {pair.pair_id}")
             return adopted
@@ -190,14 +179,14 @@ class PairProductStore:
             "implementation_sha256": self.implementation_sha256,
             "model_sha256": self.model_sha256,
             "pair_id": pair.pair_id,
-            "kind": kind,
-            "targeted": bool(targeted),
+            "kind": _KIND,
+            "targeted": False,
             "source_image_id": pair.source.image_id,
             "target_image_id": pair.target.image_id,
             "source_time_utc": pair.source.time_utc.isoformat(),
             "target_time_utc": pair.target.time_utc.isoformat(),
             "elapsed_seconds": float(pair.elapsed_seconds),
-            "targeted_positions_sha256": positions_sha256,
+            "targeted_positions_sha256": None,
             "field_sha256": result.field.checksum,
             "content_sha256": content_sha256,
             "match_count": len(result.matches),
@@ -233,26 +222,18 @@ class PairProductStore:
             _publish_marker(marker_temporary, marker_path)
         finally:
             marker_temporary.unlink(missing_ok=True)
-        product = self.load(
-            pair,
-            kind,
-            targeted,
-            targeted_positions_xy_m=targeted_positions_xy_m,
-        )
+        product = self.load(pair)
         if product is None:  # pragma: no cover - guarded by publication above
             raise RuntimeError(f"pair product was not published: {pair.pair_id}")
         return product
 
-    def has_product(self, pair_id: str, kind: str) -> bool:
-        """Whether a completed product marker exists for this pair and kind."""
-        return self._paths(pair_id, kind)[1].exists()
+    def has_product(self, pair_id: str) -> bool:
+        """Whether a completed product marker exists for this pair."""
+        return self._paths(pair_id)[1].exists()
 
     def load(
         self,
         pair: ImagePair,
-        kind: str,
-        targeted: bool,
-        targeted_positions_xy_m: np.ndarray | None = None,
         *,
         require_current_implementation: bool = True,
     ) -> PairProduct | None:
@@ -265,15 +246,11 @@ class PairProductStore:
         resuming their own output, while downstream readers may accept a different
         implementation and record the producer hash in their own manifest.
         """
-        data_path, marker_path = self._paths(pair.pair_id, kind)
+        data_path, marker_path = self._paths(pair.pair_id)
         if not marker_path.exists():
             return None
         if not data_path.is_file():
             raise ValueError(f"pair product marker has no data file: {pair.pair_id}")
-        if kind == "recovery" and (
-            targeted_positions_xy_m is None or not len(targeted_positions_xy_m)
-        ):
-            raise ValueError("recovery pair products require measured source positions")
         metadata = json.loads(marker_path.read_text(encoding="utf-8"))
         if not isinstance(metadata, dict):
             raise ValueError(f"pair product marker is not an object: {pair.pair_id}")
@@ -311,16 +288,14 @@ class PairProductStore:
             )
         expected.update({
             "pair_id": pair.pair_id,
-            "kind": kind,
-            "targeted": bool(targeted),
+            "kind": _KIND,
+            "targeted": False,
             "source_image_id": pair.source.image_id,
             "target_image_id": pair.target.image_id,
             "source_time_utc": pair.source.time_utc.isoformat(),
             "target_time_utc": pair.target.time_utc.isoformat(),
             "elapsed_seconds": float(pair.elapsed_seconds),
-            "targeted_positions_sha256": _positions_sha256(
-                targeted_positions_xy_m
-            ),
+            "targeted_positions_sha256": None,
         })
         changed = [
             name for name, value in expected.items() if metadata.get(name) != value
@@ -342,7 +317,7 @@ class PairProductStore:
         if content_sha256 != metadata.get("content_sha256"):
             raise ValueError(f"pair product content failed checksum: {pair.pair_id}")
         result = _result_from_arrays(metadata, arrays)
-        self._validate_identity(pair, kind, targeted, result)
+        self._validate_identity(pair, result)
         if result.field.checksum != metadata.get("field_sha256"):
             raise ValueError(f"pair field failed checksum: {pair.pair_id}")
         match_count = int(metadata["match_count"])
@@ -370,32 +345,22 @@ class PairProductStore:
             schema,
         )
 
-    def count(self, kind: str) -> int:
-        """Completed products of this kind in the store (a shared store also holds
-        other runs' pairs)."""
-        directory = self.kind_root(kind)
+    def count(self) -> int:
+        """Completed products in the store (a shared store also holds other runs' pairs)."""
+        directory = self.directory
         return (
             sum(1 for _path in directory.glob("*.json"))
             if directory.is_dir()
             else 0
         )
 
-    def _paths(self, pair_id: str, kind: str) -> tuple[Path, Path]:
+    def _paths(self, pair_id: str) -> tuple[Path, Path]:
         identity = hashlib.sha256(pair_id.encode("utf-8")).hexdigest()
-        base = self.kind_root(kind) / identity
+        base = self.directory / identity
         return base.with_suffix(".npz"), base.with_suffix(".json")
 
     @staticmethod
-    def _validate_identity(
-        pair: ImagePair,
-        kind: str,
-        targeted: bool,
-        result: PairResult,
-    ) -> None:
-        if kind not in {"primary", "recovery"}:
-            raise ValueError("pair kind must be primary or recovery")
-        if targeted != (kind == "recovery"):
-            raise ValueError("only recovery pair products may be targeted")
+    def _validate_identity(pair: ImagePair, result: PairResult) -> None:
         field = result.field
         if (
             field.pair_id != pair.pair_id
@@ -469,18 +434,6 @@ def _result_from_arrays(metadata: dict, arrays: dict[str, np.ndarray]) -> PairRe
         diagnostics=dict(metadata.get("diagnostics") or {}),
         ancillary_inputs=dict(metadata.get("ancillary_inputs") or {}),
     )
-
-
-def _positions_sha256(values: np.ndarray | None) -> str | None:
-    if values is None:
-        return None
-    array = np.ascontiguousarray(values, dtype="<f8")
-    if array.ndim != 2 or array.shape[1] != 2:
-        raise ValueError("targeted positions must have shape (n, 2)")
-    digest = hashlib.sha256()
-    digest.update(str(array.shape).encode("utf-8"))
-    digest.update(array.tobytes())
-    return digest.hexdigest()
 
 
 def _metadata_sha256(metadata: dict) -> str:

@@ -97,9 +97,8 @@ def test_invalid_coarse_window_stride_is_rejected(stride):
         RoutingConfig(coarse_window_stride=stride)
 
 
-def test_default_coarse_window_stride_keeps_configuration_identity(tmp_path):
+def test_coarse_window_stride_changes_configuration_identity(tmp_path):
     config = _config(tmp_path)
-    assert 'coarse_window_stride' not in config.to_dict()['routing']
     shared = replace(config, routing=replace(config.routing, coarse_window_stride=3))
     assert shared.to_dict()['routing']['coarse_window_stride'] == 3
     assert shared.sha256 != config.sha256
@@ -170,12 +169,12 @@ def test_unsupported_member_of_measured_window_gets_its_own_window(tmp_path):
     np.testing.assert_allclose(result.shifts, [[100, 0], [100, 0]])
 
 
-def test_layout_gap_agreement_is_opt_in_and_keeps_identity(tmp_path):
+def test_layout_gap_agreement_is_opt_in(tmp_path):
     from limosat.pairs import _gap_field_config
 
     config = _config(tmp_path)
     assert _gap_field_config(config) is config.field
-    assert 'layout_gap_minimum_agreeing_matches' not in config.to_dict()['matcher']
+    assert config.matcher.layout_gap_minimum_agreeing_matches is None
     strict = replace(config, matcher=replace(
         config.matcher, layout_gap_minimum_agreeing_matches=10,
         layout_gap_agreement_distance_m=500.0))

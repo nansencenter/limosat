@@ -2,6 +2,7 @@ import json
 import sqlite3
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import numpy as np
 import rasterio
@@ -12,9 +13,7 @@ from limosat import (
     DisplacementField,
     FieldConfig,
     ImageCatalogue,
-    ImagePair,
     ImageRecord,
-    LiMOSATRun,
     MotionMatches,
     PairProductStore,
     PairResult,
@@ -22,7 +21,6 @@ from limosat import (
     RunConfig,
     RunStages,
     RunStore,
-    TrajectoryPoint,
 )
 
 
@@ -67,6 +65,10 @@ def catalogue(tmp_path):
         records.append(
             ImageRecord(name, path, START + timedelta(days=index), "component")
         )
+    (tmp_path / "catalogue.csv").write_text(
+        "image_id,path,time_utc,component_id\n"
+        + "".join(f"{r.image_id},{r.path},{r.time_utc.isoformat()},component\n" for r in records)
+    )
     return ImageCatalogue(records)
 
 
@@ -118,17 +120,9 @@ class Processor:
     def __init__(self):
         self.calls = []
 
-    def process(
-        self,
-        pair,
-        previous_field=None,
-        previous_elapsed_seconds=None,
-        targeted_positions_xy_m=None,
-    ):
-        targeted = targeted_positions_xy_m is not None
-        self.calls.append((pair.pair_id, targeted))
-        available = pair.pair_id != "b__c" or targeted
-        return result(pair, available=available)
+    def process(self, pair, previous_field=None, previous_elapsed_seconds=None):
+        self.calls.append(pair.pair_id)
+        return result(pair, available=pair.pair_id != "b__c")
 
 
 def test_pair_product_round_trip_is_checked_and_immutable(tmp_path):
@@ -137,8 +131,8 @@ def test_pair_product_round_trip_is_checked_and_immutable(tmp_path):
     products = PairProductStore(cfg)
     expected = result(pair)
 
-    saved = products.save(pair, "primary", False, expected)
-    loaded = products.load(pair, "primary", False)
+    saved = products.save(pair, expected)
+    loaded = products.load(pair)
 
     assert loaded is not None
     assert loaded.sha256 == saved.sha256
@@ -147,19 +141,25 @@ def test_pair_product_round_trip_is_checked_and_immutable(tmp_path):
     np.testing.assert_array_equal(
         loaded.result.matches.source_xy_m, expected.matches.source_xy_m
     )
-    assert products.count("primary") == 1
+    assert products.count() == 1
+    assert saved.path.parent == cfg.pair_products / "primary"
+    metadata = json.loads(saved.path.with_suffix(".json").read_text())
+    # Stored products keep the identity fields of the former product kinds.
+    assert (metadata["kind"], metadata["targeted"], metadata["targeted_positions_sha256"]) == (
+        "primary", False, None
+    )
 
-    resumed = products.save(pair, "primary", False, expected)
+    resumed = products.save(pair, expected)
     assert resumed.sha256 == saved.sha256
     assert resumed.content_sha256 == saved.content_sha256
 
     marker = saved.path.with_suffix(".json")
     marker.unlink()
-    recovered = products.save(pair, "primary", False, expected)
+    recovered = products.save(pair, expected)
     assert recovered.sha256 == saved.sha256
 
     # First writer wins: a later, different result for the same pair keeps the stored one.
-    adopted = products.save(pair, "primary", False, result(pair, available=False))
+    adopted = products.save(pair, result(pair, available=False))
     assert adopted.content_sha256 == saved.content_sha256
 
     # Different data without a marker means another writer is mid-publication; a writer
@@ -168,25 +168,25 @@ def test_pair_product_round_trip_is_checked_and_immutable(tmp_path):
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr("limosat.pair_products.PUBLICATION_WAIT_SECONDS", 0.0)
         with pytest.raises(ValueError, match="marker never appeared"):
-            products.save(pair, "primary", False, result(pair, available=False))
-    products.save(pair, "primary", False, expected)
+            products.save(pair, result(pair, available=False))
+    products.save(pair, expected)
 
     metadata = json.loads(marker.read_text())
     metadata["field_sha256"] = "f" * 64
     marker.write_text(json.dumps(metadata))
     with pytest.raises(ValueError, match="marker failed checksum"):
-        products.load(pair, "primary", False)
+        products.load(pair)
 
 
 def test_pair_products_outlive_code_changes_until_the_matching_version_changes(tmp_path):
     cfg = config(tmp_path)
     pair = catalogue(tmp_path).adjacent_pairs("component")[0]
     products = PairProductStore(cfg)
-    saved = products.save(pair, "primary", False, result(pair))
+    saved = products.save(pair, result(pair))
     producer_hash = saved.producer_implementation_sha256
 
     products.implementation_sha256 = "f" * 64
-    loaded = products.load(pair, "primary", False)
+    loaded = products.load(pair)
     assert loaded is not None
     assert loaded.producer_implementation_sha256 == producer_hash
     assert loaded.result.field.checksum == saved.result.field.checksum
@@ -194,14 +194,14 @@ def test_pair_products_outlive_code_changes_until_the_matching_version_changes(t
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr("limosat.pair_products.MATCHING_VERSION", 2)
         with pytest.raises(ValueError, match="matching_version"):
-            products.load(pair, "primary", False)
+            products.load(pair)
 
 
 def test_legacy_pair_products_load_only_in_their_own_run(tmp_path):
     cfg = config(tmp_path)
     pair = catalogue(tmp_path).adjacent_pairs("component")[0]
     products = PairProductStore(cfg)
-    saved = products.save(pair, "primary", False, result(pair))
+    saved = products.save(pair, result(pair))
     marker = saved.path.with_suffix(".json")
     metadata = json.loads(marker.read_text())
     for name in ("matching_version", "matching_sha256", "matching_identity", "scene_sha256",
@@ -211,15 +211,15 @@ def test_legacy_pair_products_load_only_in_their_own_run(tmp_path):
     metadata["marker_content_sha256"] = _marker_sha256(metadata)
     marker.write_text(json.dumps(metadata))
 
-    loaded = products.load(pair, "primary", False)
+    loaded = products.load(pair)
     assert loaded is not None and loaded.schema_version == 2
     products.implementation_sha256 = "f" * 64
     with pytest.raises(ValueError, match="implementation_sha256"):
-        products.load(pair, "primary", False)
-    assert products.load(pair, "primary", False, require_current_implementation=False)
+        products.load(pair)
+    assert products.load(pair, require_current_implementation=False)
     other = PairProductStore(replace(cfg, run_id="another-run"))
     with pytest.raises(ValueError, match="run_id"):
-        other.load(pair, "primary", False)
+        other.load(pair)
 
 
 def _marker_sha256(metadata):
@@ -229,127 +229,35 @@ def _marker_sha256(metadata):
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def test_recovery_product_is_bound_to_measured_source_positions(tmp_path):
-    cfg = config(tmp_path)
-    images = catalogue(tmp_path).chronological()
-    pair = ImagePair(images[0], images[2])
-    products = PairProductStore(cfg)
-    positions = np.array([[0.0, 0.0], [1_000.0, 0.0]])
-    products.save(pair, "recovery", True, result(pair), positions)
-
-    changed = positions.copy()
-    changed[0, 0] = 1.0
-    with pytest.raises(ValueError, match="targeted_positions_sha256"):
-        products.load(pair, "recovery", True, changed)
+def _rows(path):
+    pq = pytest.importorskip("pyarrow.parquet")
+    return pq.read_table(path).to_pylist()
 
 
-def test_staged_workers_do_not_write_sqlite_and_batches_recompose_globally(tmp_path):
+def test_batched_pair_workers_and_composition_match_a_single_machine_run(tmp_path):
     cfg = config(tmp_path)
     images = catalogue(tmp_path)
     processor = Processor()
     stages = RunStages(cfg, images, processor)
     prepared = stages.prepare()
-
-    first = stages.process_pairs("primary", batch_index=0, batch_count=2)
-    second = stages.process_pairs("primary", batch_index=1, batch_count=2)
-    with sqlite3.connect(cfg.database) as connection:
-        assert connection.execute("SELECT COUNT(*) FROM pairs").fetchone()[0] == 0
-
-    assert first["assigned_pairs"] + second["assigned_pairs"] == 2
-    assert first["computed_pairs"] + second["computed_pairs"] == 2
     assert prepared["primary_pairs"] == 2
 
-    primary = stages.compose("primary")
-    assert primary["pair_product_import"]["imported_pair_products"] == 2
+    first = stages.process_pairs(batch_index=0, batch_count=2)
+    second = stages.process_pairs(batch_index=1, batch_count=2)
+    assert first["assigned_pairs"] + second["assigned_pairs"] == 2
+    assert first["computed_pairs"] + second["computed_pairs"] == 2
+    assert sorted(processor.calls) == ["a__b", "b__c"]
     with sqlite3.connect(cfg.database) as connection:
-        dormant = connection.execute(
-            "SELECT COUNT(*) FROM trajectory_points "
-            "WHERE state='dormant' AND x_m IS NULL AND y_m IS NULL"
-        ).fetchone()[0]
-    assert dormant > 0
-    assert primary["recovery_pairs"] == 0
-    with sqlite3.connect(cfg.database) as connection:
-        frozen_entries = connection.execute(
-            """
-            SELECT trajectory_id,image_id,time_utc,state,position_basis,x_m,y_m,
-                   source_pair_id,selected_matches,support_radius_m,
-                   maximum_residual_m
-            FROM trajectory_points ORDER BY trajectory_id,time_utc,image_id
-            """
-        ).fetchall()
-        frozen_ids = connection.execute(
-            "SELECT trajectory_id FROM trajectories ORDER BY trajectory_id"
-        ).fetchall()
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert tables == {"runs", "images", "candidate_pairs", "planning_counts"}
+    assert stages.process_pairs()["resumed_pair_products"] == 2
 
-    recovery = stages.process_pairs("recovery")
-    assert recovery["planned_pairs"] == 1
-    final = stages.compose("final", ["limosat", "compose", "config", "--phase", "final"])
-    assert final["pair_product_import"]["imported_pair_products"] == 1
-
-    with sqlite3.connect(cfg.database) as connection:
-        reappeared = connection.execute(
-            "SELECT COUNT(*) FROM trajectory_points "
-            "WHERE state='reappeared' AND source_pair_id='a__c'"
-        ).fetchone()[0]
-        deformation = dict(
-            connection.execute(
-                """
-                SELECT pairs.kind,COUNT(deformation_cells.triangle_index)
-                FROM pairs LEFT JOIN deformation_cells USING(run_id,pair_id)
-                GROUP BY pairs.kind
-                """
-            )
-        )
-        augmentation_counts = dict(
-            connection.execute(
-                """
-                SELECT augmentation_kind,COUNT(*)
-                FROM trajectory_augmentations GROUP BY augmentation_kind
-                """
-            )
-        )
-        final_ids = connection.execute(
-            "SELECT trajectory_id FROM trajectories ORDER BY trajectory_id"
-        ).fetchall()
-    assert reappeared > 0
-    assert augmentation_counts == {"reappearance": reappeared}
-    assert final_ids == frozen_ids
-    assert deformation["primary"] > 0
-    assert deformation["recovery"] == 0
-    assert final["manifest_sha256"]
-
-    with sqlite3.connect(cfg.database) as connection:
-        staged_rows = connection.execute(
-            """
-            SELECT trajectory_id,image_id,time_utc,state,position_basis,x_m,y_m,
-                   source_pair_id,selected_matches,support_radius_m,
-                   maximum_residual_m
-            FROM trajectory_points ORDER BY trajectory_id,time_utc,image_id
-            """
-        ).fetchall()
-    frozen_by_key = {(row[0], row[1]): row for row in frozen_entries}
-    staged_by_key = {(row[0], row[1]): row for row in staged_rows}
-    assert staged_by_key.keys() == frozen_by_key.keys()
-    assert all(
-        staged_by_key[key] == entry
-        for key, entry in frozen_by_key.items()
-        if entry[5] is not None
-    )
-
-    resumed_final = stages.compose(
-        "final", ["limosat", "compose", "config", "--phase", "final"]
-    )
-    assert resumed_final["restored_augmentations"] == reappeared
-    with sqlite3.connect(cfg.database) as connection:
-        resumed_rows = connection.execute(
-            """
-            SELECT trajectory_id,image_id,time_utc,state,position_basis,x_m,y_m,
-                   source_pair_id,selected_matches,support_radius_m,
-                   maximum_residual_m
-            FROM trajectory_points ORDER BY trajectory_id,time_utc,image_id
-            """
-        ).fetchall()
-    assert resumed_rows == staged_rows
+    composed = stages.compose()
+    assert Path(composed["manifest"]).parent == Path(cfg.output_directory) / "primary-composition"
+    points = _rows(composed["trajectory_points"])
+    # b -> c supports nothing: tracks end at b and no point is stored at c.
+    assert {row["image_id"] for row in points} == {"a", "b"}
+    assert {row["state"] for row in points} == {"created", "observed"}
 
     single = replace(
         cfg,
@@ -357,69 +265,19 @@ def test_staged_workers_do_not_write_sqlite_and_batches_recompose_globally(tmp_p
         output_directory=str(tmp_path / "single-products"),
         pair_product_directory=str(tmp_path / "single-work" / "pairs"),
     )
-    LiMOSATRun(single, images, Processor()).execute()
-    with sqlite3.connect(single.database) as connection:
-        single_rows = connection.execute(
-            """
-            SELECT trajectory_id,image_id,time_utc,state,position_basis,x_m,y_m,
-                   source_pair_id,selected_matches,support_radius_m,
-                   maximum_residual_m
-            FROM trajectory_points ORDER BY trajectory_id,time_utc,image_id
-            """
-        ).fetchall()
-    assert staged_rows == single_rows
+    report = RunStages(single, images, Processor()).run_all()
+    assert report["computed_pairs"] == 2
+    assert _rows(report["trajectory_points"]) == points
 
 
-def test_field_only_worker_product_preserves_match_count_on_import(tmp_path):
+def test_field_only_worker_product_preserves_match_count(tmp_path):
     cfg = config(tmp_path, retain_matches=False)
-    images = catalogue(tmp_path)
-    stages = RunStages(cfg, images, Processor())
+    stages = RunStages(cfg, catalogue(tmp_path), Processor())
     stages.prepare()
-    stages.process_pairs("primary")
-    stages.compose("primary")
-
-    with sqlite3.connect(cfg.database) as connection:
-        counts = connection.execute(
-            "SELECT match_count FROM pairs ORDER BY pair_id"
-        ).fetchall()
-        archives = connection.execute(
-            "SELECT COUNT(*) FROM pair_match_archives"
-        ).fetchone()[0]
-    assert counts == [(1,), (1,)]
-    assert archives == 0
-
-
-def test_disabled_recovery_schedules_no_pair_work(tmp_path):
-    cfg = replace(
-        config(tmp_path),
-        routing=RoutingConfig(
-            coarse_matching=False, initial="same_center", targeted_recovery=False
-        ),
-    )
-    images = catalogue(tmp_path)
-    processor = Processor()
-    stages = RunStages(cfg, images, processor)
-    stages.prepare()
-    stages.process_pairs("primary")
-    stages.compose("primary")
-
-    recovery = stages.process_pairs("recovery")
-    final = stages.compose(
-        "final", ["limosat", "compose", "config", "--phase", "final"]
-    )
-
-    assert recovery == {
-        "kind": "recovery",
-        "batch_index": 0,
-        "batch_count": 1,
-        "planned_pairs": 0,
-        "assigned_pairs": 0,
-        "computed_pairs": 0,
-        "resumed_pair_products": 0,
-        "resumed_sqlite_pairs": 0,
-    }
-    assert not any(targeted for _pair_id, targeted in processor.calls)
-    assert final["recovery_pairs"] == 0
+    stages.process_pairs()
+    for pair in catalogue(tmp_path).adjacent_pairs("component"):
+        product = stages.pair_products.load(pair)
+        assert product.match_count == 1 and not len(product.result.matches)
 
 
 def test_default_pair_product_path_is_database_specific(tmp_path):
@@ -433,7 +291,7 @@ def test_pair_stage_requires_a_registered_candidate_plan(tmp_path):
     RunStore(cfg)
 
     with pytest.raises(RuntimeError, match="run prepare first"):
-        RunStages(cfg, catalogue(tmp_path), Processor()).process_pairs("primary")
+        RunStages(cfg, catalogue(tmp_path), Processor()).process_pairs()
 
 
 def test_pair_stage_rejects_changed_registered_catalogue_metadata(tmp_path):
@@ -445,41 +303,4 @@ def test_pair_stage_rejects_changed_registered_catalogue_metadata(tmp_path):
     )
 
     with pytest.raises(ValueError, match="catalogue image metadata changed"):
-        RunStages(cfg, changed, Processor()).process_pairs("primary")
-
-
-def test_interrupted_streamed_composition_rolls_back_existing_rows(tmp_path):
-    cfg = config(tmp_path)
-    store = RunStore(cfg)
-    image = catalogue(tmp_path).chronological()[0]
-    original = (
-        TrajectoryPoint(
-            "parcel",
-            image.image_id,
-            image.time_utc,
-            "created",
-            "seed_grid",
-            0.0,
-            0.0,
-            None,
-        ),
-    )
-    store.replace_global_trajectories(original)
-
-    def interrupted():
-        yield original
-        raise RuntimeError("synthetic composition interruption")
-
-    with pytest.raises(RuntimeError, match="synthetic composition interruption"):
-        store.replace_global_trajectory_batches(interrupted())
-
-    with sqlite3.connect(cfg.database) as connection:
-        rows = connection.execute(
-            "SELECT trajectory_id,image_id,x_m,y_m FROM trajectory_points"
-        ).fetchall()
-        index = connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='index' "
-            "AND name='trajectory_points_run_image_state'"
-        ).fetchone()
-    assert rows == [("parcel", "a", 0.0, 0.0)]
-    assert index == (1,)
+        RunStages(cfg, changed, Processor()).process_pairs()

@@ -202,14 +202,9 @@ class FieldConfig:
         )
 
 
-GAP_FILL_SETTINGS = tuple(
-    item.name for item in fields(FieldConfig) if item.name.startswith("gap_fill_")
-)
-
-
 @dataclass(frozen=True)
 class RoutingConfig:
-    """Causal pair routing and measured-loss recovery settings."""
+    """Pair planning and causal pair routing settings."""
 
     planning_grid_spacing_m: float = 4_000.0
     mode: Literal["same_center", "sequential", "sequential_local"] = (
@@ -219,9 +214,6 @@ class RoutingConfig:
     phase_correlation_failure: Literal["same_center", "error"] = "same_center"
     phase_correlation_minimum_response: float = 0.05
     residual_edge_recovery: bool = True
-    targeted_recovery: bool = True
-    maximum_recovery_elapsed_hours: float = 96.0
-    targeted_selection_buffer_m: float = 6_400.0
     candidate_minimum_elapsed_hours: float = 1.0
     candidate_maximum_elapsed_hours: float = 96.0
     candidate_minimum_overlap_fraction: float = 0.05
@@ -234,15 +226,6 @@ class RoutingConfig:
     coarse_minimum_matches: int = 12
     coarse_support_radius_m: float = 35_840.0
     coarse_window_stride: int = 1
-    recovery_target_policy: Literal["loss_targeted", "all_losses"] = "loss_targeted"
-    # Loss-targeted nomination skips a pair for a loss when the target image is less
-    # valid than this share in a window of recovery_target_valid_window_m around the
-    # loss's predicted position (0 disables). On MOSAiC 2020, 88% of continuation
-    # attempts aimed at targets under 10% valid and almost never succeeded. Over chained
-    # passes 2+ on Fram (Feb-Mar 2020), 0.3 reached about 90% of the coverage gain with
-    # 45% fewer matcher tiles than no check.
-    recovery_minimum_target_valid_fraction: float = 0.3
-    recovery_target_valid_window_m: float = 31_000.0
     # Next-observation primary selection (planning.py _next_observation_selection). Each
     # source image's planning cells (4 km, imaged by both images, no drift allowance) go
     # to the earliest later candidate image that images them, so every piece of ice is
@@ -284,12 +267,6 @@ class RoutingConfig:
             or self.coarse_minimum_matches < 1
         ):
             raise ValueError("coarse_minimum_matches must be a positive integer")
-        if not 0.0 <= self.recovery_minimum_target_valid_fraction <= 1.0:
-            raise ValueError("recovery_minimum_target_valid_fraction must be in [0, 1]")
-        if not 0 < self.recovery_target_valid_window_m < float("inf"):
-            raise ValueError("recovery_target_valid_window_m must be finite and positive")
-        if self.recovery_target_policy not in ("loss_targeted", "all_losses"):
-            raise ValueError("recovery_target_policy must be loss_targeted or all_losses")
         if (
             isinstance(self.coarse_window_stride, bool)
             or not isinstance(self.coarse_window_stride, int)
@@ -301,10 +278,6 @@ class RoutingConfig:
             raise ValueError(
                 "phase_correlation_minimum_response must be in [0, 1]"
             )
-        if self.maximum_recovery_elapsed_hours <= 0:
-            raise ValueError("maximum_recovery_elapsed_hours must be positive")
-        if self.targeted_selection_buffer_m <= 0:
-            raise ValueError("targeted_selection_buffer_m must be positive")
         if self.candidate_minimum_elapsed_hours <= 0:
             raise ValueError("candidate_minimum_elapsed_hours must be positive")
         if (
@@ -385,7 +358,6 @@ class TrajectoryConfig:
 
     add_as_coverage_enters: bool = True
     new_point_exclusion_radius_m: float = 2_000.0
-    convergence_audit_radius_m: float | None = None
     # Merge duplicate trajectories (off by default). When the positions of two or more
     # trajectories in one image lie within this distance (chained), only the one with the
     # longest history continues (then more selected matches, lower residual, identity, as
@@ -412,11 +384,6 @@ class TrajectoryConfig:
             raise ValueError("new_point_exclusion_radius_m must be positive")
         if self.merge_radius_m is not None and not 0 < self.merge_radius_m < self.new_point_exclusion_radius_m:
             raise ValueError("merge_radius_m must be positive and below new_point_exclusion_radius_m")
-        if (
-            self.convergence_audit_radius_m is not None
-            and self.convergence_audit_radius_m <= 0
-        ):
-            raise ValueError("convergence_audit_radius_m must be positive")
 
 
 @dataclass(frozen=True)
@@ -473,57 +440,7 @@ class RunConfig:
             raise ValueError("shear_point_estimates requires retain_pair_matches")
 
     def to_dict(self) -> dict[str, Any]:
-        values = asdict(self)
-        if not self.surface.enabled:
-            # Configurations without land or point open-water exclusion keep their identity.
-            values.pop("surface")
-        if not self.field.missing_node_fallback:
-            # Preserve the identity of existing configurations with fallback off.
-            values["field"].pop("missing_node_fallback")
-        if not self.field.shear_point_estimates:
-            # Preserve the identity of existing configurations without shear point estimates.
-            values["field"].pop("shear_point_estimates")
-        if self.trajectories.merge_radius_m is None:
-            # Preserve the identity of existing configurations without merging.
-            values["trajectories"].pop("merge_radius_m")
-        if self.trajectories.merge_maximum_younger_age_hours is None:
-            values["trajectories"].pop("merge_maximum_younger_age_hours")
-        if not self.field.gap_filling:
-            # Preserve the identity of existing configurations without gap filling.
-            for name in GAP_FILL_SETTINGS:
-                values["field"].pop(name)
-        for name in ("pair_store_directory", "scene_checksums"):
-            if not values[name]:
-                # Locations only; preserve the identity of configurations without them.
-                values.pop(name)
-        defaults = MatcherConfig()
-        for name in (
-            "tile_grid_offsets",
-            "masked_rematch_target_valid_fraction",
-            "layout_dedup_m",
-            "layout_field_merge",
-            "tile_sampling",
-            "layout_gap_minimum_agreeing_matches",
-            "layout_gap_agreement_distance_m",
-            "scene_mask_invalid_from",
-        ):
-            if getattr(self.matcher, name) == getattr(defaults, name):
-                # Preserve the identity of configurations with one plain tile layout.
-                values["matcher"].pop(name)
-        if self.routing.coarse_window_stride == 1:
-            # Preserve the identity of configurations with one coarse window per tile.
-            values["routing"].pop("coarse_window_stride")
-        # Recovery target selection decides which losses a recovery pair measures, not
-        # how any pair is measured, so it never enters the configuration identity
-        # (pair products stay valid when the selection changes). Target manifests
-        # record the selection settings instead.
-        for name in (
-            "recovery_target_policy",
-            "recovery_minimum_target_valid_fraction",
-            "recovery_target_valid_window_m",
-        ):
-            values["routing"].pop(name)
-        return values
+        return asdict(self)
 
     @property
     def pair_products(self) -> Path:
@@ -575,16 +492,10 @@ def load_config(path: str | Path) -> RunConfig:
         if matcher_values.get(name):
             matcher_values[name] = str(_resolve_path(base, matcher_values[name]))
     resolved["matcher"] = _construct(MatcherConfig, matcher_values)
-    field_values = dict(resolved.get("field", {}))
-    legacy_field_keys = {item.name for item in fields(FieldConfig)} - {
-        "missing_node_fallback", "shear_point_estimates", *GAP_FILL_SETTINGS
-    }
-    if ("missing_node_fallback" not in field_values
-            and legacy_field_keys <= field_values.keys()):
-        # Older fully resolved configs omitted the former opt-in when it was off.
-        field_values["missing_node_fallback"] = False
-    resolved["field"] = _construct(FieldConfig, field_values)
-    resolved["routing"] = _construct(RoutingConfig, resolved.get("routing", {}))
+    resolved["field"] = _construct(FieldConfig, resolved.get("field", {}))
+    resolved["routing"] = _construct(
+        RoutingConfig, _without_removed(resolved.get("routing", {}), "routing")
+    )
     open_water_values = dict(resolved.get("open_water", {}))
     if open_water_values.get("sic_root"):
         open_water_values["sic_root"] = str(
@@ -592,7 +503,7 @@ def load_config(path: str | Path) -> RunConfig:
         )
     resolved["open_water"] = _construct(OpenWaterConfig, open_water_values)
     resolved["trajectories"] = _construct(
-        TrajectoryConfig, resolved.get("trajectories", {})
+        TrajectoryConfig, _without_removed(resolved.get("trajectories", {}), "trajectories")
     )
     surface_values = dict(resolved.get("surface", {}))
     for name in ("land_raster", "point_sic_root", "point_sic_fallback_root"):
@@ -619,3 +530,41 @@ def _require_positive(values: dict[str, Any]) -> None:
     invalid = [name for name, value in values.items() if float(value) <= 0]
     if invalid:
         raise ValueError(f"values must be positive: {invalid}")
+
+
+_ANY = object()
+# Settings of removed methods (continuation passes, per-target coverage selection, the
+# drift-prior and assigned-tile experiments). Configurations written before their
+# removal still load when these describe the kept method: _ANY values are ignored (they
+# never changed the kept path), others must equal the kept behaviour.
+_REMOVED_SETTINGS = {
+    "routing": {
+        "primary_selection": "next_observation",
+        "primary_maximum_pairs_per_target": None,
+        "source_coverage_completion": False,
+        "source_coverage_minimum_cells": _ANY,
+        "primary_tiles": "all",
+        "prior_displacement_file": "",
+        "targeted_recovery": _ANY,
+        "maximum_recovery_elapsed_hours": _ANY,
+        "recovery_target_policy": _ANY,
+        "recovery_minimum_target_valid_fraction": _ANY,
+        "recovery_target_valid_window_m": _ANY,
+        # Part of the matching fingerprint at this value (pair_identity.py).
+        "targeted_selection_buffer_m": 6_400.0,
+    },
+    "trajectories": {"convergence_audit_radius_m": _ANY},
+}
+
+
+def _without_removed(values: dict[str, Any], section: str) -> dict[str, Any]:
+    kept = dict(values)
+    for name, required in _REMOVED_SETTINGS[section].items():
+        if name in kept:
+            value = kept.pop(name)
+            if required is not _ANY and value != required:
+                raise ValueError(
+                    f"{section}.{name} = {value!r} selects a removed method; "
+                    f"only {required!r} is supported"
+                )
+    return kept

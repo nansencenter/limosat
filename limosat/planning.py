@@ -233,21 +233,6 @@ def build_candidate_plan(
             _cells,
         ) in enumerate(ordered)
     )
-    recovery_pool = [
-        item
-        for item in pairs
-        if item.selection == "candidate" and item.skipped_images > 0
-    ]
-    within_recovery_horizon = [
-        item
-        for item in recovery_pool
-        if item.pair.elapsed_seconds
-        <= config.maximum_recovery_elapsed_hours * 3_600.0
-    ]
-    selected_recovery = recovery_candidates(
-        pairs,
-        maximum_elapsed_hours=config.maximum_recovery_elapsed_hours,
-    )
     counts = {
         **exclusions,
         "accepted_candidate_pairs": len(pairs),
@@ -264,57 +249,8 @@ def build_candidate_plan(
             for target in by_target.values()
             if any(cells is not None for *_prefix, cells in target)
         ),
-        "unselected_recovery_candidates": len(recovery_pool),
-        "recovery_candidates_outside_elapsed_horizon": (
-            len(recovery_pool) - len(within_recovery_horizon)
-        ),
-        "recovery_candidates_within_elapsed_horizon": len(
-            within_recovery_horizon
-        ),
-        "recovery_candidates_selected_by_elapsed_horizon": len(
-            selected_recovery
-        ),
     }
     return CandidatePlan(pairs, counts)
-
-
-def recovery_candidates(
-    planned: tuple[PlannedPair, ...], maximum_elapsed_hours: float = 96.0,
-) -> tuple[PlannedPair, ...]:
-    """Select recent recovery candidates inside an elapsed-time horizon."""
-    if maximum_elapsed_hours <= 0:
-        raise ValueError("maximum_elapsed_hours must be positive")
-    maximum_elapsed_seconds = maximum_elapsed_hours * 3_600.0
-    by_target: dict[str, list[PlannedPair]] = {}
-    for item in planned:
-        if (
-            item.selection == "candidate"
-            and item.skipped_images > 0
-            and item.pair.elapsed_seconds <= maximum_elapsed_seconds
-        ):
-            by_target.setdefault(item.pair.target.image_id, []).append(item)
-    selected = []
-    for target_id in sorted(by_target):
-        ranked = sorted(
-            by_target[target_id],
-            key=lambda item: (
-                -item.pair.source.time_utc.timestamp(),
-                -(item.overlap_fraction or 0.0),
-                item.pair.pair_id,
-            ),
-        )
-        selected.extend(ranked)
-    return tuple(
-        sorted(
-            selected,
-            key=lambda item: (
-                item.pair.target.time_utc,
-                item.pair.target.image_id,
-                -item.pair.source.time_utc.timestamp(),
-                item.pair.source.image_id,
-            ),
-        )
-    )
 
 
 def select_overlap_probe(
