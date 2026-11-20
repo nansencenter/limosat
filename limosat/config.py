@@ -448,8 +448,19 @@ class TrajectoryConfig:
     # 91 % of trajectories < 1 km apart were already that close when first in one image
     # (median 0.39 km) and kept their separation (median change 20 m over ~39 days).
     merge_radius_m: float | None = None
+    # Merge only young duplicates (None: any). A trajectory is ended by a merge only if it
+    # is at most this old (hours since it was created) and was never positioned in the same
+    # image as its survivor before. Duplicates are mostly reseeds on ice already tracked
+    # (Jan-Apr 2020: 85-88 % of merges ended a trajectory that never shared an image with
+    # its survivor, median age 1 day); established trajectories with their own history are
+    # kept even when they converge, since they may follow different ice.
+    merge_maximum_younger_age_hours: float | None = None
 
     def __post_init__(self) -> None:
+        if self.merge_maximum_younger_age_hours is not None and (
+            self.merge_radius_m is None or not self.merge_maximum_younger_age_hours > 0
+        ):
+            raise ValueError("merge_maximum_younger_age_hours needs merge_radius_m and must be positive")
         if self.new_point_exclusion_radius_m <= 0:
             raise ValueError("new_point_exclusion_radius_m must be positive")
         if self.merge_radius_m is not None and not 0 < self.merge_radius_m < self.new_point_exclusion_radius_m:
@@ -528,6 +539,8 @@ class RunConfig:
         if self.trajectories.merge_radius_m is None:
             # Preserve the identity of existing configurations without merging.
             values["trajectories"].pop("merge_radius_m")
+        if self.trajectories.merge_maximum_younger_age_hours is None:
+            values["trajectories"].pop("merge_maximum_younger_age_hours")
         if not self.field.gap_filling:
             # Preserve the identity of existing configurations without gap filling.
             for name in GAP_FILL_SETTINGS:

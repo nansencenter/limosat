@@ -218,6 +218,9 @@ def iter_global_trajectory_batches(
     observations: dict[str, int] = {}
     merged: set[str] = set()
     merge_radius = trajectory_config.merge_radius_m
+    young_hours = trajectory_config.merge_maximum_younger_age_hours
+    created_step: dict[str, int] = {}
+    young_steps: dict[str, list[int]] = {}
     last_use: dict[int, int] = {}
     for source, target, _edge in indexed:
         last_use[source] = max(last_use.get(source, target), target)
@@ -297,8 +300,25 @@ def iter_global_trajectory_batches(
                 )
 
         if merge_radius is not None and len(positions[step]) > 1:
+            eligible_loser = None
+            if young_hours is not None:
+                limit = young_hours * 3_600.0
+
+                def eligible_loser(loser: str, winner: str) -> bool:
+                    born = created_step.get(loser)
+                    if born is None:
+                        return False
+                    age = (image.time_utc - ordered_images[born].time_utc).total_seconds()
+                    if age > limit:
+                        return False
+                    return not any(
+                        winner in positions[earlier]
+                        for earlier in young_steps.get(loser, ())
+                        if earlier != step
+                    )
             merges = _merge_duplicates(
-                positions[step], points, observations, merge_radius, image
+                positions[step], points, observations, merge_radius, image,
+                eligible_loser=eligible_loser,
             )
             if merges:
                 ended = {event.trajectory_id for event in merges}
@@ -311,6 +331,16 @@ def iter_global_trajectory_batches(
         for point in points:
             if point.available:
                 observations[point.trajectory_id] = observations.get(point.trajectory_id, 0) + 1
+                if young_hours is not None and point.trajectory_id in young_steps:
+                    young_steps[point.trajectory_id].append(step)
+        if young_hours is not None and young_steps:
+            # Forget the history of trajectories too old to be merged.
+            limit = young_hours * 3_600.0
+            for identity in [
+                identity for identity, steps in young_steps.items()
+                if (image.time_utc - ordered_images[created_step[identity]].time_utc).total_seconds() > limit
+            ]:
+                del young_steps[identity]
 
         if trajectory_config.add_as_coverage_enters:
             candidates = _outgoing_primary_points(indexed, step)
@@ -330,6 +360,9 @@ def iter_global_trajectory_batches(
                 identities.add(identity)
                 positions[step][identity] = xy
                 observations[identity] = 1
+                if young_hours is not None:
+                    created_step[identity] = step
+                    young_steps[identity] = [step]
                 points.append(
                     _point(identity, image, "created", "seed_grid", xy, None)
                 )
@@ -747,10 +780,12 @@ def _merge_duplicates(
     observations: dict[str, int],
     radius_m: float,
     image: ImageRecord,
+    eligible_loser=None,
 ) -> list[MergeEvent]:
     """End all but one trajectory of each cluster of positions within ``radius_m`` in
     this image; ``current`` loses the ended ones. The survivor has the longest
-    history, then the convergence-audit order."""
+    history, then the convergence-audit order. ``eligible_loser(loser, survivor)``,
+    when given, keeps trajectories it rejects (merge_maximum_younger_age_hours)."""
     identities = sorted(current)
     coordinates = np.vstack([current[identity] for identity in identities])
     pairs = cKDTree(coordinates).query_pairs(radius_m, output_type="ndarray")
@@ -767,6 +802,8 @@ def _merge_duplicates(
         winner = identities[ranked[0]]
         for index in ranked[1:]:
             loser = identities[index]
+            if eligible_loser is not None and not eligible_loser(loser, winner):
+                continue
             events.append(MergeEvent(
                 trajectory_id=loser, merged_into=winner, image_id=image.image_id,
                 time_utc=image.time_utc,
