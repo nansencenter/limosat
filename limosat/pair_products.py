@@ -27,10 +27,8 @@ from .store import file_sha256, implementation_sha256
 
 # Schema 3 identifies a product by its matching fingerprint (pair_identity.py) and the
 # checksums of its scene and SIC files, so any run with the same fingerprint can reuse
-# it. Schema 2 products were tied to the run (ID and full configuration hash) that made
-# them; they still load in that run.
+# it. (Schema 2 products, tied to the run that made them, are no longer read.)
 PAIR_PRODUCT_SCHEMA_VERSION = 3
-LEGACY_PAIR_PRODUCT_SCHEMA_VERSION = 2
 # How long a writer that lost a publication race waits for the winner's marker.
 PUBLICATION_WAIT_SECONDS = 600.0
 # Recorded in every marker; recovery products of the abandoned continuation passes were
@@ -48,7 +46,6 @@ class PairProduct:
     sha256: str
     content_sha256: str
     producer_implementation_sha256: str
-    schema_version: int = PAIR_PRODUCT_SCHEMA_VERSION
 
 
 class PairProductStore:
@@ -121,21 +118,8 @@ class PairProductStore:
             "sic_sha256": sic,
         }
 
-    def save(
-        self,
-        pair: ImagePair,
-        result: PairResult,
-        *,
-        provenance: dict | None = None,
-    ) -> PairProduct:
-        """Atomically publish a pair product without replacing an existing one.
-
-        ``provenance`` overrides the producer fields (run, configuration and code
-        hashes) for a product made elsewhere, e.g. when migrating schema 2 products.
-        """
-        unknown = set(provenance or {}) - _PROVENANCE_FIELDS
-        if unknown:
-            raise ValueError(f"unknown provenance fields: {sorted(unknown)}")
+    def save(self, pair: ImagePair, result: PairResult) -> PairProduct:
+        """Atomically publish a pair product without replacing an existing one."""
         self._validate_identity(pair, result)
         arrays = _arrays(result, include_matches=self.config.retain_pair_matches)
         content_sha256 = _content_sha256(arrays)
@@ -200,7 +184,6 @@ class PairProductStore:
             "data_sha256": data_sha256,
             "data_size_bytes": data_path.stat().st_size,
         }
-        metadata.update(provenance or {})
         metadata["marker_content_sha256"] = _metadata_sha256(metadata)
         marker_bytes = (
             json.dumps(
@@ -231,20 +214,12 @@ class PairProductStore:
         """Whether a completed product marker exists for this pair."""
         return self._paths(pair_id)[1].exists()
 
-    def load(
-        self,
-        pair: ImagePair,
-        *,
-        require_current_implementation: bool = True,
-    ) -> PairProduct | None:
+    def load(self, pair: ImagePair) -> PairProduct | None:
         """Load a completed pair product, or ``None`` without a marker.
 
-        Schema 3 products are accepted by any run with the same matching fingerprint
-        and identical scene and SIC files; ``MATCHING_VERSION`` decides when code
-        changes invalidate them. Schema 2 products load only in the run that made
-        them, and there pair workers require an exact implementation match when
-        resuming their own output, while downstream readers may accept a different
-        implementation and record the producer hash in their own manifest.
+        Products are accepted by any run with the same matching fingerprint and
+        identical scene and SIC files; ``MATCHING_VERSION`` decides when code changes
+        invalidate them, so the producing code itself may differ (its hash is kept).
         """
         data_path, marker_path = self._paths(pair.pair_id)
         if not marker_path.exists():
@@ -268,24 +243,15 @@ class PairProductStore:
                 f"pair product producer hash is invalid: {pair.pair_id}"
             )
         schema = metadata.get("pair_product_schema_version")
-        if schema == LEGACY_PAIR_PRODUCT_SCHEMA_VERSION:
-            expected = {
-                "run_id": self.config.run_id,
-                "config_sha256": self.config.sha256,
-                "model_sha256": self.model_sha256,
-            }
-            if require_current_implementation:
-                expected["implementation_sha256"] = self.implementation_sha256
-        elif schema == PAIR_PRODUCT_SCHEMA_VERSION:
-            expected = {
-                "matching_version": MATCHING_VERSION,
-                "matching_sha256": self.matching_sha256,
-                **self.input_checksums(pair),
-            }
-        else:
+        if schema != PAIR_PRODUCT_SCHEMA_VERSION:
             raise ValueError(
                 f"unsupported pair product schema {schema!r}: {pair.pair_id}"
             )
+        expected = {
+            "matching_version": MATCHING_VERSION,
+            "matching_sha256": self.matching_sha256,
+            **self.input_checksums(pair),
+        }
         expected.update({
             "pair_id": pair.pair_id,
             "kind": _KIND,
@@ -342,7 +308,6 @@ class PairProductStore:
             data_sha256,
             content_sha256,
             producer_implementation_sha256,
-            schema,
         )
 
     def count(self) -> int:
@@ -370,11 +335,6 @@ class PairProductStore:
             or field.target_time_utc != pair.target.time_utc
         ):
             raise ValueError("pair product field identity differs from its image pair")
-
-
-_PROVENANCE_FIELDS = {
-    "producer_run_id", "producer_config_sha256", "implementation_sha256", "migrated_from",
-}
 
 
 def _arrays(result: PairResult, include_matches: bool) -> dict[str, np.ndarray]:

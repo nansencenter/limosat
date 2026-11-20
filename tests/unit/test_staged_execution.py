@@ -197,36 +197,21 @@ def test_pair_products_outlive_code_changes_until_the_matching_version_changes(t
             products.load(pair)
 
 
-def test_legacy_pair_products_load_only_in_their_own_run(tmp_path):
+def test_run_bound_schema_2_products_are_refused(tmp_path):
+    import hashlib
+
     cfg = config(tmp_path)
     pair = catalogue(tmp_path).adjacent_pairs("component")[0]
     products = PairProductStore(cfg)
-    saved = products.save(pair, result(pair))
-    marker = saved.path.with_suffix(".json")
+    marker = products.save(pair, result(pair)).path.with_suffix(".json")
     metadata = json.loads(marker.read_text())
-    for name in ("matching_version", "matching_sha256", "matching_identity", "scene_sha256",
-                 "sic_sha256", "producer_run_id", "producer_config_sha256", "marker_content_sha256"):
-        metadata.pop(name)
-    metadata.update(pair_product_schema_version=2, run_id=cfg.run_id, config_sha256=cfg.sha256)
-    metadata["marker_content_sha256"] = _marker_sha256(metadata)
-    marker.write_text(json.dumps(metadata))
-
-    loaded = products.load(pair)
-    assert loaded is not None and loaded.schema_version == 2
-    products.implementation_sha256 = "f" * 64
-    with pytest.raises(ValueError, match="implementation_sha256"):
-        products.load(pair)
-    assert products.load(pair, require_current_implementation=False)
-    other = PairProductStore(replace(cfg, run_id="another-run"))
-    with pytest.raises(ValueError, match="run_id"):
-        other.load(pair)
-
-
-def _marker_sha256(metadata):
-    import hashlib
-
+    metadata.pop("marker_content_sha256")
+    metadata["pair_product_schema_version"] = 2
     encoded = json.dumps(metadata, sort_keys=True, separators=(",", ":"), allow_nan=False)
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    metadata["marker_content_sha256"] = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    marker.write_text(json.dumps(metadata))
+    with pytest.raises(ValueError, match="unsupported pair product schema 2"):
+        products.load(pair)
 
 
 def _rows(path):

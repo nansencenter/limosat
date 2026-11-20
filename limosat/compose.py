@@ -62,20 +62,17 @@ def compose_primary_parquet(
 
     edges: list[FieldEdge] = []
     producer_hashes: set[str] = set()
-    schemas: set[int] = set()
     product_set = hashlib.sha256()
     for item, product in zip(primary, _load_primary_products(products, primary)):
         if product is None:
             raise RuntimeError(f"primary pair product is missing: {item.pair.pair_id}")
         producer_hashes.add(product.producer_implementation_sha256)
-        schemas.add(product.schema_version)
         product_set.update(item.pair.pair_id.encode("utf-8"))
         product_set.update(product.sha256.encode("ascii"))
         product_set.update(product.content_sha256.encode("ascii"))
         edges.append(field_edge_with_fallback(
             product.result.field, product.result.matches, config.field
         ))
-    _check_producers(producer_hashes, schemas)
 
     point_schema = _point_schema(pa, config)
     extension_schema = _extension_schema(pa, config, qc)
@@ -168,11 +165,7 @@ def compose_primary_parquet(
             next(iter(producer_hashes)) if len(producer_hashes) == 1 else None
         ),
         "producer_implementation_sha256s": sorted(producer_hashes),
-        "matching_sha256": (
-            products.matching_sha256
-            if schemas == {PAIR_PRODUCT_SCHEMA_VERSION}
-            else None
-        ),
+        "matching_sha256": products.matching_sha256,
         "consumer_implementation_note": (
             "consumer code may differ; every pair-product checksum was verified"
         ),
@@ -215,17 +208,6 @@ def compose_primary_parquet(
     }
 
 
-def _check_producers(producer_hashes: set[str], schemas: set[int]) -> None:
-    """Products from several code versions may be composed together only when their
-    shared matching fingerprint vouches for them (schema 3); legacy products must all
-    come from one implementation."""
-    if len(producer_hashes) > 1 and schemas != {PAIR_PRODUCT_SCHEMA_VERSION}:
-        raise ValueError(
-            "primary pair products have multiple producer implementations: "
-            f"{sorted(producer_hashes)}"
-        )
-
-
 def _load_primary_products(products: PairProductStore, primary, workers: int = 8):
     """Load (and checksum) primary products on threads, in plan order.
 
@@ -234,7 +216,7 @@ def _load_primary_products(products: PairProductStore, primary, workers: int = 8
     """
 
     def load(item):
-        return products.load(item.pair, require_current_implementation=False)
+        return products.load(item.pair)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         pending = deque()

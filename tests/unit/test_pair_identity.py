@@ -139,12 +139,3 @@ def test_matching_modules_digest_is_recorded():
         "matching code changed: bump MATCHING_VERSION in limosat/pair_identity.py if pair "
         f"products change, then record {digest.hexdigest()} in this test"
     )
-
-
-def test_compose_mixes_producer_versions_only_under_a_shared_fingerprint():
-    from limosat.compose import _check_producers
-
-    _check_producers({"a" * 64, "b" * 64}, {3})
-    _check_producers({"a" * 64}, {2})
-    with pytest.raises(ValueError, match="multiple producer implementations"):
-        _check_producers({"a" * 64, "b" * 64}, {2, 3})
