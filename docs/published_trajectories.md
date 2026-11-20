@@ -1,111 +1,84 @@
 # Published trajectory dataset
 
-**The released format is NetCDF4** (CF-1.8 trajectory files, one per processing period). One command builds it from an
-internal QC release:
-
-```bash
-python -m limosat.publish_netcdf release \
-  --source-root /path/to/internal/release \        # <period>/<period>_qc.parquet + manifest
-  --catalog-dir /path/to/image_catalogs \
-  --output-dir /path/to/staging/limosat_v1 \
-  --release-id limosat_v1 \
-  --metadata netcdf_metadata.json                  # title, creators, licence, acknowledgement; optional
-```
-
-It writes the validated point table (described below) into a private Parquet scratch folder next to the output, writes the
-NetCDF files from it, validates both steps value by value (NetCDF against the Parquet point table against the source links), removes
-the scratch folder (`--keep-parquet` keeps it) and writes `<output>.provenance.json` beside the output folder. The released
-folder contains the ten `limosat_<period>.nc` files and `manifest.json`; the README is written by hand. The Parquet point
-table is an intermediate and is not released. The NetCDF layout is documented in the `limosat.publish_netcdf` module docstring and in the
-release README; the sections below describe the point table that both formats carry.
-
-`limosat.publish` converts the internal database outputs of a release into the public LiMOSAT trajectory
-dataset (schema 2): a format fit for public use that leaves out everything an ordinary data user does not
-need (internal ids and row numbers, quality-control bookkeeping, removed links, raw points, local paths).
-It reads each period's internal kept-link Parquet and its manifest plus the period's image catalogue, and
-never scores, filters or alters a link. Keep it independent of `limosat.qc`: the public format is a stable
-contract, while the internal files may change.
-
-The result is one Parquet point table per processing period (one row per observation, sorted by time, with
-the Sentinel-1 scene name and an `is_primary` flag for the period's own date window), plus a manifest. The README
-(column definitions, flags, attribution) is written by hand and kept with the deposit, not generated.
-
-## Format
-
-One Parquet file per processing period, `limosat_<period>.parquet`, flat in the output folder, and:
-
-- `manifest.json`: schema version, release id, column definitions, flag bits, the primary window of every
-  period, and per file the checksum, size, row, trajectory and displacement counts, time and spatial bounds.
-
-A row is one **observation** of a feature in one Sentinel-1 scene, carrying the displacement from the previous observation.
-A trajectory is the rows with one `trajectory_id` (unique within a period) ordered by `point_index`; the first
-row has `point_index` 0 and null displacement columns. Rows are sorted by `time`, with time-ordered row groups so
-date queries read few row groups.
-
-| Column | Meaning |
-| --- | --- |
-| `period`, `trajectory_id`, `point_index` | identity; use (`period`, `trajectory_id`) across periods |
-| `time`, `scene` | UTC acquisition time and Sentinel-1 product name of the scene |
-| `x_m`, `y_m` | EPSG:3413 position in metres |
-| `dx_m`, `dy_m`, `speed_m_per_day` | displacement from the previous row of the trajectory |
-| `interpolated`, `correlation`, `direct_match_share`, `quality_flags` | properties of the arriving displacement |
-| `is_primary` | the row lies in the period's own date window |
-
-The full definitions, flag bits and the explanation of `is_primary` are in the generated data dictionary.
-
-### Overlapping periods and `is_primary`
-
-Periods are 15 months long and overlap their neighbours by three months. All rows are published. Rule
-`limosat_release_august_annual_v1` gives each displacement to one period by its start time: a period owns start times
-from 1 August of its first year up to 1 August of the next, the first period also owning its first three
-months. `is_primary` is true on rows in that window (for a trajectory's first row, its own time; otherwise the
-start time of the arriving displacement). Keep `is_primary` rows of all periods to use each date once.
-
-## Scene names
-
-The scene name comes from the period's image catalogue (`<period>_image_catalog_*.json`, written by
-`limosat.catalog`, which numbers images by acquisition time then file name). `publish` checks that every image
-id exists in the catalogue and that its time equals the observation time, so a wrong catalogue fails the build.
+`limosat.publish` converts the internal database outputs of a release into the public LiMOSAT trajectory dataset
+(schema 2): CF-1.8 trajectory files in NetCDF4, one per processing period, fit for public use and leaving out everything an
+ordinary data user does not need (internal ids and row numbers, quality-control bookkeeping, removed links, raw points, local
+paths). It reads each period's internal kept-link Parquet (`<period>/<period>_qc.parquet`) and its manifest plus the period's
+image catalogue, and never scores, filters or alters a link. Keep it independent of `limosat.qc`: the public format is a
+stable contract, while the internal files may change. The QC SQLite files are not used.
 
 ## Build and validate
 
-Use the LiMOSAT Conda environment from `environment.yaml`, which includes PyArrow:
+Use the LiMOSAT Conda environment from `environment.yaml` (it includes PyArrow, netCDF4 and pyproj):
 
 ```bash
 python -m limosat.publish build \
   --source-root /path/to/internal/release \        # <period>/<period>_qc.parquet + manifest
   --catalog-dir /path/to/image_catalogs \
-  --output-dir /path/to/staging/public_v2 \
-  --release-id <public release id>
+  --output-dir /path/to/staging/limosat_v1 \
+  --release-id limosat_v1 \
+  --metadata netcdf_metadata.json                  # title, summary, creators (ORCID), licence, acknowledgement; optional
 ```
 
-`--period YYYYMM_YYYYMM` (repeatable) builds selected periods; `--overwrite` replaces existing files;
-`--skip-source-checksum` skips hashing the sources against their manifests. The build streams month by month
-(about 3 GB of memory for a 52-million-link period) and checks that the row count equals displacements plus
-trajectories and that the number of primary displacements equals the number of source links starting in the window.
+`build` writes the files, `manifest.json`, and then validates them (`--no-validate` skips that). `--period YYYYMM_YYYYMM`
+(repeatable) builds selected periods; `--overwrite` replaces existing files; `--skip-source-checksum` skips hashing the
+sources against their manifests. The source is read month by month and checks that the observation count equals
+displacements plus trajectories and that the number of primary displacements equals the number of source links starting in
+the window. A 55-million-observation period needs about 8 GB of memory and a few minutes.
 
-Internal provenance (source paths, checksums, protocol ids) is written next to, not inside, the output folder
-as `<output-dir>.provenance.json`. Do not publish it. Public outputs contain no local paths.
+Internal provenance (source paths, checksums, protocol ids) is written next to, not inside, the output folder as
+`<output-dir>.provenance.json`. Do not publish it. The files carry no local paths. The README of a release is written by hand.
 
 ```bash
 python -m limosat.publish validate --source-root ... --catalog-dir ... --output-dir ... --sample-modulus 50
 ```
 
-`validate` re-checks checksums, schema, time order, `point_index`, and the manifest counts for every file,
-and compares every Nth trajectory (default 50, 1 checks all) with the source links: positions, displacement values,
-quality flags, scenes, chain continuity and `is_primary`.
+`validate` re-checks checksums, global attributes, the layout (`rowsize` total, unique ids, `point_index`, start-time order,
+`time_start`/`time_end`, flag masks) and the manifest counts for every file, and compares every Nth trajectory (default 50, 1
+checks all) with the source links: positions, displacement values, quality flags, scenes, chain continuity and `is_primary`.
+
+## File layout
+
+One file per processing period, `limosat_<period>.nc`, flat in the output folder, and `manifest.json` (schema version,
+release id, column definitions, flag bits, the primary window of every period, and per file the checksum, size, observation,
+trajectory and displacement counts, time and spatial bounds, compression and layout).
+
+A file is a CF *trajectory* featureType in the contiguous ragged array representation (CF 9.3.3):
+
+- dimensions `trajectory`, `obs` and `scene`; `rowsize(trajectory)` (`sample_dimension = "obs"`) is the number of observations of
+  each trajectory, so trajectory *i* is `obs[offset[i] : offset[i] + rowsize[i]]` of every `obs` variable;
+- trajectories are ordered by start time (`time_start`, ascending) and the observations of a trajectory by `point_index`
+  (0 at the first observation), so a date window reads as a few contiguous runs and one trajectory is a single slice;
+- `trajectory_id` (unique within a period, `cf_role`), `time_start`, `time_end` on the trajectory dimension;
+- on the observation dimension: `time` (float64 seconds since 1970-01-01), `lat`/`lon` (WGS 84, computed from the positions),
+  `x_m`/`y_m` (EPSG:3413 metres, grid mapping `crs`), `point_index`, `dx_m`, `dy_m`, `speed_m_per_day`, `interpolated`,
+  `correlation`, `direct_match_share`, `quality_flags` (`flag_masks`/`flag_meanings`), `is_primary`, `scene_index`;
+- `scene_name(scene)`: the Sentinel-1 product name of every scene, looked up with `scene_index`;
+- the displacement variables describe the step from the previous observation and are missing (`_FillValue`: NaN, -1 for
+  `interpolated`, 255 for `quality_flags`) on a trajectory's first observation.
+
+Nothing is rounded or packed: values are the internal float64/float32 numbers, and compression is lossless (zlib level 4 with
+shuffle, 65,536-observation chunks). The global attributes follow CF and ACDD (title, summary, creators with ORCID, licence,
+time coverage, bounds, release id, schema version, primary window and rule, counts).
+
+`is_primary` marks the observations whose arriving displacement starts in the period's own half-open window (a period owns start
+times from 1 August of its first year to 1 August of the next; the first period also owns its first three months). Selecting
+`is_primary` observations from all periods gives every date once; all observations of the three-month overlaps are published.
+
+## Scene names
+
+The scene name comes from the period's image catalogue (`<period>_image_catalog_*.json`, written by `limosat.catalog`, which
+numbers images by acquisition time then file name). `publish` checks that every image id exists in the catalogue and that its
+time equals the observation time, so a wrong catalogue fails the build.
 
 ## Reader examples
 
 ```python
-import pandas as pd
-frame = pd.read_parquet("limosat_202305_202407.parquet")
-once = frame[frame.is_primary]                       # each date once across periods
-trajectory = frame[(frame.trajectory_id == 401)].sort_values("point_index")
+import numpy as np, xarray as xr
+ds = xr.open_dataset("limosat_202305_202407.nc")               # lazy; dims trajectory, obs, scene
+january = (ds.time >= np.datetime64("2024-01-01")) & (ds.time < np.datetime64("2024-02-01")) & (ds.is_primary == 1)
+x = ds["x_m"].isel(obs=january.values)
 ```
 
-```sql
--- DuckDB
-SELECT date_trunc('month', time) AS month, avg(speed_m_per_day)
-FROM read_parquet('limosat_*.parquet') WHERE is_primary AND point_index > 0 GROUP BY 1;
-```
+For date and space-time windows, whole trajectories, displacements with both ends, flag filters and column selection use
+the `limosat-analysis` package (`open_limosat("limosat_<period>.nc")`).

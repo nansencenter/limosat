@@ -7,6 +7,8 @@ import pytest
 
 pa = pytest.importorskip("pyarrow")
 pq = pytest.importorskip("pyarrow.parquet")
+netCDF4 = pytest.importorskip("netCDF4")
+pytest.importorskip("pyproj")
 
 from limosat import publish  # noqa: E402
 
@@ -104,9 +106,34 @@ def make_release(tmp_path, links=LINKS, manifest=None, drop=(), shift=None):
     return tmp_path / "source", tmp_path / "catalogs", tmp_path / "out"
 
 
+METADATA = {"creators": [{"name": "Chua, Sean Minhui Tashi", "affiliation": "NERSC", "orcid": "0000-0002-8462-3170"}],
+            "license": "CC-BY-4.0"}
+
+
 def build(tmp_path, **kwargs):
     source, catalogs, out = make_release(tmp_path, **kwargs)
-    return publish.build(source, catalogs, out, "test-release"), source, catalogs, out
+    return publish.build(source, catalogs, out, "test-release", metadata=METADATA, sample_modulus=1), source, catalogs, out
+
+
+def read_rows(out):
+    """The observations of a NetCDF release as dicts, sorted by (time, trajectory, point_index); nulls are None."""
+    d = netCDF4.Dataset(out / f"limosat_{PERIOD}.nc")
+    d.set_auto_maskandscale(False)
+    rowsize = d["rowsize"][:]
+    tid = np.repeat(d["trajectory_id"][:], rowsize)
+    names = [str(n) for n in d["scene_name"][:]]  # char array with _Encoding: read as strings
+    rows = []
+    for i in range(len(tid)):
+        interp, flags = int(d["interpolated"][i]), int(d["quality_flags"][i])
+        nan = lambda name: None if np.isnan(d[name][i]) else float(d[name][i])
+        rows.append(dict(
+            trajectory_id=int(tid[i]), point_index=int(d["point_index"][i]), time=datetime.fromtimestamp(float(d["time"][i]), timezone.utc),
+            scene=names[int(d["scene_index"][i])], x_m=float(d["x_m"][i]), y_m=float(d["y_m"][i]), lon=float(d["lon"][i]), lat=float(d["lat"][i]),
+            dx_m=nan("dx_m"), dy_m=nan("dy_m"), speed_m_per_day=nan("speed_m_per_day"), correlation=nan("correlation"),
+            direct_match_share=nan("direct_match_share"), interpolated=None if interp == -1 else bool(interp),
+            quality_flags=None if flags == 255 else flags, is_primary=bool(d["is_primary"][i])))
+    d.close()
+    return sorted(rows, key=lambda r: (r["time"], r["trajectory_id"], r["point_index"]))
 
 
 def test_primary_windows_tile_the_ten_periods():
@@ -128,14 +155,13 @@ def test_primary_windows_tile_the_ten_periods():
 
 def test_point_table_rows_flags_and_order(tmp_path):
     manifest, _, _, out = build(tmp_path)
-    table = pq.read_table(out / f"limosat_{PERIOD}.parquet").to_pylist()
+    table = read_rows(out)
     keys = [(r["time"].strftime("%Y-%m-%dT%H:%M"), r["trajectory_id"], r["point_index"], r["is_primary"]) for r in table]
     assert keys == [
         ("2023-07-30T00:00", 10, 0, False), ("2023-07-31T12:00", 10, 1, False), ("2023-08-02T00:00", 10, 2, False),
         ("2023-08-04T00:00", 10, 3, True), ("2023-09-10T00:00", 11, 0, True), ("2023-09-11T00:00", 11, 1, True),
         ("2024-01-01T00:00", 11, 2, True), ("2024-01-01T00:00", 12, 0, True), ("2024-01-03T00:00", 12, 1, True),
     ]
-    assert all(r["period"] == PERIOD for r in table)
     by = {(r["trajectory_id"], r["point_index"]): r for r in table}
     assert by[(10, 0)]["scene"] == scene(1) and by[(10, 3)]["scene"] == scene(4) and by[(12, 1)]["scene"] == scene(8)
     # first observations have no displacement values
@@ -150,6 +176,7 @@ def test_point_table_rows_flags_and_order(tmp_path):
     assert step["correlation"] == pytest.approx(0.6) and step["direct_match_share"] == pytest.approx(0.3)
     assert by[(10, 1)]["speed_m_per_day"] == pytest.approx(100.0 / 1.5)
     assert by[(10, 3)]["quality_flags"] == 4
+    assert by[(10, 0)]["lat"] > 89.9  # the origin of EPSG:3413 is the pole
     # point_index counts from the trajectory's first kept observation, not from the original link index
     assert [by[(11, i)]["point_index"] for i in range(3)] == [0, 1, 2]
     assert manifest["files"][0]["rows"] == 9 and manifest["files"][0]["trajectories"] == 3
@@ -157,33 +184,44 @@ def test_point_table_rows_flags_and_order(tmp_path):
     assert manifest["files"][0]["primary_rows"] == 6 and manifest["files"][0]["scenes"] == 8
 
 
-def test_row_groups_follow_time_and_schema_metadata(tmp_path):
+def test_file_is_a_cf_contiguous_ragged_trajectory_file_ordered_by_start_time(tmp_path):
     _, _, _, out = build(tmp_path)
-    parquet = pq.ParquetFile(out / f"limosat_{PERIOD}.parquet")
-    index = parquet.schema_arrow.names.index("time")
-    ranges = []
-    for group in range(parquet.num_row_groups):
-        stats = parquet.metadata.row_group(group).column(index).statistics
-        ranges.append((stats.min, stats.max))
-    assert len(ranges) >= 3 and all(a[1] <= b[0] for a, b in zip(ranges, ranges[1:]))
-    metadata = parquet.schema_arrow.metadata
-    assert metadata[b"limosat.schema_version"] == b"2.0.0" and metadata[b"limosat.crs"] == b"EPSG:3413"
-    assert json.loads(metadata[b"limosat.flag_bits"]) == publish.FLAG_BITS
-    assert json.loads(metadata[b"limosat.primary_window"]) == {
-        "start": "2023-08-01T00:00:00Z", "stop_exclusive": "2024-08-01T00:00:00Z"}
-    assert metadata[b"limosat.release_id"] == b"test-release" and metadata[b"limosat.period"] == PERIOD.encode()
-    assert [f.name for f in parquet.schema_arrow] == list(publish.COLUMN_NAMES)
+    d = netCDF4.Dataset(out / f"limosat_{PERIOD}.nc")
+    try:
+        assert d.featureType == "trajectory" and "CF-1.8" in d.Conventions
+        assert d["trajectory_id"].cf_role == "trajectory_id"
+        assert d["rowsize"].sample_dimension == "obs" and d["rowsize"][:].sum() == d.dimensions["obs"].size
+        assert list(d["trajectory_id"][:]) == [10, 11, 12] and list(d["rowsize"][:]) == [4, 3, 2]
+        assert np.all(np.diff(d["time_start"][:]) >= 0)
+        assert d["time"].standard_name == "time" and d["lat"].units == "degrees_north" and d["lon"].units == "degrees_east"
+        assert d["x_m"].grid_mapping == "crs" and d["crs"].grid_mapping_name == "polar_stereographic" and d["crs"].epsg_code == "EPSG:3413"
+        assert list(d["quality_flags"].flag_masks) == [1, 2, 4] and d["quality_flags"].flag_meanings.split() == list(publish.FLAG_BITS)
+        assert d.schema_version == "2.0.0" and d.release_id == "test-release" and d.period == PERIOD
+        assert d.primary_window_start == "2023-08-01T00:00:00Z" and d.primary_window_stop_exclusive == "2024-08-01T00:00:00Z"
+        assert d.creator_name == "Chua, Sean Minhui Tashi" and d.creator_id == "https://orcid.org/0000-0002-8462-3170" and d.license == "CC-BY-4.0"
+        assert d["x_m"].filters()["zlib"] and d["x_m"].filters()["shuffle"]
+        assert d["scene_name"].dtype == "S1" and d["scene_name"].dimensions == ("scene", "scene_strlen")
+        for name in ("x_m", "y_m", "dx_m", "dy_m", "speed_m_per_day", "correlation", "direct_match_share", "interpolated",
+                     "quality_flags", "is_primary", "scene_index", "point_index", "lon", "lat", "time"):
+            assert d[name].dimensions == ("obs",)
+    finally:
+        d.close()
 
 
 def test_public_outputs_carry_no_local_paths_or_internal_detail(tmp_path):
     manifest, source, _, out = build(tmp_path)
     public = (out / "manifest.json").read_text()
     assert str(tmp_path) not in public and "internal_protocol" not in public and "qc_" not in public
-    assert sorted(p.name for p in out.iterdir()) == sorted(["manifest.json", f"limosat_{PERIOD}.parquet"])  # the README is written by hand
+    assert sorted(p.name for p in out.iterdir()) == sorted(["manifest.json", f"limosat_{PERIOD}.nc"])  # the README is written by hand
+    d = netCDF4.Dataset(out / f"limosat_{PERIOD}.nc")
+    attributes = json.dumps({k: str(d.getncattr(k)) for k in d.ncattrs()})
+    d.close()
+    assert str(tmp_path) not in attributes and "internal_protocol" not in attributes
     sidecar = json.loads((tmp_path / "out.provenance.json").read_text())
     assert sidecar["periods"][PERIOD]["protocol_id"] == "internal_protocol"
     assert str(source) in sidecar["source_root"] and not (out / "out.provenance.json").exists()
     assert manifest["totals"] == {"rows": 9, "trajectories": 3, "displacements": 6, "primary_rows": 6, "primary_displacements": 4}
+    assert manifest["format"] == publish.FORMAT
 
 
 def test_validate_checks_every_trajectory_against_the_source(tmp_path):
@@ -202,17 +240,30 @@ def test_validate_checks_every_trajectory_against_the_source(tmp_path):
 
 def test_validate_detects_a_modified_output(tmp_path):
     _, source, catalogs, out = build(tmp_path)
-    path = out / f"limosat_{PERIOD}.parquet"
+    path = out / f"limosat_{PERIOD}.nc"
     path.write_bytes(path.read_bytes() + b"x")
     with pytest.raises(ValueError, match="checksum"):
         publish.validate(source, catalogs, out)
+
+
+def test_validate_detects_a_changed_value_even_when_the_manifest_is_updated(tmp_path):
+    _, source, catalogs, out = build(tmp_path)
+    path = out / f"limosat_{PERIOD}.nc"
+    d = netCDF4.Dataset(path, "a")
+    d["x_m"][0] = d["x_m"][0] + 1.0
+    d.close()
+    manifest = json.loads((out / "manifest.json").read_text())
+    manifest["files"][0]["sha256"], manifest["files"][0]["bytes"] = publish.sha256(path), path.stat().st_size
+    (out / "manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="differ from the source"):
+        publish.validate(source, catalogs, out, sample_modulus=1)
 
 
 def test_catalogue_problems_are_rejected(tmp_path):
     source, catalogs, out = make_release(tmp_path / "a", drop=(4,))
     with pytest.raises(ValueError, match="not in catalogue"):
         publish.build(source, catalogs, out, "test-release")
-    assert not list(out.glob("*.parquet*"))  # nothing partial is left behind
+    assert not list(out.glob("*.nc*"))  # nothing partial is left behind
     source, catalogs, out = make_release(tmp_path / "b", shift=3)
     with pytest.raises(ValueError, match="different from their catalogue"):
         publish.build(source, catalogs, out, "test-release")
