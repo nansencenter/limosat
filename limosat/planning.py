@@ -246,7 +246,7 @@ def _plan_source(source_index: int):
             continue
         target_footprint = footprints[target_index]
         if source_footprint is None or target_footprint is None:
-            found.append((pair, None, None, target_index - source_index - 1, None))
+            found.append((pair, None, None, target_index - source_index - 1, None, None))
             continue
         overlap_area = _overlap_area(source_footprint, target_footprint)
         overlap = _overlap_fraction(source_footprint, target_footprint, overlap_area)
@@ -262,7 +262,11 @@ def _plan_source(source_index: int):
         if not imaged.any():
             exclusions["no_planning_cells"] += 1
             continue
-        found.append((pair, overlap, overlap_area, target_index - source_index - 1, imaged))
+        edge = None
+        if config.next_observation_edge_drift_m_per_day is not None:
+            margin = config.next_observation_edge_drift_m_per_day * elapsed / 86_400.0
+            edge = imaged & ~_imaged_mask(source_footprint, target_footprint.buffer(-margin), grid)
+        found.append((pair, overlap, overlap_area, target_index - source_index - 1, imaged, edge))
 
     if config.candidate_pair_ids:
         primary = {item[0].pair_id for item in found}
@@ -272,7 +276,7 @@ def _plan_source(source_index: int):
             found, config.next_observation_minimum_cells, config.next_observation_backup_after_hours,
         )
     return (
-        [(pair, overlap, area, skipped, pair.pair_id in primary) for pair, overlap, area, skipped, _mask in found],
+        [(pair, overlap, area, skipped, pair.pair_id in primary) for pair, overlap, area, skipped, _mask, _edge in found],
         exclusions,
         selection,
     )
@@ -401,7 +405,7 @@ def _next_observation_selection(found, minimum_cells: int, backup_after_hours: f
     backup_seconds = None if backup_after_hours is None else backup_after_hours * 3_600.0
     need = np.logical_or.reduce([item[4] for item in items])
     waiting = np.zeros_like(need)
-    for pair, _overlap, _area, _skipped, cells in items:
+    for pair, _overlap, _area, _skipped, cells, edge in items:
         first = cells & need
         second = cells & waiting
         n_first, n_second = int(first.sum()), int(second.sum())
@@ -416,5 +420,7 @@ def _next_observation_selection(found, minimum_cells: int, backup_after_hours: f
         waiting &= ~cells
         if backup_seconds is not None and pair.elapsed_seconds > backup_seconds:
             waiting |= first
+        elif edge is not None:
+            waiting |= first & edge          # may drift out of the target before it is acquired
     counts["next_observation_cells_without_pair"] = int(need.sum())
     return kept_ids, counts

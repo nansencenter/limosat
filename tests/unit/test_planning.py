@@ -226,3 +226,16 @@ def test_parallel_planning_matches_serial():
     parallel = build_candidate_plan(ImageCatalogue(images), RoutingConfig(next_observation_backup_after_hours=10.0), workers=3)
     assert [(p.pair.pair_id, p.selection, p.ordinal) for p in serial.pairs] == [(p.pair.pair_id, p.selection, p.ordinal) for p in parallel.pairs]
     assert serial.exclusion_counts == parallel.exclusion_counts
+
+
+def test_edge_cells_get_a_backup_when_they_may_drift_out():
+    # B covers A's west half only; ice near B's eastern edge may drift out before B is
+    # acquired (6 h later), so those cells also wait for C.
+    a = _image("a", 0.0, "a", box(0, 0, 100_000, 40_000))
+    b = _image("b", 0.25, "b", box(0, 0, 52_000, 40_000))
+    c = _image("c", 0.5, "c", box(0, 0, 100_000, 40_000))
+    plain = build_candidate_plan(ImageCatalogue([a, b, c]), RoutingConfig())
+    edged = build_candidate_plan(ImageCatalogue([a, b, c]), RoutingConfig(next_observation_edge_drift_m_per_day=40_000.0))
+    assert plain.exclusion_counts["next_observation_assigned_cells"] < edged.exclusion_counts["next_observation_assigned_cells"]
+    with pytest.raises(ValueError, match="edge_drift"):
+        RoutingConfig(next_observation_edge_drift_m_per_day=0.0)

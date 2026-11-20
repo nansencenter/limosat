@@ -80,7 +80,7 @@ EXCLUDED_SETTINGS = {
         "candidate_maximum_elapsed_hours", "candidate_minimum_overlap_fraction",
         "candidate_minimum_overlap_area_m2", "exclude_same_acquisition_pass",
         "require_orbit_metadata", "candidate_pair_ids", "next_observation_minimum_cells",
-        "next_observation_backup_after_hours", "plan_surface_cells",
+        "next_observation_backup_after_hours", "next_observation_edge_drift_m_per_day", "plan_surface_cells",
     ),
     "open_water": ("sic_root",),
     "surface": (

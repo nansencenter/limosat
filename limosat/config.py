@@ -236,8 +236,12 @@ class RoutingConfig:
     # observation as a backup (production: 30 h). plan_surface_cells drops cells that the
     # surface gate excludes at the source time (land >= land_minimum_inland_km inland,
     # point open water) before planning (production: on).
+    # next_observation_edge_drift_m_per_day: cells closer to the target footprint's edge than
+    # this speed times the interval may drift out of the target before it is acquired; they
+    # keep the pair but also get the following observation as a backup (None: off).
     next_observation_minimum_cells: int = 25
     next_observation_backup_after_hours: float | None = None
+    next_observation_edge_drift_m_per_day: float | None = None
     plan_surface_cells: bool = False
 
     def __post_init__(self) -> None:
@@ -251,6 +255,10 @@ class RoutingConfig:
             0 < self.next_observation_backup_after_hours < float("inf")
         ):
             raise ValueError("next_observation_backup_after_hours must be positive")
+        if self.next_observation_edge_drift_m_per_day is not None and not (
+            0 < self.next_observation_edge_drift_m_per_day < float("inf")
+        ):
+            raise ValueError("next_observation_edge_drift_m_per_day must be positive")
         if not isinstance(self.plan_surface_cells, bool):
             raise ValueError("plan_surface_cells must be a boolean")
         if not 0 < self.planning_grid_spacing_m < float("inf"):
