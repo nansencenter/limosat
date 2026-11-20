@@ -179,6 +179,22 @@ def sample_edge(
     )
 
 
+def _valid_targets(values: PairSamples, source_positions, target_validity) -> PairSamples:
+    """Keep the samples whose endpoint is valid in the target image."""
+    if not values.identities:
+        return values
+    start = np.vstack([source_positions[identity] for identity in values.identities])
+    valid = np.asarray(target_validity(start + values.displacement_m), dtype=bool)
+    if valid.shape != (len(values.identities),):
+        raise ValueError("target validity must return one flag per endpoint")
+    keep = np.flatnonzero(valid)
+    return PairSamples(
+        values.pair_id, tuple(values.identities[i] for i in keep), values.displacement_m[keep],
+        values.selected_matches[keep], values.support_radius_m[keep], values.maximum_residual_m[keep],
+        values.product,
+    )
+
+
 def _choose(
     samples: Sequence[tuple[int, datetime, PairSamples, FieldEdge | None]],
     excluded: set[str] | frozenset[str] = frozenset(),
@@ -216,13 +232,9 @@ def iter_global_trajectory_batches(
     """Compose in-memory pair fields (see ``compose_batches``), sampling each pair in this
     process as soon as its source image is complete."""
     by_id = {edge.field.pair_id: edge for edge in edges}
-    ordered = tuple(sorted(images, key=lambda image: (image.time_utc, image.image_id)))
-    validity: dict[int, TargetValidity | None] = {}
 
     def submit(pair_id, identities, queries, target_step):
-        if target_validity_factory is not None and target_step not in validity and len(identities):
-            validity[target_step] = target_validity_factory(ordered[target_step])
-        return _Done(sample_edge(by_id[pair_id], identities, queries, field_config, validity.get(target_step)))
+        return _Done(sample_edge(by_id[pair_id], identities, queries, field_config))
 
     def nodes(pair_id):
         field = by_id[pair_id].field
@@ -234,6 +246,7 @@ def iter_global_trajectory_batches(
         for edge in edges
     ]
     yield from compose_batches(specs, images, trajectory_config, nodes=nodes, submit=submit,
+                               target_validity_factory=target_validity_factory,
                                seed_filter_factory=seed_filter_factory, edges=by_id)
 
 
@@ -254,6 +267,7 @@ def compose_batches(
     *,
     nodes: Callable[[str], np.ndarray],
     submit: Callable[[str, tuple[str, ...], np.ndarray, int], object],
+    target_validity_factory: TargetValidityFactory | None = None,
     seed_filter_factory: SeedFilterFactory | None = None,
     edges: dict[str, FieldEdge] | None = None,
 ) -> Iterator[TrajectoryBatch]:
@@ -268,6 +282,8 @@ def compose_batches(
     target_step)``, which returns a future of the pair's ``PairSamples`` at those
     positions; the futures are collected when the pair's target image is composed. So
     sampling can run in other processes, ahead of the sequential choice of continuations.
+    Target validity (endpoints on valid target pixels, not land or open water) is applied
+    here, once per target image, since its rasters are large.
     ``nodes(pair_id)`` gives a pair's field nodes with a displacement (new seeds).
     """
     ordered_images = tuple(
@@ -316,6 +332,13 @@ def compose_batches(
                  edges.get(spec.pair_id) if edges else None)
                 for source_step, _target_step, spec in incoming_by_target.get(step, ())
             ]
+            if target_validity_factory is not None and any(values.identities for _s, _t, values, _e in samples):
+                target_validity = target_validity_factory(image)
+                samples = [
+                    (source_step, source_time,
+                     _valid_targets(values, positions[source_step], target_validity), edge)
+                    for source_step, source_time, values, edge in samples
+                ]
             chosen = _choose(samples, merged)
             for identity in sorted(chosen):
                 continuation = chosen[identity]

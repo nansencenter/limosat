@@ -60,7 +60,6 @@ def compose_primary_parquet(
     # (a missing one raises when it is sampled), extra ones are ignored.
     products = PairProductStore(config)
     images = catalogue.chronological()
-    ordered_images = tuple(sorted(images, key=lambda image: (image.time_utc, image.image_id)))
     by_pair_id = {item.pair.pair_id: item for item in primary}
     specs = [
         PairSpec(item.pair.pair_id, item.pair.source.image_id, item.pair.target.image_id,
@@ -73,8 +72,7 @@ def compose_primary_parquet(
     )
     digests: dict[str, tuple[str, str, str]] = {}
     global _COMPOSE
-    _COMPOSE = {"config": config, "products": products, "pairs": by_pair_id,
-                "images": ordered_images, "validity_factory": validity_factory, "validity": {}}
+    _COMPOSE = {"config": config, "products": products, "pairs": by_pair_id}
     workers = _compose_workers()
     executor = (
         ProcessPoolExecutor(workers, mp_context=multiprocessing.get_context("fork"))
@@ -109,6 +107,7 @@ def compose_primary_parquet(
             config.trajectories,
             nodes=nodes,
             submit=_recording(submit, digests),
+            target_validity_factory=validity_factory,
             seed_filter_factory=seed_filter_factory(surface_gate(config)),
         ):
             if batch.points:
@@ -246,24 +245,16 @@ def _compose_workers() -> int:
 
 
 def _sample_pair(pair_id, identities, queries, target_step):
-    """Load and verify one pair product, sample it at its source positions with the
-    target image's validity, and return the samples with the product's checksums."""
+    """Load and verify one pair product, sample it at its source positions and return
+    the samples with the product's checksums (target validity is applied by the caller)."""
     state = _COMPOSE
     config = state["config"]
     item = state["pairs"][pair_id]
     product = state["products"].load(item.pair)
     if product is None:
         raise RuntimeError(f"primary pair product is missing: {pair_id}")
-    validity = None
-    if len(identities):
-        cache = state["validity"]
-        if target_step not in cache:
-            if len(cache) > 8:
-                cache.pop(next(iter(cache)))
-            cache[target_step] = state["validity_factory"](state["images"][target_step])
-        validity = cache[target_step]
     edge = field_edge_with_fallback(product.result.field, product.result.matches, config.field)
-    samples = sample_edge(edge, identities, queries, config.field, validity)
+    samples = sample_edge(edge, identities, queries, config.field)
     return replace(samples, product=(product.sha256, product.content_sha256,
                                      product.producer_implementation_sha256))
 
