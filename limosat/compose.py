@@ -17,7 +17,7 @@ from .imagery import pass_pixel_validity_factory
 from .surface import seed_filter_factory, surface_gate, surface_validity_factory
 from .models import FieldEdge
 from .pair_products import PAIR_PRODUCT_SCHEMA_VERSION, PairProductStore
-from .planning import run_plan, recovery_candidates
+from .planning import assigned_positions, run_plan, recovery_candidates
 from .qc import QC_PROTOCOL_ID, ExtensionQCConfig, ScoredExtension, score_extensions
 from .recovery import (
     RecoveryTargetStore,
@@ -74,7 +74,7 @@ def compose_primary_parquet(
     producer_hashes: set[str] = set()
     schemas: set[int] = set()
     product_set = hashlib.sha256()
-    for item, product in zip(primary, _load_primary_products(products, primary)):
+    for item, product in zip(primary, _load_primary_products(products, primary, plan=plan)):
         if product is None:
             raise RuntimeError(f"primary pair product is missing: {item.pair.pair_id}")
         producer_hashes.add(product.producer_implementation_sha256)
@@ -302,7 +302,7 @@ def compose_recovery_parquet(
     recovery_schemas: set[int] = set()
     recovery_product_set = hashlib.sha256()
     target_set = hashlib.sha256()
-    for item, product in zip(primary, _load_primary_products(products, primary)):
+    for item, product in zip(primary, _load_primary_products(products, primary, plan=plan)):
         if product is None:
             raise RuntimeError(f"primary pair product is missing: {item.pair.pair_id}")
         primary_producers.add(product.producer_implementation_sha256)
@@ -489,15 +489,23 @@ def _check_producers(producer_hashes: set[str], schemas: set[int], kind: str = "
         )
 
 
-def _load_primary_products(products: PairProductStore, primary, workers: int = 8):
+def _load_primary_products(products: PairProductStore, primary, workers: int = 8, plan=None):
     """Load (and checksum) primary products on threads, in plan order.
 
     At most twice ``workers`` products are held at once, since each carries its
-    full match arrays.
+    full match arrays. With ``routing.primary_tiles == "assigned"`` the products are
+    targeted at the plan's assigned cells.
     """
+    config = products.config
+    targeted = config.routing.primary_tiles == "assigned"
+
     def load(item):
+        positions = (
+            assigned_positions(plan, item.pair.pair_id, config.routing.planning_grid_spacing_m)
+            if targeted else None
+        )
         return products.load(
-            item.pair, "primary", False, require_current_implementation=False
+            item.pair, "primary", False, positions, require_current_implementation=False
         )
 
     with ThreadPoolExecutor(max_workers=workers) as pool:

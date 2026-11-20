@@ -353,3 +353,31 @@ def test_next_observation_settings_keep_identity_at_defaults():
         RoutingConfig(primary_selection="next_observation", source_coverage_completion=True)
     with pytest.raises(ValueError, match="plan_surface_cells"):
         RunConfig("run", "catalogue", "database", "output", routing=RoutingConfig(plan_surface_cells=True))
+
+
+def test_next_observation_records_assigned_cells_for_targeted_tiles():
+    from limosat.planning import assigned_positions
+    a = _image("a", 0.0, "a", box(0, 0, 100_000, 40_000))
+    b = _image("b", 0.25, "b", box(0, 0, 50_000, 40_000))
+    c = _image("c", 0.5, "c", box(0, 0, 100_000, 40_000))
+    plan = build_candidate_plan(ImageCatalogue([a, b, c]), RoutingConfig(
+        primary_selection="next_observation", primary_tiles="assigned"))
+    assert plan.assigned_cells is not None
+    west = assigned_positions(plan, "a__b", 4_000.0)
+    east = assigned_positions(plan, "a__c", 4_000.0)
+    assert len(west) and len(east)
+    assert west[:, 0].max() <= 50_000 and east[:, 0].min() >= 48_000   # A->C only for A's east
+    assert not ({tuple(p) for p in west} & {tuple(p) for p in east})
+    with pytest.raises(ValueError, match="primary_tiles"):
+        RoutingConfig(primary_tiles="assigned")
+
+
+def test_assigned_tiles_change_matching_identity_only_when_set():
+    from dataclasses import replace
+    from limosat.config import RunConfig
+    from limosat.pair_identity import matching_sha256
+    base = RunConfig("run", "catalogue", "database", "output")
+    nextobs = replace(base, routing=RoutingConfig(primary_selection="next_observation"))
+    assigned = replace(base, routing=RoutingConfig(primary_selection="next_observation", primary_tiles="assigned"))
+    assert matching_sha256(nextobs) == matching_sha256(base)
+    assert matching_sha256(assigned) != matching_sha256(base)

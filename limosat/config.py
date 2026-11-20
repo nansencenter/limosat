@@ -273,8 +273,19 @@ class RoutingConfig:
     # "drift_prior" routing hypothesis translated by it and keeps the best hypothesis.
     # Empty (default) changes nothing.
     prior_displacement_file: str = ""
+    # Which tiles a primary pair matches. "all": every tile of the pair's overlap (default).
+    # "assigned" (next_observation selection only): only around the source cells for which
+    # the pair is the next observation or a backup (targeted_selection_buffer_m around each
+    # 4 km cell centre); other cells of the overlap are carried by an earlier pair, so
+    # matching them again is never used by composition. Products are then partial and get
+    # their own matching fingerprint.
+    primary_tiles: Literal["all", "assigned"] = "all"
 
     def __post_init__(self) -> None:
+        if self.primary_tiles not in ("all", "assigned"):
+            raise ValueError("primary_tiles must be all or assigned")
+        if self.primary_tiles == "assigned" and self.primary_selection != "next_observation":
+            raise ValueError("primary_tiles=assigned requires primary_selection=next_observation")
         if self.primary_selection not in ("target_coverage", "next_observation"):
             raise ValueError("primary_selection must be target_coverage or next_observation")
         if (
@@ -661,6 +672,7 @@ _PLANNING_DEFAULTS = {
     "next_observation_backup_after_hours": None,
     "plan_surface_cells": False,
     "prior_displacement_file": "",
+    "primary_tiles": "all",
 }
 
 

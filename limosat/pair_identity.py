@@ -83,7 +83,7 @@ EXCLUDED_SETTINGS = {
         "source_coverage_completion", "source_coverage_minimum_cells",
         "primary_selection", "next_observation_minimum_cells",
         "next_observation_backup_after_hours", "plan_surface_cells",
-        "prior_displacement_file",
+        "prior_displacement_file", "primary_tiles",
     ),
     "open_water": ("sic_root",),
     "surface": (
@@ -102,6 +102,10 @@ def matching_settings(config) -> dict:
     if not config.surface.land_raster:
         # Without a land raster the inland distance threshold has no effect.
         settings["surface"] = {}
+    if config.routing.primary_tiles != "all":
+        # Partial primary products (assigned tiles only) must never mix with full ones;
+        # only present when set, so full products keep their identity.
+        settings["routing"]["primary_tiles"] = config.routing.primary_tiles
     return json.loads(json.dumps(settings))
 
 
