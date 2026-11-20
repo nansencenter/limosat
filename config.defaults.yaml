@@ -60,7 +60,9 @@ routing:
   candidate_minimum_overlap_area_m2: 1024000000.0
   exclude_same_acquisition_pass: true
   require_orbit_metadata: false
-  primary_maximum_pairs_per_target: null
+  next_observation_minimum_cells: 25
+  next_observation_backup_after_hours: 30.0  # production; null: no backups
+  plan_surface_cells: false  # production: true (needs a surface source)
   candidate_pair_ids: []
 
 open_water:

@@ -228,7 +228,6 @@ class RoutingConfig:
     candidate_minimum_overlap_area_m2: float = 1_024_000_000.0
     exclude_same_acquisition_pass: bool = True
     require_orbit_metadata: bool = False
-    primary_maximum_pairs_per_target: int | None = None
     candidate_pair_ids: tuple[str, ...] = ()
     coarse_matching: bool = True
     coarse_pixel_size_m: float = 320.0
@@ -244,34 +243,21 @@ class RoutingConfig:
     # 45% fewer matcher tiles than no check.
     recovery_minimum_target_valid_fraction: float = 0.3
     recovery_target_valid_window_m: float = 31_000.0
-    # Source-side completion of the primary plan (off by default; planning.py
-    # _complete_source_coverage). The per-target selection keeps, for each target cell,
-    # only the most recent earlier image, assuming the ice was carried into it; when that
-    # step was not planned, a source image's ice has no pair forward and its tracks end
-    # (75-91 % of losses in the January-April 2020 hotspots). With completion, each
-    # source image's planning cells that a later candidate target images but no selected
-    # pair from it reaches get the shortest candidate pair covering most of them, until
-    # fewer than source_coverage_minimum_cells would be added.
-    source_coverage_completion: bool = False
-    source_coverage_minimum_cells: int = 25
-    # Next-observation primary selection (planning.py _next_observation_selection), an
-    # alternative to the per-target selection and its completion. Each source image's
-    # planning cells (4 km, imaged by both images, no drift allowance) go to the earliest
-    # later candidate image that images them, so every piece of ice is carried to its next
-    # observation and composition chains the steps. A pair is kept when it is the next
-    # observation for at least next_observation_minimum_cells cells. Cells whose next
-    # observation is more than next_observation_backup_after_hours away (longer pairs
-    # fail more often, mostly in fast drift) also get the following observation as a
-    # backup. plan_surface_cells drops cells that the surface gate excludes at the source
-    # time (land >= land_minimum_inland_km inland, point open water) before planning.
-    primary_selection: Literal["target_coverage", "next_observation"] = "target_coverage"
+    # Next-observation primary selection (planning.py _next_observation_selection). Each
+    # source image's planning cells (4 km, imaged by both images, no drift allowance) go
+    # to the earliest later candidate image that images them, so every piece of ice is
+    # carried to its next observation and composition chains the steps. A pair is kept
+    # when it is the next observation for at least next_observation_minimum_cells cells.
+    # Cells whose next observation is more than next_observation_backup_after_hours away
+    # (longer pairs fail more often, mostly in fast drift) also get the following
+    # observation as a backup (production: 30 h). plan_surface_cells drops cells that the
+    # surface gate excludes at the source time (land >= land_minimum_inland_km inland,
+    # point open water) before planning (production: on).
     next_observation_minimum_cells: int = 25
     next_observation_backup_after_hours: float | None = None
     plan_surface_cells: bool = False
 
     def __post_init__(self) -> None:
-        if self.primary_selection not in ("target_coverage", "next_observation"):
-            raise ValueError("primary_selection must be target_coverage or next_observation")
         if (
             isinstance(self.next_observation_minimum_cells, bool)
             or not isinstance(self.next_observation_minimum_cells, int)
@@ -284,16 +270,6 @@ class RoutingConfig:
             raise ValueError("next_observation_backup_after_hours must be positive")
         if not isinstance(self.plan_surface_cells, bool):
             raise ValueError("plan_surface_cells must be a boolean")
-        if self.primary_selection == "next_observation" and self.source_coverage_completion:
-            raise ValueError("source_coverage_completion applies to the target_coverage selection only")
-        if not isinstance(self.source_coverage_completion, bool):
-            raise ValueError("source_coverage_completion must be a boolean")
-        if (
-            isinstance(self.source_coverage_minimum_cells, bool)
-            or not isinstance(self.source_coverage_minimum_cells, int)
-            or self.source_coverage_minimum_cells < 1
-        ):
-            raise ValueError("source_coverage_minimum_cells must be a positive integer")
         if not 0 < self.planning_grid_spacing_m < float("inf"):
             raise ValueError("planning_grid_spacing_m must be finite and positive")
         if not isinstance(self.coarse_matching, bool):
@@ -344,19 +320,6 @@ class RoutingConfig:
             )
         if self.candidate_minimum_overlap_area_m2 < 0:
             raise ValueError("candidate_minimum_overlap_area_m2 cannot be negative")
-        if (
-            self.primary_maximum_pairs_per_target is not None
-            and self.primary_maximum_pairs_per_target < 1
-        ):
-            raise ValueError("primary_maximum_pairs_per_target must be positive")
-        if (
-            self.primary_maximum_pairs_per_target is not None
-            and self.candidate_pair_ids
-        ):
-            raise ValueError(
-                "primary_maximum_pairs_per_target cannot be combined with "
-                "candidate_pair_ids"
-            )
         object.__setattr__(
             self,
             "candidate_pair_ids",
@@ -550,11 +513,6 @@ class RunConfig:
         if self.routing.coarse_window_stride == 1:
             # Preserve the identity of configurations with one coarse window per tile.
             values["routing"].pop("coarse_window_stride")
-        if not self.routing.source_coverage_completion:
-            # Preserve the identity of configurations without source-side completion.
-            values["routing"].pop("source_coverage_completion")
-            values["routing"].pop("source_coverage_minimum_cells")
-        _pop_default_planning(values["routing"], self.routing)
         # Recovery target selection decides which losses a recovery pair measures, not
         # how any pair is measured, so it never enters the configuration identity
         # (pair products stay valid when the selection changes). Target manifests
@@ -661,19 +619,3 @@ def _require_positive(values: dict[str, Any]) -> None:
     invalid = [name for name, value in values.items() if float(value) <= 0]
     if invalid:
         raise ValueError(f"values must be positive: {invalid}")
-
-
-_PLANNING_DEFAULTS = {
-    "primary_selection": "target_coverage",
-    "next_observation_minimum_cells": 25,
-    "next_observation_backup_after_hours": None,
-    "plan_surface_cells": False,
-}
-
-
-def _pop_default_planning(values: dict, routing: RoutingConfig) -> None:
-    """Drop next-observation planning settings at their defaults, so configurations
-    made before they existed keep their identity and plan cache key."""
-    for name, default in _PLANNING_DEFAULTS.items():
-        if getattr(routing, name) == default:
-            values.pop(name, None)

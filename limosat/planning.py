@@ -14,7 +14,7 @@ import numpy as np
 from shapely.geometry.base import BaseGeometry
 
 from .catalog import ImageCatalogue, ImagePair, ImageRecord
-from .config import RoutingConfig, RunConfig, _pop_default_planning
+from .config import RoutingConfig, RunConfig
 from .field import regular_grid
 from .imagery import projected_footprint
 
@@ -54,13 +54,7 @@ def run_plan(config: RunConfig, catalogue: ImageCatalogue) -> CandidatePlan:
          image.platform, image.absolute_orbit]
         for image in catalogue.chronological()
     ]
-    routing = asdict(config.routing)
-    if not config.routing.source_coverage_completion:
-        # Plans made before the option existed keep their cache key.
-        routing.pop("source_coverage_completion")
-        routing.pop("source_coverage_minimum_cells")
-    _pop_default_planning(routing, config.routing)
-    key = [records, routing, config.matcher.maximum_speed_m_per_day, config.analysis_epsg]
+    key = [records, asdict(config.routing), config.analysis_epsg]
     cell_filter = None
     if config.routing.plan_surface_cells:
         from .surface import surface_gate
@@ -82,7 +76,6 @@ def run_plan(config: RunConfig, catalogue: ImageCatalogue) -> CandidatePlan:
         catalogue,
         config.routing,
         grid_spacing_m=config.routing.planning_grid_spacing_m,
-        maximum_speed_m_per_day=config.matcher.maximum_speed_m_per_day,
         cell_filter=cell_filter,
     )
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -97,34 +90,26 @@ def plan_candidate_pairs(
     catalogue: ImageCatalogue,
     config: RoutingConfig,
     grid_spacing_m: float = 4_000.0,
-    maximum_speed_m_per_day: float = 43_200.0,
 ) -> tuple[PlannedPair, ...]:
     """Plan overlap-qualified candidates and a deterministic primary subset."""
-    return build_candidate_plan(
-        catalogue,
-        config,
-        grid_spacing_m=grid_spacing_m,
-        maximum_speed_m_per_day=maximum_speed_m_per_day,
-    ).pairs
+    return build_candidate_plan(catalogue, config, grid_spacing_m=grid_spacing_m).pairs
 
 
 def build_candidate_plan(
     catalogue: ImageCatalogue,
     config: RoutingConfig,
     grid_spacing_m: float = 4_000.0,
-    maximum_speed_m_per_day: float = 43_200.0,
     cell_filter=None,
 ) -> CandidatePlan:
     """Plan image pairs and retain deterministic exclusion diagnostics.
 
-    ``cell_filter(source_image, cells) -> cells`` drops planning cells (for example land
-    and open water) before primary selection; ``None`` keeps them all.
+    Candidates are image pairs within the elapsed-time window whose footprints overlap
+    enough. Primary pairs are chosen by next observation (``_next_observation_selection``)
+    on the planning cells both images image. ``cell_filter(source_image, cells) -> cells``
+    drops planning cells (for example land and open water) first; ``None`` keeps them all.
     """
-    next_observation = config.primary_selection == "next_observation"
     if grid_spacing_m <= 0:
         raise ValueError("grid_spacing_m must be positive")
-    if maximum_speed_m_per_day <= 0:
-        raise ValueError("maximum_speed_m_per_day must be positive")
     images = catalogue.chronological()
     if config.require_orbit_metadata:
         missing = [
@@ -141,14 +126,9 @@ def build_candidate_plan(
     minimum_seconds = config.candidate_minimum_elapsed_hours * 3_600.0
     maximum_seconds = config.candidate_maximum_elapsed_hours * 3_600.0
     footprints = {image.image_id: _footprint(image) for image in images}
+    # (pair, overlap fraction, overlap area, skipped images, planning cells or None)
     candidates: list[
-        tuple[
-            ImagePair,
-            float | None,
-            float | None,
-            int,
-            frozenset[tuple[int, int]] | None,
-        ]
+        tuple[ImagePair, float | None, float | None, int, frozenset[tuple[int, int]] | None]
     ] = []
     exclusions = {
         "below_minimum_elapsed": 0,
@@ -194,17 +174,7 @@ def build_candidate_plan(
                 overlap >= config.candidate_minimum_overlap_fraction
                 and overlap_area >= config.candidate_minimum_overlap_area_m2
             ):
-                cells = (
-                    _imaged_cells(source_footprint, target_footprint, grid_spacing_m)
-                    if next_observation else
-                    _planning_cells(
-                        source_footprint,
-                        target_footprint,
-                        pair.elapsed_seconds,
-                        grid_spacing_m,
-                        maximum_speed_m_per_day,
-                    )
-                )
+                cells = _imaged_cells(source_footprint, target_footprint, grid_spacing_m)
                 if cell_filter is not None:
                     cells = frozenset(cell_filter(source, cells))
                 if not cells:
@@ -223,51 +193,18 @@ def build_candidate_plan(
                 exclusions["below_minimum_overlap"] += 1
 
     primary_ids: set[str] = set()
-    primary_pairs_before_target_maximum = 0
-    primary_pairs_excluded_by_target_maximum = 0
-    targets_affected_by_primary_pair_maximum = 0
-    by_target: dict[
-        str,
-        list[
-            tuple[
-                ImagePair,
-                float | None,
-                float | None,
-                int,
-                frozenset[tuple[int, int]] | None,
-            ]
-        ],
-    ] = {}
-    for candidate in candidates:
-        by_target.setdefault(candidate[0].target.image_id, []).append(candidate)
     next_observation_counts: dict[str, int] = {}
     if config.candidate_pair_ids:
         primary_ids.update(pair.pair_id for pair, *_rest in candidates)
-        primary_pairs_before_target_maximum = len(primary_ids)
-    elif next_observation:
+    else:
         next_observation_counts = _next_observation_selection(
             candidates, primary_ids,
             config.next_observation_minimum_cells,
             config.next_observation_backup_after_hours,
         )
-    else:
-        for target_candidates in by_target.values():
-            selected, unrestricted_count = _coverage_primary_selection(
-                target_candidates,
-                config.primary_maximum_pairs_per_target,
-            )
-            primary_ids.update(selected)
-            primary_pairs_before_target_maximum += unrestricted_count
-            excluded = unrestricted_count - len(selected)
-            primary_pairs_excluded_by_target_maximum += excluded
-            targets_affected_by_primary_pair_maximum += int(excluded > 0)
-
-    added_for_source_coverage = 0
-    if config.source_coverage_completion and not config.candidate_pair_ids:
-        added_for_source_coverage = _complete_source_coverage(
-            candidates, primary_ids, footprints, grid_spacing_m,
-            config.source_coverage_minimum_cells,
-        )
+    by_target: dict[str, list] = {}
+    for candidate in candidates:
+        by_target.setdefault(candidate[0].target.image_id, []).append(candidate)
 
     ordered = sorted(
         candidates,
@@ -315,17 +252,6 @@ def build_candidate_plan(
         **exclusions,
         "accepted_candidate_pairs": len(pairs),
         **next_observation_counts,
-        "primary_pairs_selected_for_cell_coverage": len(primary_ids) - added_for_source_coverage,
-        "primary_pairs_added_for_source_coverage": added_for_source_coverage,
-        "primary_pairs_before_target_maximum": (
-            primary_pairs_before_target_maximum
-        ),
-        "primary_pairs_excluded_by_target_maximum": (
-            primary_pairs_excluded_by_target_maximum
-        ),
-        "targets_affected_by_primary_pair_maximum": (
-            targets_affected_by_primary_pair_maximum
-        ),
         "candidate_planning_cell_assignments": sum(
             len(cells) for *_prefix, cells in candidates if cells is not None
         ),
@@ -460,24 +386,6 @@ def _overlap_fraction(
     return numerator / denominator
 
 
-def _planning_cells(
-    source: BaseGeometry,
-    target: BaseGeometry,
-    elapsed_seconds: float,
-    grid_spacing_m: float,
-    maximum_speed_m_per_day: float,
-) -> frozenset[tuple[int, int]]:
-    maximum_displacement_m = (
-        maximum_speed_m_per_day * elapsed_seconds / 86_400.0
-    )
-    domain = source.intersection(target.buffer(maximum_displacement_m)).buffer(0)
-    _rows, _columns, coordinates = regular_grid(domain, grid_spacing_m)
-    return frozenset(
-        (int(round(x / grid_spacing_m)), int(round(y / grid_spacing_m)))
-        for x, y in coordinates
-    )
-
-
 def _imaged_cells(source: BaseGeometry, target: BaseGeometry, grid_spacing_m: float):
     """Planning cells of the source that the target also images (no drift allowance)."""
     _rows, _columns, coordinates = regular_grid(source.intersection(target).buffer(0), grid_spacing_m)
@@ -553,119 +461,3 @@ def _next_observation_selection(
         "next_observation_kept_pair_cells": imaged_total,
         "next_observation_cells_without_pair": unassigned,
     }
-
-
-def _complete_source_coverage(
-    candidates, primary_ids: set[str], footprints, grid_spacing_m: float, minimum_cells: int
-) -> int:
-    """Add primary pairs so that each source image's ice imaged by a later candidate
-    target has a selected pair forward.
-
-    Coverage is judged on the cells both images actually image, not on the drift-buffered
-    cells the per-target selection uses: a buffered cell may claim ice the target never
-    imaged. Per source, repeatedly add the candidate covering most uncovered cells
-    (ties: the shorter interval, then pair ID) until fewer than ``minimum_cells`` would be
-    added. Returns the number of pairs added; ``primary_ids`` is updated in place.
-    """
-    by_source: dict[str, list] = {}
-    for item in candidates:
-        if item[4] is not None:
-            by_source.setdefault(item[0].source.image_id, []).append(item[0])
-    added = 0
-    for source_id in sorted(by_source):
-        pairs = by_source[source_id]
-        imaged = {
-            pair.pair_id: _imaged_cells(
-                footprints[pair.source.image_id], footprints[pair.target.image_id], grid_spacing_m
-            )
-            for pair in pairs
-        }
-        covered: set = set()
-        for pair in pairs:
-            if pair.pair_id in primary_ids:
-                covered |= imaged[pair.pair_id]
-        need = set().union(*imaged.values()) - covered
-        remaining = [pair for pair in pairs if pair.pair_id not in primary_ids]
-        while need and remaining:
-            best = max(
-                remaining,
-                key=lambda pair: (len(imaged[pair.pair_id] & need), -pair.elapsed_seconds, pair.pair_id),
-            )
-            if len(imaged[best.pair_id] & need) < minimum_cells:
-                break
-            primary_ids.add(best.pair_id)
-            need -= imaged[best.pair_id]
-            remaining.remove(best)
-            added += 1
-    return added
-
-
-def _coverage_primary_selection(
-    target_candidates, maximum_pairs: int | None = None
-) -> tuple[set[str], int]:
-    """Keep each pair that is the most recent option for at least one cell."""
-    known = [item for item in target_candidates if item[4] is not None]
-    if not known:
-        most_recent = max(item[0].source.time_utc for item in target_candidates)
-        ranked = sorted(
-            (
-                item
-                for item in target_candidates
-                if item[0].source.time_utc == most_recent
-            ),
-            key=lambda item: (
-                -(item[2] or 0.0),
-                item[0].pair_id,
-            ),
-        )
-        unrestricted_count = len(ranked)
-        selected = ranked if maximum_pairs is None else ranked[:maximum_pairs]
-        return {item[0].pair_id for item in selected}, unrestricted_count
-    latest_by_cell: dict[tuple[int, int], object] = {}
-    for pair, _overlap, _area, _skipped, cells in known:
-        assert cells is not None
-        for cell in cells:
-            previous = latest_by_cell.get(cell)
-            if previous is None or pair.source.time_utc > previous:
-                latest_by_cell[cell] = pair.source.time_utc
-    contributions = [
-        (
-            item,
-            frozenset(
-                cell
-                for cell in item[4]
-                if latest_by_cell[cell] == item[0].source.time_utc
-            ),
-        )
-        for item in known
-    ]
-    contributions = [item for item in contributions if item[1]]
-    if maximum_pairs is None:
-        return (
-            {item[0][0].pair_id for item in contributions},
-            len(contributions),
-        )
-
-    selected: set[str] = set()
-    covered: set[tuple[int, int]] = set()
-    remaining = contributions
-    while remaining and len(selected) < maximum_pairs:
-        ranked = sorted(
-            remaining,
-            key=lambda value: (
-                -len(value[1] - covered),
-                -len(value[1]),
-                -value[0][0].source.time_utc.timestamp(),
-                -(value[0][2] or 0.0),
-                value[0][0].pair_id,
-            ),
-        )
-        item, cells = ranked[0]
-        selected.add(item[0].pair_id)
-        covered.update(cells)
-        remaining = [
-            value
-            for value in remaining
-            if value[0][0].pair_id not in selected
-        ]
-    return selected, len(contributions)

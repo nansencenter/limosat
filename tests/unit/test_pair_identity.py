@@ -65,7 +65,7 @@ def test_matching_fingerprint_ignores_run_identity_paths_and_composition(tmp_pat
         pair_store_directory=str(tmp_path / "store"),
         pair_workers=3,
         trajectories=TrajectoryConfig(new_point_exclusion_radius_m=3_000.0),
-        routing=replace(base.routing, primary_maximum_pairs_per_target=4),
+        routing=replace(base.routing, next_observation_backup_after_hours=30.0),
         field=replace(base.field, missing_node_fallback=not base.field.missing_node_fallback),
         matcher=replace(base.matcher, tile_batch_size=8, prefix_cuda_graph=False),
         surface=SurfaceConfig(point_sic_root="/somewhere"),

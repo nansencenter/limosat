@@ -123,66 +123,6 @@ def test_recovery_uses_elapsed_time_not_intervening_image_count():
     ) == ()
 
 
-def test_primary_plan_keeps_most_recent_source_for_each_spatial_cell():
-    old_full = _image("old-full", 0, "old", box(0, 0, 100_000, 100_000))
-    recent_left = _image(
-        "recent-left", 1, "left", box(0, 0, 60_000, 100_000)
-    )
-    target = _image("target", 2, "target", box(0, 0, 100_000, 100_000))
-
-    first = plan_candidate_pairs(ImageCatalogue([old_full, recent_left, target]), RoutingConfig())
-    second = plan_candidate_pairs(
-        ImageCatalogue([target, recent_left, old_full]), RoutingConfig()
-    )
-
-    def target_primary_ids(planned):
-        return {
-            item.pair.pair_id
-            for item in planned
-            if item.pair.target.image_id == "target"
-            and item.selection == "primary"
-        }
-
-    assert target_primary_ids(first) == {
-        "old-full__target",
-        "recent-left__target",
-    }
-    assert target_primary_ids(second) == target_primary_ids(first)
-
-
-def test_diagnostic_primary_maximum_keeps_largest_spatial_contributors():
-    old_full = _image("old-full", 0, "old", box(0, 0, 100_000, 100_000))
-    recent_left = _image(
-        "recent-left", 1, "left", box(0, 0, 60_000, 100_000)
-    )
-    newest_left = _image(
-        "newest-left", 2, "newest", box(0, 0, 30_000, 100_000)
-    )
-    target = _image("target", 3, "target", box(0, 0, 100_000, 100_000))
-    records = [old_full, recent_left, newest_left, target]
-    routing = RoutingConfig(primary_maximum_pairs_per_target=2)
-
-    first = build_candidate_plan(ImageCatalogue(records), routing)
-    second = build_candidate_plan(ImageCatalogue(tuple(reversed(records))), routing)
-
-    def target_primary_ids(plan):
-        return {
-            item.pair.pair_id
-            for item in plan.pairs
-            if item.pair.target.image_id == "target"
-            and item.selection == "primary"
-        }
-
-    assert target_primary_ids(first) == {
-        "old-full__target",
-        "newest-left__target",
-    }
-    assert target_primary_ids(second) == target_primary_ids(first)
-    assert first.exclusion_counts["primary_pairs_before_target_maximum"] == 6
-    assert first.exclusion_counts["primary_pairs_excluded_by_target_maximum"] == 1
-    assert first.exclusion_counts["targets_affected_by_primary_pair_maximum"] == 1
-
-
 def test_candidate_plan_requires_fractional_and_absolute_overlap():
     source = _image("source", 0, "a", box(0, 0, 100_000, 100_000))
     small_overlap = _image(
@@ -269,38 +209,6 @@ def test_overlap_probe_is_bounded_and_deterministic():
     assert len(first["0.900-1.000"]) == 2
 
 
-def test_source_coverage_completion_gives_ice_left_behind_a_pair_forward():
-    # B keeps only its most useful source (cap 1): A2, the more recent and larger one.
-    # A's western ice is imaged again only by B, so without completion no pair leaves A
-    # over it; completion adds A -> B.
-    a = _image("a", 0.0, "a", box(0, 0, 60_000, 40_000))
-    a2 = _image("a2", 0.25, "a2", box(40_000, 0, 100_000, 40_000))
-    b = _image("b", 0.5, "b", box(0, 0, 100_000, 40_000))
-    catalogue = ImageCatalogue([a, a2, b])
-
-    def primary(plan):
-        return {item.pair.pair_id for item in plan.pairs if item.selection == "primary"}
-
-    plain = build_candidate_plan(catalogue, RoutingConfig(primary_maximum_pairs_per_target=1))
-    assert "a__b" not in primary(plain)
-    assert plain.exclusion_counts["primary_pairs_added_for_source_coverage"] == 0
-    completed = build_candidate_plan(catalogue, RoutingConfig(
-        primary_maximum_pairs_per_target=1, source_coverage_completion=True))
-    assert primary(completed) == primary(plain) | {"a__b"}
-    assert completed.exclusion_counts["primary_pairs_added_for_source_coverage"] == 1
-
-
-def test_source_coverage_completion_is_off_by_default_and_keeps_identity():
-    from dataclasses import replace
-    from limosat.config import RunConfig
-    base = RunConfig("run", "catalogue", "database", "output")
-    assert "source_coverage_completion" not in base.to_dict()["routing"]
-    on = replace(base, routing=RoutingConfig(source_coverage_completion=True))
-    assert on.sha256 != base.sha256
-    with pytest.raises(ValueError, match="source_coverage_minimum_cells"):
-        RoutingConfig(source_coverage_minimum_cells=0)
-
-
 def _primary(plan):
     return {item.pair.pair_id for item in plan.pairs if item.selection == "primary"}
 
@@ -312,7 +220,7 @@ def test_next_observation_sends_each_cell_to_its_next_image():
     b = _image("b", 0.25, "b", box(0, 0, 50_000, 40_000))
     c = _image("c", 0.5, "c", box(50_000, 0, 100_000, 40_000))
     d = _image("d", 0.75, "d", box(0, 0, 100_000, 40_000))
-    plan = build_candidate_plan(ImageCatalogue([a, b, c, d]), RoutingConfig(primary_selection="next_observation"))
+    plan = build_candidate_plan(ImageCatalogue([a, b, c, d]), RoutingConfig())
     kept = _primary(plan)
     assert {"a__b", "a__c", "b__d", "c__d"} <= kept
     assert "a__d" not in kept
@@ -325,11 +233,10 @@ def test_next_observation_backup_for_long_pairs_and_minimum_cells():
     c = _image("c", 3.0, "c", box(0, 0, 100_000, 40_000))
     sliver = _image("s", 1.0, "s", box(0, 0, 8_000, 40_000))
     catalogue = ImageCatalogue([a, b, c, sliver])
-    plain = build_candidate_plan(catalogue, RoutingConfig(primary_selection="next_observation"))
+    plain = build_candidate_plan(catalogue, RoutingConfig())
     assert "a__s" not in _primary(plain)            # fewer than 25 cells
     assert "a__b" in _primary(plain) and "a__c" not in _primary(plain)
-    backed = build_candidate_plan(catalogue, RoutingConfig(
-        primary_selection="next_observation", next_observation_backup_after_hours=30.0))
+    backed = build_candidate_plan(catalogue, RoutingConfig(next_observation_backup_after_hours=30.0))
     assert {"a__b", "a__c"} <= _primary(backed)      # A -> B is 48 h, so C backs it up
     assert backed.exclusion_counts["next_observation_backup_pairs"] >= 1
 
@@ -338,18 +245,11 @@ def test_next_observation_cell_filter_drops_land():
     a = _image("a", 0.0, "a", box(0, 0, 100_000, 40_000))
     b = _image("b", 0.25, "b", box(0, 0, 100_000, 40_000))
     land = lambda image, cells: {cell for cell in cells if cell[0] * 4_000 < 30_000}  # noqa: E731
-    plan = build_candidate_plan(ImageCatalogue([a, b]), RoutingConfig(primary_selection="next_observation"), cell_filter=land)
+    plan = build_candidate_plan(ImageCatalogue([a, b]), RoutingConfig(), cell_filter=land)
     assert plan.exclusion_counts["next_observation_assigned_cells"] < 8 * 11
 
 
-def test_next_observation_settings_keep_identity_at_defaults():
-    from dataclasses import replace
+def test_surface_cell_planning_requires_a_surface_source():
     from limosat.config import RunConfig
-    base = RunConfig("run", "catalogue", "database", "output")
-    assert "primary_selection" not in base.to_dict()["routing"]
-    on = replace(base, routing=RoutingConfig(primary_selection="next_observation"))
-    assert on.sha256 != base.sha256
-    with pytest.raises(ValueError, match="source_coverage_completion"):
-        RoutingConfig(primary_selection="next_observation", source_coverage_completion=True)
     with pytest.raises(ValueError, match="plan_surface_cells"):
         RunConfig("run", "catalogue", "database", "output", routing=RoutingConfig(plan_surface_cells=True))

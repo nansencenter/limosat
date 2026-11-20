@@ -43,3 +43,11 @@ def test_production_matching_fingerprint_is_unchanged():
         "inputs": PRODUCTION_INPUTS,
     }
     assert identity_sha256(identity) == PRODUCTION_MATCHING_SHA256
+
+
+def test_prepare_chain_olivia_writes_the_production_matching_settings(tmp_path):
+    from limosat.config import load_config
+    from test_prepare_chain_olivia import production_config_file
+
+    prepared = load_config(production_config_file(tmp_path))
+    assert matching_settings(prepared) == matching_settings(production_config())
