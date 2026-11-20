@@ -15,6 +15,9 @@ and the period's image catalogue. The public schema is defined once, here (``COL
 schema and a generated data dictionary are written into the release so that readers do not need a second
 copy.
 
+The released format is NetCDF: ``python -m limosat.publish_netcdf release`` runs this module as its first stage (a private
+Parquet scratch folder) and writes the CF NetCDF files from it; the Parquet point table itself is not released.
+
 Public outputs carry no local paths and no internal protocol detail. Internal provenance (source paths,
 checksums, protocol ids) goes to a sidecar next to, not inside, the output directory.
 """
@@ -457,7 +460,7 @@ def build_period(
     bounds = {"x_min": None, "x_max": None, "y_min": None, "y_max": None}
     months = _month_starts(first_ms, last_ms)
     try:
-        with pq.ParquetWriter(temporary, ctx.schema, compression="gzip", compression_level=6) as writer:
+        with pq.ParquetWriter(temporary, ctx.schema, compression="zstd") as writer:
             for lo in months:
                 hi = datetime(lo.year + lo.month // 12, lo.month % 12 + 1, 1, tzinfo=timezone.utc)
                 pieces = []
