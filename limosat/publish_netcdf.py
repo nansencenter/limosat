@@ -1,7 +1,9 @@
 """Write the public LiMOSAT trajectory dataset as CF NetCDF4 (one file per processing period).
 
-The public Parquet point table written by :mod:`limosat.publish` is the validated source of truth. This module
-re-encodes it, losslessly, as a self-describing CF-1.8 *trajectory* file, using the contiguous ragged array
+``python -m limosat.publish_netcdf release`` is the entry point: internal kept-link Parquet in, validated NetCDF release out
+(see :func:`release`). Internally the public point table of :mod:`limosat.publish` is built first, as a private scratch
+Parquet folder that is validated against the source and removed afterwards; ``build``/``validate`` below work on that folder.
+This module re-encodes the point table, losslessly, as a self-describing CF-1.8 *trajectory* file, using the contiguous ragged array
 representation of the CF discrete sampling geometries (section 9.3.3 of the CF conventions):
 
 * dimension ``trajectory`` (one entry per trajectory) and ``obs`` (one entry per observation);
@@ -24,6 +26,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -314,6 +317,33 @@ def build(parquet_dir: Path, output_dir: Path, metadata: dict[str, Any] | None =
     return manifest
 
 
+def release(source_root: Path, catalog_dir: Path, output_dir: Path, release_id: str, metadata: dict[str, Any] | None = None,
+            periods: list[str] | None = None, overwrite: bool = False, verify_source: bool = True, keep_parquet: bool = False,
+            sample_modulus: int = 50) -> dict[str, Any]:
+    """The whole public release from an internal QC release: one call, NetCDF files out.
+
+    The internal kept-link Parquet is first turned into the public point table (a private Parquet scratch folder next to the
+    output, built month by month and validated against the source), which is then written as the CF NetCDF files and
+    validated against it. The scratch folder is removed unless ``keep_parquet``. Internal provenance (source paths,
+    checksums, protocol ids) goes to ``<output>.provenance.json`` beside the output folder, never into it.
+    """
+    from . import publish
+
+    source_root, catalog_dir, output_dir = Path(source_root), Path(catalog_dir), Path(output_dir)
+    work = output_dir.with_name(f".{output_dir.name}_parquet_work")
+    if work.exists():
+        shutil.rmtree(work)
+    publish.build(source_root, catalog_dir, work, release_id, periods, overwrite=True, verify_source=verify_source)
+    publish.validate(source_root, catalog_dir, work, sample_modulus)
+    manifest = build(work, output_dir, metadata, periods, overwrite)
+    validate(work, output_dir, sample_modulus)
+    sidecar = work.with_name(work.name + ".provenance.json")
+    os.replace(sidecar, output_dir.with_name(output_dir.name + ".provenance.json"))
+    if not keep_parquet:
+        shutil.rmtree(work)
+    return manifest
+
+
 # --------------------------------------------------------------------------------------------- validation
 
 
@@ -417,12 +447,28 @@ def main(argv: list[str] | None = None) -> None:
     b.add_argument("--metadata", type=Path, help="JSON with title, summary, keywords, creators, license, acknowledgement, ...")
     b.add_argument("--period", action="append", dest="periods")
     b.add_argument("--overwrite", action="store_true")
+    r = sub.add_parser("release", help="internal QC release -> validated NetCDF release in one call")
+    r.add_argument("--source-root", type=Path, required=True, help="internal release folder holding <period>/<period>_qc.parquet")
+    r.add_argument("--catalog-dir", type=Path, required=True, help="folder of <period>_image_catalog_*.json")
+    r.add_argument("--output-dir", type=Path, required=True)
+    r.add_argument("--release-id", required=True)
+    r.add_argument("--metadata", type=Path)
+    r.add_argument("--period", action="append", dest="periods")
+    r.add_argument("--overwrite", action="store_true")
+    r.add_argument("--skip-source-checksum", action="store_true")
+    r.add_argument("--keep-parquet", action="store_true", help="keep the private Parquet scratch folder")
+    r.add_argument("--sample-modulus", type=int, default=50)
     v = sub.add_parser("validate")
     v.add_argument("--parquet-dir", type=Path, required=True)
     v.add_argument("--output-dir", type=Path, required=True)
     v.add_argument("--sample-modulus", type=int, default=50)
     args = parser.parse_args(argv)
-    if args.command == "build":
+    if args.command == "release":
+        metadata = json.loads(args.metadata.read_text()) if args.metadata else None
+        result = release(args.source_root, args.catalog_dir, args.output_dir, args.release_id, metadata, args.periods, args.overwrite,
+                         not args.skip_source_checksum, args.keep_parquet, args.sample_modulus)
+        print(json.dumps(result["totals"], indent=2))
+    elif args.command == "build":
         metadata = json.loads(args.metadata.read_text()) if args.metadata else None
         result = build(args.parquet_dir, args.output_dir, metadata, args.periods, args.overwrite)
         print(json.dumps(result["totals"], indent=2))

@@ -15,6 +15,9 @@ and the period's image catalogue. The public schema is defined once, here (``COL
 schema and a generated data dictionary are written into the release so that readers do not need a second
 copy.
 
+The released format is NetCDF: ``python -m limosat.publish_netcdf release`` runs this module as its first stage (a private
+Parquet scratch folder) and writes the CF NetCDF files from it; the Parquet point table itself is not released.
+
 Public outputs carry no local paths and no internal protocol detail. Internal provenance (source paths,
 checksums, protocol ids) goes to a sidecar next to, not inside, the output directory.
 """

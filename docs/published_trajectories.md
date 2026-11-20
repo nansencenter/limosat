@@ -1,5 +1,24 @@
 # Published trajectory dataset
 
+**The released format is NetCDF4** (CF-1.8 trajectory files, one per processing period). One command builds it from an
+internal QC release:
+
+```bash
+python -m limosat.publish_netcdf release \
+  --source-root /path/to/internal/release \        # <period>/<period>_qc.parquet + manifest
+  --catalog-dir /path/to/image_catalogs \
+  --output-dir /path/to/staging/limosat_v1 \
+  --release-id limosat_v1 \
+  --metadata netcdf_metadata.json                  # title, creators, licence, acknowledgement; optional
+```
+
+It writes the validated point table (described below) into a private Parquet scratch folder next to the output, writes the
+NetCDF files from it, validates both steps value by value (NetCDF against the Parquet point table against the source links), removes
+the scratch folder (`--keep-parquet` keeps it) and writes `<output>.provenance.json` beside the output folder. The released
+folder contains the ten `limosat_<period>.nc` files and `manifest.json`; the README is written by hand. The Parquet point
+table is an intermediate and is not released. The NetCDF layout is documented in the `limosat.publish_netcdf` module docstring and in the
+release README; the sections below describe the point table that both formats carry.
+
 `limosat.publish` converts the internal database outputs of a release into the public LiMOSAT trajectory
 dataset (schema 2): a format fit for public use that leaves out everything an ordinary data user does not
 need (internal ids and row numbers, quality-control bookkeeping, removed links, raw points, local paths).

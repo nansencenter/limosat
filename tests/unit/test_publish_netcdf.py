@@ -80,3 +80,23 @@ def test_netcdf_values_round_trip_the_parquet_table(tmp_path):
         assert np.isnan(nc["dx"][sel][order][0])  # the first observation has no displacement
     manifest_nc = json.loads((out / "manifest.json").read_text())
     assert manifest_nc["format"] == publish_netcdf.FORMAT and manifest_nc["release_id"] == "test-release"
+
+
+def test_release_builds_validates_and_leaves_only_the_netcdf_release(tmp_path):
+    from test_publish import make_release
+
+    source, catalogs, _ = make_release(tmp_path)
+    out = tmp_path / "limosat_release"
+    manifest = publish_netcdf.release(source, catalogs, out, "test-release", METADATA)
+    assert sorted(p.name for p in out.iterdir()) == sorted([f"limosat_{PERIOD}.nc", "manifest.json"])
+    assert not (tmp_path / ".limosat_release_parquet_work").exists()
+    sidecar = json.loads((tmp_path / "limosat_release.provenance.json").read_text())
+    assert PERIOD in sidecar["periods"] and manifest["format"] == publish_netcdf.FORMAT
+
+
+def test_release_can_keep_the_private_parquet_scratch_folder(tmp_path):
+    from test_publish import make_release
+
+    source, catalogs, _ = make_release(tmp_path)
+    publish_netcdf.release(source, catalogs, tmp_path / "keep", "test-release", keep_parquet=True)
+    assert (tmp_path / ".keep_parquet_work" / f"limosat_{PERIOD}.parquet").exists()
