@@ -121,7 +121,7 @@ def read_rows(out):
     d.set_auto_maskandscale(False)
     rowsize = d["rowsize"][:]
     tid = np.repeat(d["trajectory_id"][:], rowsize)
-    names = list(d["scene_name"][:])
+    names = [str(n) for n in d["scene_name"][:]]  # char array with _Encoding: read as strings
     rows = []
     for i in range(len(tid)):
         interp, flags = int(d["interpolated"][i]), int(d["quality_flags"][i])
@@ -200,6 +200,7 @@ def test_file_is_a_cf_contiguous_ragged_trajectory_file_ordered_by_start_time(tm
         assert d.primary_window_start == "2023-08-01T00:00:00Z" and d.primary_window_stop_exclusive == "2024-08-01T00:00:00Z"
         assert d.creator_name == "Chua, Sean Minhui Tashi" and d.creator_id == "https://orcid.org/0000-0002-8462-3170" and d.license == "CC-BY-4.0"
         assert d["x_m"].filters()["zlib"] and d["x_m"].filters()["shuffle"]
+        assert d["scene_name"].dtype == "S1" and d["scene_name"].dimensions == ("scene", "scene_strlen")
         for name in ("x_m", "y_m", "dx_m", "dy_m", "speed_m_per_day", "correlation", "direct_match_share", "interpolated",
                      "quality_flags", "is_primary", "scene_index", "point_index", "lon", "lat", "time"):
             assert d[name].dimensions == ("obs",)

@@ -554,9 +554,12 @@ def _write_netcdf(path: Path, a: dict[str, np.ndarray], o: dict[str, np.ndarray]
         v.long_name = "index of the Sentinel-1 scene of the observation into scene_name"
         v.coordinates = coords
         v[:] = scene_index
-        v = ds.createVariable("scene_name", str, ("scene",))
+        width = max(len(name) for name in scene_names)
+        ds.createDimension("scene_strlen", width)
+        v = ds.createVariable("scene_name", "S1", ("scene", "scene_strlen"))  # a char array: valid CF in every NetCDF tool
         v.long_name = describe["scene"].description
-        v[:] = np.array(scene_names, dtype=object)
+        v._Encoding = "ascii"
+        v[:] = netCDF4.stringtochar(np.array([name.encode("ascii") for name in scene_names], dtype=f"S{width}"))
 
         # ---- global attributes
         meta = {**DEFAULT_METADATA, **metadata}
@@ -815,7 +818,8 @@ def validate_period(source: Source, catalog_path: Path, output: Path, entry: dic
         keep = np.repeat((ids % sample_modulus) == 0, rowsize)
         sampled = {name: d[name][:][keep] for name in ("x_m", "y_m", "dx_m", "dy_m", "speed_m_per_day", "correlation",
                                                           "direct_match_share", "interpolated", "quality_flags", "is_primary")}
-        names = np.array(list(d["scene_name"][:]), dtype=object)
+        d.set_auto_chartostring(False)
+        names = np.array(netCDF4.chartostring(d["scene_name"][:], encoding="ascii").tolist(), dtype=object)
         scene = names[d["scene_index"][:][keep]]
         tid_s, pidx_s, ms_s = np.repeat(ids, rowsize)[keep], pidx[keep], time[keep]
     finally:
