@@ -1,17 +1,23 @@
-# Parquet-first primary composition
+# Primary composition
 
-`limosat compose-parquet` reads the immutable pair-worker NPZ and JSON products
-and writes trajectory points and directly measured trajectory extensions without
-importing either product into SQLite. The command does not modify the native run
-database or the pair-product directory.
+`limosat compose-parquet CONFIG OUTPUT_DIRECTORY` reads the immutable pair products
+of every primary pair in the plan and writes trajectory points and directly
+measured trajectory extensions to Parquet. It changes neither the run database nor
+the pair products, so composition can be repeated with other composition settings
+without rematching.
+
+At each image (in UTC order) a trajectory continues from its most recent position
+through the incoming primary pair field that supports it best: the most recent
+source, then more agreeing matches, lower residual and support radius. New
+trajectories are seeded at the field nodes of the image's outgoing primary pairs
+(`add_as_coverage_enters`) unless an existing trajectory is within
+`new_point_exclusion_radius_m` (production 3 km). Gaps are not stored: a trajectory
+has no row on an image that a pair from its last position reaches without
+supporting it, and it may continue later through another pair.
 
 The local field defaults are 4 km grid spacing and a 6.4 km maximum triangle
 edge; pair planning remains on a fixed 4 km grid. Recomposition of an existing
 archive must use that archive's frozen configuration, not current defaults.
-
-```bash
-limosat compose-parquet CONFIG OUTPUT_DIRECTORY
-```
 
 Every pair of the deterministic primary plan must have a product; a shared pair
 store may hold other runs' pairs as well, which are ignored. Every marker, NPZ
@@ -24,20 +30,20 @@ to evolve without invalidating completed GPU measurements.
 
 The command writes these files atomically:
 
-- `trajectory-points-v1.parquet`, including created, observed and dormant rows;
+- `trajectory-points-v1.parquet`, with created and observed rows;
 - `trajectory-extensions-qc-v1.parquet`, containing only directly measured
   source-to-target extensions; and
+- `trajectory-merges-v1.parquet`, only with merging on (below); and
 - `composition-manifest-v1.json`, written last as the completion marker.
 
 Before choosing an incoming pair, composition checks each inferred endpoint
 against that target image's raster bounds and invalid-pixel band. An endpoint
 outside the raster or on a pixel with mask value at least 2 cannot become an
 observed point; another valid incoming pair may still continue the trajectory.
-If none does, the target row is dormant. An endpoint that is invalid on the
+If none does, the trajectory has a gap there. An endpoint that is invalid on the
 target frame but valid on another frame of the same acquisition pass (same
 platform and absolute orbit, seconds apart) is accepted: in the March 2020
-archive about a quarter of gate rejections were such frame-seam positions. The same rule applies to recovery
-augmentation. Pair matches and fields remain reusable for recomposition.
+archive about a quarter of gate rejections were such frame-seam positions.
 
 The optional `surface` section adds land and point open-water exclusion. With
 `land_raster` (an EPSG:3413 inland-distance `.npz`, such as the 1 km
@@ -50,6 +56,42 @@ rejected; a missing concentration never rejects. Seeds are filtered by both.
 The tile-level OSI SAF open-water gate is unchanged. On a Fram Strait week
 (1-7 March 2020) this removed all 1,264 land or open-water positions (0.3 %)
 while ice cell-days fell by 0.04 %.
+
+## Gap filling and shear point estimates
+
+Both act during composition only and are not in the matching fingerprint; both
+need retained matches (`retain_pair_matches: true`).
+
+Gap filling (`field.gap_fill_*`) applies where a point has no usable triangle:
+first a rigid triangle of accepted nodes up to `gap_fill_rigid_edge_m` apart whose
+displacements differ by at most `gap_fill_rigid_spread_m`, then the point's own raw
+matches under the node rule with the `gap_fill_point_*` settings (point-local
+consensus). Production: 12.8 km / 300 m and 12 matches within 3 km, 8 agreeing
+within 500 m. On the January 2020 test week lost tracks fell 5.9 %; over MOSAiC
+January-April 2020 13 %; at MOSAiC buoys the added samples had median errors of
+56-61 m against 47-51 m for ordinary samples.
+
+Shear point estimates (`field.shear_point_estimates`, production on): a point is
+normally moved by linear interpolation between three 4 km nodes, which blends the
+two sides of a lead or shear line running between them. Where those nodes disagree
+by more than the point's own point-local estimate disagrees with its matches, that
+estimate is used instead; points without a sample get their own estimate before any
+rigid-triangle bridge. On the January-April 2020 stored pairs the p90 displacement
+error at MOSAiC and IABP buoys fell from 152 to 124 m.
+
+The missing-node fallback (`field.missing_node_fallback`) is off: at MOSAiC and
+Beaufort buoys the points it adds were 2-3x less accurate than measured nodes.
+
+## Merging duplicate trajectories (optional, off)
+
+With `trajectories.merge_radius_m` set, when positions of two or more trajectories
+in one image lie within that distance (chained), only the one with the longest
+history continues (then more selected matches, lower residual, identity); the others
+end there and are recorded in `trajectory-merges-v1.parquet`. With
+`merge_maximum_younger_age_hours` only young duplicates are merged: a trajectory is
+ended only if it is at most that old and was never positioned in the same image as
+its survivor. `scripts/prepare_chain_olivia.py --merge-radius-m 250
+--merge-maximum-younger-age-hours 48` turns this on.
 
 ## Initial QC policy
 
@@ -72,118 +114,3 @@ only to the speed gate.
 `trajectory-extensions-qc-v1.parquet` records accepted, review and rejected rows.
 The `accepted` column excludes only hard-speed failures. PySIDA and public
 exporters can select `accepted`, while validation can examine the review rows.
-
-## Targeted recovery
-
-Recovery uses the completed primary composition as an immutable reference. It
-does not rewrite primary trajectory identities or fields.
-
-Default target preparation selects two kinds of measured loss for each
-eligible recovery pair. A dormant row is an identity that a primary pair from
-its source image tried and failed to continue. An unscheduled loss is an
-identity last measured on the pair's source image that has no row on the target
-image because no primary pair from its last image reached that target. Each
-unscheduled loss is nominated once, for the earliest eligible pair whose target
-footprint contains its frozen source position. Identities already targeted as
-dormant are not nominated again. The SQLite and Parquet recovery paths apply
-the same rule; nothing is predicted, and the recovery field must still measure
-the motion. In the March 2020 capped-plan archive this class was 26% of
-uncensored endings, and 78% of a held-out sample gained a QC-accepted link.
-
-By default (`routing.recovery_target_policy: loss_targeted`) only the pairs
-that some loss needs are run: every lost identity nominates its shortest
-eligible pair, and each selected pair carries all losses eligible for it, so
-its field is reused. Pairs that would only repeat losses already nominated for
-a shorter pair are not run. In the 2015 N-ICE run (168 h horizon) this kept
-2,478 of 11,802 candidate pairs and 15.1M of 81.5M positions for the same
-671k losses. `all_losses` restores the previous behaviour, which targets every
-dormant row on every eligible pair. The manifest records the policy. Both the
-SQLite and Parquet paths apply it.
-For adaptive rounds, pass a frozen JSON request plan with
-`pair_request_schema_version: 1`, `run_id`,
-`config_sha256`, `primary_composition_manifest_sha256`, and a `pairs` list of
-`{"pair_id": ..., "trajectory_ids": [...]}`. The requested source coordinates
-are read from the immutable primary Parquet, not trusted from the plan. An
-explicit request may target either a dormant row or no row; it cannot replace
-an existing measurement.
-
-```bash
-limosat prepare-recovery-parquet \
-  CONFIG PRIMARY_COMPOSITION_DIRECTORY RECOVERY_TARGET_DIRECTORY \
-  --requests REQUEST_PLAN.json
-```
-
-Each nonempty pair target is stored atomically and bound to the run
-configuration, image-pair identity, primary-composition checksum, requested
-trajectory identities and exact coordinate-array checksum. Composition applies
-each recovery field only to the identities bound to that target set; older
-target markers without identities must be regenerated. Recovery workers consume
-those targets without
-reading or writing SQLite:
-
-```bash
-limosat pairs CONFIG --kind recovery \
-  --recovery-targets RECOVERY_TARGET_DIRECTORY \
-  --batch-index 0 --batch-count 4
-```
-
-After every targeted recovery pair product is complete, compose delta products:
-
-```bash
-limosat compose-recovery-parquet \
-  CONFIG PRIMARY_COMPOSITION_DIRECTORY RECOVERY_TARGET_DIRECTORY OUTPUT_DIRECTORY
-```
-
-The recovery composer writes `trajectory-augmentations-v1.parquet`,
-`trajectory-augmentation-extensions-qc-v1.parquet`, and
-`recovery-composition-manifest-v1.json`. Consumers overlay augmentation points
-on primary points by `(trajectory_id, image_id)` and append augmentation
-extensions to primary extensions. Recovery fields sample only frozen primary
-coordinates, inserting a row if the frozen primary has none. Later primary
-fields may continue a recovered coordinate through dormant or absent rows,
-but a recovery field never consumes an earlier augmentation. Recovery products
-remain trajectory-only and are not deformation inputs.
-
-Continuation can be chained over several passes. `merge-recovery-base` freezes a
-base composition plus one recovery composition as the next pass's base:
-recovered rows become measured rows (`reappeared` becomes `observed`, and the
-position basis gains a `pass<N>_` prefix) and the manifest records the lineage.
-`prepare-recovery-parquet` on that base plans the remaining losses. Pairs whose
-recovery product already exists are excluded, because a measured product is
-immutable and cannot take new targets.
-
-```bash
-limosat merge-recovery-base CONFIG BASE_DIR RECOVERY_COMPOSITION_DIR NEXT_BASE --pass-index 1
-limosat prepare-recovery-parquet CONFIG NEXT_BASE NEXT_TARGETS
-limosat pairs CONFIG --kind recovery --recovery-targets NEXT_TARGETS
-limosat compose-recovery-parquet CONFIG NEXT_BASE NEXT_TARGETS NEXT_RECOVERY_COMPOSITION
-```
-
-In the MOSAiC region (January–April 2020), passes 2 and 3 (2,103 and 2,315 pairs)
-raised the share of 5 km cell-days with a track at least 7 days old by 0.01–0.025
-per month over one pass. Median lifetime went from 6.0 to 7.1 days. Buoy errors
-of existing links were unchanged; new links had a median of 57–60 m.
-
-Loss-targeted nomination also checks the target image. A (loss, pair) option is
-skipped when the target is less than 30% valid
-(`routing.recovery_minimum_target_valid_fraction`) in a 31 km window around the
-loss's predicted position: its last measured velocity times the pair's lag.
-Losses without a usable option are not attempted and remain open, rather than
-counting as failed continuations. Target selection settings are recorded in the
-target manifest and do not enter the configuration identity. On Fram Strait
-(February–March 2020) chained passes 2+, the check reached about 90% of the
-coverage gain of unchecked passes. It used 45% fewer matcher tiles
-(167k vs 307k) and 4,620 vs 5,024 pairs.
-
-`limosat.pair_queue.choose_pair_batch` provides the provisional adaptive policy:
-each unresolved trajectory nominates its shortest unprocessed pair, pairs are
-ranked by how many trajectories nominated them, and every unresolved position
-eligible for a selected pair is submitted for field reuse. Reassess field
-support after each bounded round before selecting the next, then compose the
-saved products to measure actual trajectory-duration gains. This is not yet a
-validated production policy.
-The existing March 2020 frozen primary archive and newly targeted experiment
-products have different run configurations, so the branch recovery CLI cannot
-compose them together directly. The March experiment uses a separate bounded,
-resumable driver and a retrospective comparison; the same-configuration CLI
-above is for runs planned together from the outset.

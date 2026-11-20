@@ -210,10 +210,6 @@ class PairProductStore:
             raise RuntimeError(f"pair product was not published: {pair.pair_id}")
         return product
 
-    def has_product(self, pair_id: str) -> bool:
-        """Whether a completed product marker exists for this pair."""
-        return self._paths(pair_id)[1].exists()
-
     def load(self, pair: ImagePair) -> PairProduct | None:
         """Load a completed pair product, or ``None`` without a marker.
 

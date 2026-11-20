@@ -1,13 +1,13 @@
 # LiMOSAT
 
-LiMOSAT produces EfficientLoFTR sea-ice displacement fields, observed
-Lagrangian trajectories, and deformation products from chronological satellite
-image catalogues. The operational coordinate system is float64 EPSG:3413
-metres. Time is explicit UTC; velocity limits use metres per day; deformation
-rates use inverse seconds.
+LiMOSAT produces EfficientLoFTR sea-ice displacement fields and observed
+Lagrangian trajectories from chronological satellite image catalogues. The
+coordinate system is float64 EPSG:3413 metres; time is explicit UTC; velocity
+limits use metres per day.
 
-This branch intentionally has one matching method. It does not contain the old
-ORB detector/descriptor/template pipeline or the frozen ALIKED research code.
+This branch has one method (below). It does not contain the ORB pipeline, the
+ALIKED research code, continuation (recovery) passes or the per-target pair
+selection used before November 2026; see the git history for those.
 
 ## Install
 
@@ -19,147 +19,67 @@ pip install -e .
 
 The official EfficientLoFTR source checkout and optimized outdoor checkpoint
 are external scientific inputs. Record their local paths in the run
-configuration; the checkpoint SHA256 is written to the manifest.
+configuration; their checksums enter the matching fingerprint.
+
+## Method
+
+1. **Planning** (`planning.py`). Candidate pairs span 1-96 h, overlap at least 5 %
+   of the smaller footprint and 1,024 km2, and are not from one acquisition pass.
+   Primary pairs are chosen by *next observation*: each 4 km cell of a source
+   image goes to the next later image that images it; a pair is kept when it is
+   the next observation for at least 25 cells, and cells whose next observation is
+   more than 30 h away also go to the following one as a backup. Land and AMSR2
+   open-water cells are dropped first (`plan_surface_cells`).
+2. **Matching** (`pairs.py`). Every tile of each primary pair's overlap is matched
+   with EfficientLoFTR, routed by phase correlation and a coarse 320 m pass, and
+   turned into a 4 km displacement field. Each result is stored as an immutable
+   pair product keyed by the matching fingerprint (`pair_identity.py`), so runs
+   with the same matching settings share them.
+3. **Composition** (`compose.py`, `trajectory.py`, `field.py`). Trajectories are
+   chained through the primary pair fields in UTC order, with gap filling and
+   shear point estimates; duplicate trajectories can optionally be merged.
+   Output is Parquet.
 
 ## Run
 
-Copy `config.defaults.yaml`, set the catalogue, output, model repository, and
-checkpoint paths, then run:
+Copy `config.defaults.yaml`, set the catalogue, output, model repository and
+checkpoint paths, then run everything on one machine:
 
 ```bash
-limosat run config.yaml
+limosat run config.yaml      # = prepare, pairs, compose-parquet
 limosat status config.yaml
 ```
 
-The run command uses component labels only to plan compute, resumes completed
-image pairs without overwriting them, composes and freezes one primary global
-parcel catalogue, schedules non-consecutive reappearance pairs only after
-measured trajectory loss, sparsely augments frozen dormant entries, writes
-deformation from primary pair fields, and emits `run-manifest-v5.json`. By
-default, missing-node support extends trajectories from retained matches while
-leaving the primary deformation fields unchanged. The selected post-gate,
-pre-consensus EfficientLoFTR matches are kept as one compressed, checksummed
-SQLite record per completed image pair. To turn this off, set both
-`field.missing_node_fallback: false` and `retain_pair_matches: false`.
-
-Candidate image pairs are registered before inference. By default they span
-1--96 hours, overlap at least 5% of the smaller footprint, and have at least
-1,024 km2 of direct overlap (the area of 64 nominal 4 km field cells). The most
-recent eligible source is selected independently for every fixed 4 km
-planning cell. The union of those cell choices defines the target's primary
-image pairs without a per-target cap. Primary pair fields are independent and
-`pair_workers` controls local CPU concurrency. CUDA runs use one process per
-GPU and keep `pair_workers: 1` so a model is never shared between threads.
-For a bounded diagnostic only, `primary_maximum_pairs_per_target` greedily
-keeps the strongest complementary contributors from that same coverage set;
-its default is `null`, so production planning remains uncapped.
-
-`limosat run` is the portable single-machine interface. Internally it uses the
-same explicit stages available to batch systems:
+or the same stages separately, for example on a scheduler:
 
 ```bash
-limosat prepare config.yaml
-limosat pairs config.yaml --kind primary
-limosat compose config.yaml --phase primary
-limosat pairs config.yaml --kind recovery
-limosat compose config.yaml --phase final
+limosat plan config.yaml                                     # counts only, no model
+limosat prepare config.yaml                                  # register catalogue and plan
+limosat pairs config.yaml --batch-index I --batch-count N    # one deterministic batch
+limosat compose-parquet config.yaml OUTPUT_DIRECTORY
 ```
 
-Pair workers write immutable output NPZ data plus JSON completion markers under
-`pair_product_directory`; they never write SQLite. Each CPU composition stage
-validates and imports those products, then streams trajectory rows into the
-global database. `--batch-index I --batch-count N` partitions pair work
-deterministically for scheduler arrays. These files are resumable work
-products, not cached input tiles or additional deliverables; the finalized
-SQLite and Parquet files remain the products to transfer. See the
-[GPU tile-flow description](docs/operations.md#tile-data-and-gpu-execution) for
-the distinction between COG inputs, RAM tiles, and output NPZ files.
+Pair workers write immutable NPZ data plus JSON completion markers and resume
+completed pairs without recomputing them. CUDA runs use one process per batch and
+`pair_workers: 1`. Production on Olivia uses `scripts/prepare_chain_olivia.py`
+(which writes the production configuration) and `scripts/submit_chain_olivia.sh`
+(prepare -> primary-pairs GPU array -> primary-compose).
 
-Production catalogues should provide platform and absolute orbit metadata.
-Pairs from the same Sentinel-1 platform and absolute orbit are excluded. The
-matcher estimates coarse phase correlation for every independent production
-pair. A response below 0.05 runs both phase-shifted and same-centre hypotheses;
-the normal field and fold gates select the better truth-free result. Too little
-common raster support falls back to same-centre rather than dropping the pair.
-Non-finite phase-correlation output also falls back to same-centre.
-
-Before fine matching, a coarse EfficientLoFTR pass refines each target-tile
-position. It uses the same model and pixel dimensions at 320 m resolution,
-then takes the median displacement of at least 12 matches within 35.84 km of
-the source-tile centre. Fine matching retains its configured resolution
-(default 80 m), source ownership, validity checks and speed limit. Coarse
-matches only position tiles: they never enter displacement fields, deformation
-or trajectories. Missing coarse support retains the initial or earlier-drift
-prior; existing residual-edge recovery remains available after fine matching.
-
-`routing.coarse_matching` defaults to `true`; set it to `false` for fine-only
-routing. Coarse resolution, minimum match count and local support radius are
-configurable in `config.defaults.yaml`. Pair diagnostics record coarse tile
-refinements and fallback reasons; matcher call counts and timings include both
-passes. Each low-response routing hypothesis receives its own coarse pass.
-Better positioning can restore lost matching coverage, but does not guarantee
-correct motion or remove all deformation artifacts from uneven field support.
-
-Optional OSI SAF filtering skips a tile only when complete SIC samples on both
-dates are below 15%.
-
-Inspect the frozen plan without loading the model with `limosat plan
-config.yaml`. See [the April-week GPU rerun procedure](docs/gpu-april-week-rerun.md)
-before inference.
-
-After a native run is complete, package the compact trajectory product and
-assessment checksums with:
-
-```bash
-limosat finalize config.yaml
-```
-
-This writes `global-trajectory-catalogue-v2.parquet` and
-`assessment-summary-v2.json`. SQLite remains the authoritative resumable run
-and contains fields, deformation, provenance, and optional retained matches.
-Parquet finalization imports PyArrow only when requested; PyArrow is not a core
-runtime dependency.
-
-The public Python entry point is direct:
-
-```python
-from limosat import LiMOSATRun, load_config
-
-summary = LiMOSATRun(load_config("config.yaml")).execute()
-```
-
-See [operations](docs/operations.md) for catalogue and recovery behavior,
-[schemas](docs/schemas.md) for the SQLite and manifest contracts, and the
-[production hardening and experiment plan](docs/implementation-plan.md) for
-pending scientific and operational decision gates.
-
-Completed production CSV fields can also be composed without imagery or GPU
-inference. `scripts/replay_global_catalogue_fields.py` creates a new schema-v5
-SQLite catalogue and checksummed field-replay provenance file;
-`scripts/render_global_catalogue.py` creates the static distributions and
-thin-trail pan-Arctic animation. Replay products are analysis outputs outside
-Git, not substitutes for a native run manifest.
+See [operations](docs/operations.md) for planning, matching, pair sharing and
+running, [composition](docs/composition.md) for trajectories and QC, and
+[schemas](docs/schemas.md) for the stored products.
 
 ## Scientific semantics
 
 - Pair fields are independently measured EfficientLoFTR products.
-- Unsupported field nodes have `available = false` and `dx_m = dy_m = NULL`
-  in SQLite; they are never encoded as zero displacement.
+- Unsupported field nodes have `available = false` and NaN displacement; they are
+  never encoded as zero displacement.
 - Trajectories are virtual material points advected only through supported,
-  orientation-preserving fields. Dormant points have no coordinate.
+  orientation-preserving fields; no temporal prediction is included. A gap is
+  simply an image without a row.
 - Sampling preserves successful triangle lookups. At an exact field vertex or
   shared triangle edge, a rejected lookup can use an existing incident triangle
-  that passes the same edge-length and orientation gates. An available vertex
-  without a usable incident triangle remains unsupported.
-- Reappearance requires a measured non-consecutive pair; no temporal prediction
-  is included in the trajectory product.
-- Primary trajectory IDs, entries, measured positions, seeds, and deformation
-  are frozen before measured reappearance is applied.
-- Reappearance fields can fill only frozen dormant entries from frozen primary
-  source measurements. Later full primary fields can continue only a measured
-  reappearance-derived coordinate.
-- Sparse targeted reappearance fields reconnect trajectories but are not emitted
-  as standalone deformation products.
+  that passes the same edge-length and orientation gates.
 
 ## License and citation
 
