@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import pickle
 from dataclasses import asdict, dataclass
@@ -11,11 +12,11 @@ from pathlib import Path
 from typing import Literal, Mapping
 
 import numpy as np
+import shapely
 from shapely.geometry.base import BaseGeometry
 
 from .catalog import ImageCatalogue, ImagePair, ImageRecord
 from .config import RoutingConfig, RunConfig
-from .field import regular_grid
 from .imagery import projected_footprint
 
 
@@ -66,7 +67,7 @@ def run_plan(config: RunConfig, catalogue: ImageCatalogue) -> CandidatePlan:
             value = getattr(config.surface, name)
             if value:
                 key.append(hashlib.sha256(Path(value).read_bytes()).hexdigest())
-        cell_filter = _surface_cell_filter(surface_gate(config), config.routing.planning_grid_spacing_m)
+        cell_filter = _surface_cell_filter(surface_gate(config))
     digest.update(json.dumps(key, sort_keys=True, default=str).encode("utf-8"))
     path = Path(config.output_directory) / "plan-cache" / f"{digest.hexdigest()}.pickle"
     if path.is_file():
@@ -77,6 +78,7 @@ def run_plan(config: RunConfig, catalogue: ImageCatalogue) -> CandidatePlan:
         config.routing,
         grid_spacing_m=config.routing.planning_grid_spacing_m,
         cell_filter=cell_filter,
+        workers=_planning_workers(),
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}")
@@ -84,6 +86,17 @@ def run_plan(config: RunConfig, catalogue: ImageCatalogue) -> CandidatePlan:
         pickle.dump(plan, stream, protocol=pickle.HIGHEST_PROTOCOL)
     os.replace(temporary, path)
     return plan
+
+
+def _planning_workers() -> int:
+    """Processes for planning: LIMOSAT_PLANNING_WORKERS, else the CPUs this process may use."""
+    value = os.environ.get("LIMOSAT_PLANNING_WORKERS")
+    if value:
+        return max(1, int(value))
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:  # pragma: no cover - macOS
+        return max(1, os.cpu_count() or 1)
 
 
 def plan_candidate_pairs(
@@ -100,13 +113,19 @@ def build_candidate_plan(
     config: RoutingConfig,
     grid_spacing_m: float = 4_000.0,
     cell_filter=None,
+    workers: int = 1,
 ) -> CandidatePlan:
     """Plan image pairs and retain deterministic exclusion diagnostics.
 
     Candidates are image pairs within the elapsed-time window whose footprints overlap
-    enough. Primary pairs are chosen by next observation (``_next_observation_selection``)
-    on the planning cells both images image. ``cell_filter(source_image, cells) -> cells``
-    drops planning cells (for example land and open water) first; ``None`` keeps them all.
+    enough. Primary pairs are chosen by next observation on the planning cells both images
+    image. ``cell_filter(source_image, xy_m) -> keep`` drops planning cells (for example land
+    and open water) first; ``None`` keeps them all.
+
+    Planning runs one source image at a time: its cells are a small array on the planning
+    grid, each candidate target is a boolean mask over them, and the selection needs nothing
+    from other sources. Memory therefore stays at one source's worth whatever the period,
+    and sources are planned in parallel with ``workers`` processes (fork).
     """
     if grid_spacing_m <= 0:
         raise ValueError("grid_spacing_m must be positive")
@@ -123,89 +142,42 @@ def build_candidate_plan(
                 "production pair planning requires platform and absolute orbit "
                 f"metadata; missing for {len(missing)} images ({sample})"
             )
-    minimum_seconds = config.candidate_minimum_elapsed_hours * 3_600.0
-    maximum_seconds = config.candidate_maximum_elapsed_hours * 3_600.0
-    footprints = {image.image_id: _footprint(image) for image in images}
-    # (pair, overlap fraction, overlap area, skipped images, planning cells or None)
-    candidates: list[
-        tuple[ImagePair, float | None, float | None, int, frozenset[tuple[int, int]] | None]
-    ] = []
-    exclusions = {
-        "below_minimum_elapsed": 0,
-        "above_maximum_elapsed": 0,
-        "same_acquisition_pass": 0,
-        "below_minimum_overlap": 0,
-        "no_planning_cells": 0,
-        "not_in_pair_allowlist": 0,
-    }
-    for source_index, source in enumerate(images):
-        for target_index, target in enumerate(
-            images[source_index + 1 :], start=source_index + 1
-        ):
-            elapsed = (target.time_utc - source.time_utc).total_seconds()
-            if elapsed > maximum_seconds:
-                exclusions["above_maximum_elapsed"] += len(images) - target_index
-                break
-            if elapsed < minimum_seconds:
-                exclusions["below_minimum_elapsed"] += 1
-                continue
-            pair = ImagePair(source, target)
-            if (
-                config.exclude_same_acquisition_pass
-                and source.same_acquisition_pass(target)
-            ):
-                exclusions["same_acquisition_pass"] += 1
-                continue
-            if config.candidate_pair_ids and pair.pair_id not in config.candidate_pair_ids:
-                exclusions["not_in_pair_allowlist"] += 1
-                continue
-            source_footprint = footprints[source.image_id]
-            target_footprint = footprints[target.image_id]
-            if source_footprint is None or target_footprint is None:
-                candidates.append(
-                    (pair, None, None, target_index - source_index - 1, None)
-                )
-                continue
-            overlap_area = _overlap_area(source_footprint, target_footprint)
-            overlap = _overlap_fraction(
-                source_footprint, target_footprint, overlap_area
-            )
-            if (
-                overlap >= config.candidate_minimum_overlap_fraction
-                and overlap_area >= config.candidate_minimum_overlap_area_m2
-            ):
-                cells = _imaged_cells(source_footprint, target_footprint, grid_spacing_m)
-                if cell_filter is not None:
-                    cells = frozenset(cell_filter(source, cells))
-                if not cells:
-                    exclusions["no_planning_cells"] += 1
-                    continue
-                candidates.append(
-                    (
-                        pair,
-                        overlap,
-                        overlap_area,
-                        target_index - source_index - 1,
-                        cells,
-                    )
-                )
-            else:
-                exclusions["below_minimum_overlap"] += 1
+    global _PLANNING
+    indices = range(len(images))
+    parallel = workers > 1 and len(images) > 1
+    if parallel:
+        import multiprocessing
 
-    primary_ids: set[str] = set()
-    next_observation_counts: dict[str, int] = {}
-    if config.candidate_pair_ids:
-        primary_ids.update(pair.pair_id for pair, *_rest in candidates)
+        context = multiprocessing.get_context("fork")
+        with context.Pool(workers) as pool:          # footprints read the scenes' GCPs
+            footprints = pool.map(_footprint, images, chunksize=16)
     else:
-        next_observation_counts = _next_observation_selection(
-            candidates, primary_ids,
-            config.next_observation_minimum_cells,
-            config.next_observation_backup_after_hours,
-        )
-    by_target: dict[str, list] = {}
-    for candidate in candidates:
-        by_target.setdefault(candidate[0].target.image_id, []).append(candidate)
+        footprints = [_footprint(image) for image in images]
+    _PLANNING = {
+        "images": images,
+        "footprints": footprints,
+        "config": config,
+        "grid_spacing_m": grid_spacing_m,
+        "cell_filter": cell_filter,
+    }
+    try:
+        if parallel:
+            with context.Pool(workers) as pool:
+                results = pool.map(_plan_source, indices, chunksize=16)
+        else:
+            results = [_plan_source(index) for index in indices]
+    finally:
+        _PLANNING = {}
 
+    exclusions: dict[str, int] = {}
+    selection: dict[str, int] = {}
+    candidates = []
+    for source_candidates, source_exclusions, source_selection in results:
+        candidates.extend(source_candidates)
+        for name, value in source_exclusions.items():
+            exclusions[name] = exclusions.get(name, 0) + value
+        for name, value in source_selection.items():
+            selection[name] = selection.get(name, 0) + value
     ordered = sorted(
         candidates,
         key=lambda item: (
@@ -219,38 +191,116 @@ def build_candidate_plan(
         PlannedPair(
             pair=pair,
             ordinal=ordinal,
-            selection="primary" if pair.pair_id in primary_ids else "candidate",
+            selection="primary" if primary else "candidate",
             overlap_fraction=overlap,
             overlap_area_m2=overlap_area,
             skipped_images=skipped_images,
             planning_component_id=pair.source.component_id,
         )
-        for ordinal, (
-            pair,
-            overlap,
-            overlap_area,
-            skipped_images,
-            _cells,
-        ) in enumerate(ordered)
+        for ordinal, (pair, overlap, overlap_area, skipped_images, primary) in enumerate(ordered)
     )
-    counts = {
-        **exclusions,
-        "accepted_candidate_pairs": len(pairs),
-        **next_observation_counts,
-        "candidate_planning_cell_assignments": sum(
-            len(cells) for *_prefix, cells in candidates if cells is not None
-        ),
-        "target_planning_cells": sum(
-            len(
-                set().union(
-                    *(cells for *_prefix, cells in target if cells is not None)
-                )
-            )
-            for target in by_target.values()
-            if any(cells is not None for *_prefix, cells in target)
-        ),
-    }
+    counts = {**exclusions, "accepted_candidate_pairs": len(pairs), **selection}
     return CandidatePlan(pairs, counts)
+
+
+_PLANNING: dict = {}
+_EXCLUSIONS = (
+    "below_minimum_elapsed", "above_maximum_elapsed", "same_acquisition_pass",
+    "below_minimum_overlap", "no_planning_cells", "not_in_pair_allowlist",
+)
+
+
+def _plan_source(source_index: int):
+    """Candidates from one source image and the next-observation selection among them.
+
+    Returns ``([(pair, overlap, overlap_area, skipped_images, primary)], exclusions,
+    selection counts)``.
+    """
+    images = _PLANNING["images"]
+    footprints = _PLANNING["footprints"]
+    config: RoutingConfig = _PLANNING["config"]
+    spacing = _PLANNING["grid_spacing_m"]
+    cell_filter = _PLANNING["cell_filter"]
+    source = images[source_index]
+    source_footprint = footprints[source_index]
+    exclusions = dict.fromkeys(_EXCLUSIONS, 0)
+    minimum_seconds = config.candidate_minimum_elapsed_hours * 3_600.0
+    maximum_seconds = config.candidate_maximum_elapsed_hours * 3_600.0
+    grid = None          # planning-grid points of the source and the cells the filter keeps
+    found = []           # (pair, overlap, overlap_area, skipped, imaged mask or None)
+    for target_index in range(source_index + 1, len(images)):
+        target = images[target_index]
+        elapsed = (target.time_utc - source.time_utc).total_seconds()
+        if elapsed > maximum_seconds:
+            exclusions["above_maximum_elapsed"] += len(images) - target_index
+            break
+        if elapsed < minimum_seconds:
+            exclusions["below_minimum_elapsed"] += 1
+            continue
+        pair = ImagePair(source, target)
+        if config.exclude_same_acquisition_pass and source.same_acquisition_pass(target):
+            exclusions["same_acquisition_pass"] += 1
+            continue
+        if config.candidate_pair_ids and pair.pair_id not in config.candidate_pair_ids:
+            exclusions["not_in_pair_allowlist"] += 1
+            continue
+        target_footprint = footprints[target_index]
+        if source_footprint is None or target_footprint is None:
+            found.append((pair, None, None, target_index - source_index - 1, None))
+            continue
+        overlap_area = _overlap_area(source_footprint, target_footprint)
+        overlap = _overlap_fraction(source_footprint, target_footprint, overlap_area)
+        if not (
+            overlap >= config.candidate_minimum_overlap_fraction
+            and overlap_area >= config.candidate_minimum_overlap_area_m2
+        ):
+            exclusions["below_minimum_overlap"] += 1
+            continue
+        if grid is None:
+            grid = _source_grid(source, source_footprint, spacing, cell_filter)
+        imaged = _imaged_mask(source_footprint, target_footprint, grid)
+        if not imaged.any():
+            exclusions["no_planning_cells"] += 1
+            continue
+        found.append((pair, overlap, overlap_area, target_index - source_index - 1, imaged))
+
+    if config.candidate_pair_ids:
+        primary = {item[0].pair_id for item in found}
+        selection = {}
+    else:
+        primary, selection = _next_observation_selection(
+            found, config.next_observation_minimum_cells, config.next_observation_backup_after_hours,
+        )
+    return (
+        [(pair, overlap, area, skipped, pair.pair_id in primary) for pair, overlap, area, skipped, _mask in found],
+        exclusions,
+        selection,
+    )
+
+
+def _source_grid(source: ImageRecord, footprint: BaseGeometry, spacing: float, cell_filter):
+    """Planning-grid points (multiples of ``spacing``) over the source footprint's bounds,
+    with the mask of points the cell filter keeps."""
+    minx, miny, maxx, maxy = footprint.bounds
+    xs = np.arange(math.ceil(minx / spacing) * spacing, maxx, spacing)
+    ys = np.arange(math.ceil(miny / spacing) * spacing, maxy, spacing)
+    gx, gy = (values.ravel() for values in np.meshgrid(xs, ys))
+    keep = np.ones(len(gx), dtype=bool)
+    if cell_filter is not None and len(gx):
+        inside = shapely.intersects_xy(footprint, gx, gy)
+        if inside.any():
+            keep[inside] = np.asarray(cell_filter(source, np.column_stack((gx[inside], gy[inside]))), dtype=bool)
+    return gx, gy, keep
+
+
+def _imaged_mask(source: BaseGeometry, target: BaseGeometry, grid) -> np.ndarray:
+    """Planning cells of the source that the target also images (no drift allowance), as a
+    mask over the source grid: the grid points inside the intersection of both footprints."""
+    gx, gy, keep = grid
+    domain = source.intersection(target).buffer(0)
+    if domain.is_empty:
+        return np.zeros(len(gx), dtype=bool)
+    return shapely.intersects_xy(domain, gx, gy) & keep
 
 
 def select_overlap_probe(
@@ -322,78 +372,49 @@ def _overlap_fraction(
     return numerator / denominator
 
 
-def _imaged_cells(source: BaseGeometry, target: BaseGeometry, grid_spacing_m: float):
-    """Planning cells of the source that the target also images (no drift allowance)."""
-    _rows, _columns, coordinates = regular_grid(source.intersection(target).buffer(0), grid_spacing_m)
-    return frozenset(
-        (int(round(x / grid_spacing_m)), int(round(y / grid_spacing_m)))
-        for x, y in coordinates
-    )
-
-
-def _surface_cell_filter(gate, grid_spacing_m: float):
-    """``(source_image, cells) -> cells`` keeping cells the gate does not exclude at the
-    source time; one evaluation per source image and cell, cached."""
-    cache: dict[str, dict] = {}
-
-    def keep(source: ImageRecord, cells):
-        if gate is None or not cells:
-            return cells
-        known = cache.setdefault(source.image_id, {})
-        new = [cell for cell in cells if cell not in known]
-        if new:
-            xy = np.asarray(new, dtype=np.float64) * grid_spacing_m
-            excluded = gate.excluded(xy, source.time_utc)
-            known.update(zip(new, (not value for value in excluded)))
-        if len(cache) > 64:
-            cache.pop(next(iter(cache)))
-        return {cell for cell in cells if known[cell]}
+def _surface_cell_filter(gate):
+    """``(source_image, xy_m) -> keep``: cells the surface gate does not exclude at the
+    source time (land, point open water)."""
+    def keep(source: ImageRecord, xy):
+        if gate is None:
+            return np.ones(len(xy), dtype=bool)
+        return ~np.asarray(gate.excluded(xy, source.time_utc), dtype=bool)
 
     return keep
 
 
-def _next_observation_selection(
-    candidates, primary_ids: set[str], minimum_cells: int, backup_after_hours: float | None,
-) -> dict[str, int]:
-    """Keep, per source image, the pairs to the next observation of its cells.
+def _next_observation_selection(found, minimum_cells: int, backup_after_hours: float | None):
+    """The pairs from one source image to the next observation of its cells.
 
-    Candidates carry the cells both images image (after the cell filter). For each source,
-    its candidate pairs are visited in target-time order; a pair is kept when it is the
-    earliest (or, for a backup, the second) observation for at least ``minimum_cells`` of
-    the source's cells. Cells first observed by a kept pair longer than
-    ``backup_after_hours`` also wait for a backup. Returns diagnostic counts; ``primary_ids``
-    is updated in place.
+    ``found`` holds the source's candidates with their imaged-cell masks over a common grid.
+    Candidates are visited in target-time order; a pair is kept when it is the earliest (or,
+    for a backup, the second) observation for at least ``minimum_cells`` of the source's
+    cells. Cells first observed by a kept pair longer than ``backup_after_hours`` also wait
+    for a backup. Returns the kept pair IDs and diagnostic counts.
     """
-    by_source: dict[str, list] = {}
-    for item in candidates:
-        if item[4] is not None:
-            by_source.setdefault(item[0].source.image_id, []).append(item)
-    kept = backups = assigned = imaged_total = unassigned = 0
+    items = sorted((item for item in found if item[4] is not None), key=lambda item: (item[0].target.time_utc, item[0].pair_id))
+    kept_ids: set[str] = set()
+    counts = {"next_observation_pairs": 0, "next_observation_backup_pairs": 0, "next_observation_assigned_cells": 0,
+              "next_observation_kept_pair_cells": 0, "next_observation_cells_without_pair": 0}
+    if not items:
+        return kept_ids, counts
     backup_seconds = None if backup_after_hours is None else backup_after_hours * 3_600.0
-    for source_id in sorted(by_source):
-        items = sorted(by_source[source_id], key=lambda item: (item[0].target.time_utc, item[0].pair_id))
-        need = set().union(*(item[4] for item in items))
-        waiting_backup: set = set()
-        for item in items:
-            pair, cells = item[0], item[4]
-            first = cells & need
-            second = cells & waiting_backup
-            if len(first) + len(second) < minimum_cells:
-                continue
-            primary_ids.add(pair.pair_id)
-            kept += 1
-            backups += int(len(first) < minimum_cells)
-            assigned += len(first) + len(second)
-            imaged_total += len(cells)
-            need -= cells
-            waiting_backup -= cells
-            if backup_seconds is not None and pair.elapsed_seconds > backup_seconds:
-                waiting_backup |= first
-        unassigned += len(need)
-    return {
-        "next_observation_pairs": kept,
-        "next_observation_backup_pairs": backups,
-        "next_observation_assigned_cells": assigned,
-        "next_observation_kept_pair_cells": imaged_total,
-        "next_observation_cells_without_pair": unassigned,
-    }
+    need = np.logical_or.reduce([item[4] for item in items])
+    waiting = np.zeros_like(need)
+    for pair, _overlap, _area, _skipped, cells in items:
+        first = cells & need
+        second = cells & waiting
+        n_first, n_second = int(first.sum()), int(second.sum())
+        if n_first + n_second < minimum_cells:
+            continue
+        kept_ids.add(pair.pair_id)
+        counts["next_observation_pairs"] += 1
+        counts["next_observation_backup_pairs"] += int(n_first < minimum_cells)
+        counts["next_observation_assigned_cells"] += n_first + n_second
+        counts["next_observation_kept_pair_cells"] += int(cells.sum())
+        need &= ~cells
+        waiting &= ~cells
+        if backup_seconds is not None and pair.elapsed_seconds > backup_seconds:
+            waiting |= first
+    counts["next_observation_cells_without_pair"] = int(need.sum())
+    return kept_ids, counts

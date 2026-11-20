@@ -209,7 +209,7 @@ def test_next_observation_backup_for_long_pairs_and_minimum_cells():
 def test_next_observation_cell_filter_drops_land():
     a = _image("a", 0.0, "a", box(0, 0, 100_000, 40_000))
     b = _image("b", 0.25, "b", box(0, 0, 100_000, 40_000))
-    land = lambda image, cells: {cell for cell in cells if cell[0] * 4_000 < 30_000}  # noqa: E731
+    land = lambda image, xy: xy[:, 0] < 30_000  # noqa: E731
     plan = build_candidate_plan(ImageCatalogue([a, b]), RoutingConfig(), cell_filter=land)
     assert plan.exclusion_counts["next_observation_assigned_cells"] < 8 * 11
 
@@ -218,3 +218,11 @@ def test_surface_cell_planning_requires_a_surface_source():
     from limosat.config import RunConfig
     with pytest.raises(ValueError, match="plan_surface_cells"):
         RunConfig("run", "catalogue", "database", "output", routing=RoutingConfig(plan_surface_cells=True))
+
+
+def test_parallel_planning_matches_serial():
+    images = [_image(f"i{k}", k * 0.3, f"c{k}", box(k * 10_000.0, 0, 100_000 + k * 10_000.0, 60_000)) for k in range(8)]
+    serial = build_candidate_plan(ImageCatalogue(images), RoutingConfig(next_observation_backup_after_hours=10.0))
+    parallel = build_candidate_plan(ImageCatalogue(images), RoutingConfig(next_observation_backup_after_hours=10.0), workers=3)
+    assert [(p.pair.pair_id, p.selection, p.ordinal) for p in serial.pairs] == [(p.pair.pair_id, p.selection, p.ordinal) for p in parallel.pairs]
+    assert serial.exclusion_counts == parallel.exclusion_counts

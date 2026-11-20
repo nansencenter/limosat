@@ -540,7 +540,8 @@ _ANY = object()
 _REMOVED_SETTINGS = {
     "routing": {
         "primary_selection": "next_observation",
-        "primary_maximum_pairs_per_target": None,
+        # Ignored by next-observation selection, so any value describes the kept method.
+        "primary_maximum_pairs_per_target": _ANY,
         "source_coverage_completion": False,
         "source_coverage_minimum_cells": _ANY,
         "primary_tiles": "all",
