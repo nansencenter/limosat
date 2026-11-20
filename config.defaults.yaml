@@ -90,5 +90,5 @@ surface:
 trajectories:
   add_as_coverage_enters: true
   new_point_exclusion_radius_m: 2000.0  # production: 3000.0
-  merge_radius_m: null  # e.g. 250.0 merges duplicate trajectories
-  merge_maximum_younger_age_hours: null  # e.g. 48.0 merges only young duplicates
+  merge_radius_m: null  # production (prepare_chain_olivia.py): 250.0
+  merge_maximum_younger_age_hours: null  # production: 48.0 (young duplicates only)

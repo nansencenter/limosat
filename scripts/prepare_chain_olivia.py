@@ -6,7 +6,8 @@ Writes ``control/catalogue.json`` and ``control/config.json`` under the run root
 planning on ice cells (land and AMSR2 ASI open water dropped) with backups for pairs
 longer than 30 h, the OSI-SAF tile gate, land (OSM inland distance) plus ASI point
 open-water exclusion, composition with gap filling and shear point estimates, new points
-seeded 3 km from existing ones and no trajectory merging. Matching ignores the scenes'
+seeded 3 km from existing ones, and young duplicate trajectories (within 250 m, at most
+48 h old, never in an image with the survivor) merged. Matching ignores the scenes'
 band-2 land mask (land comes from the OSM raster). Primary pair products go to a shared
 store keyed by matching fingerprint, so runs with the same matching settings reuse them.
 """
@@ -267,8 +268,10 @@ def run_config(arguments, catalogue, run_root):
         "trajectories": {
             "add_as_coverage_enters": True,
             "new_point_exclusion_radius_m": arguments.new_point_exclusion_radius_m,
-            "merge_radius_m": arguments.merge_radius_m,
-            "merge_maximum_younger_age_hours": arguments.merge_maximum_younger_age_hours,
+            "merge_radius_m": arguments.merge_radius_m or None,
+            "merge_maximum_younger_age_hours": (
+                arguments.merge_maximum_younger_age_hours or None if arguments.merge_radius_m else None
+            ),
         },
     }
     if not arguments.no_pair_store:
@@ -318,10 +321,10 @@ def parser():
     result.add_argument("--backup-after-hours", type=float, default=30.0,
                         help="next-observation pairs longer than this get a backup pair")
     result.add_argument("--new-point-exclusion-radius-m", type=float, default=3000.0)
-    result.add_argument("--merge-radius-m", type=float,
-                        help="merge duplicate trajectories closer than this (default: no merging)")
-    result.add_argument("--merge-maximum-younger-age-hours", type=float,
-                        help="merge only trajectories at most this old (needs --merge-radius-m)")
+    result.add_argument("--merge-radius-m", type=float, default=250.0,
+                        help="merge duplicate trajectories closer than this (0: no merging)")
+    result.add_argument("--merge-maximum-younger-age-hours", type=float, default=48.0,
+                        help="merge only trajectories at most this old (0: any age)")
     result.add_argument(
         "--pair-store", type=Path, default=work_root / "eloftr-pair-store",
         help="shared primary pair-product store (keyed by matching fingerprint); "

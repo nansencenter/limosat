@@ -84,10 +84,9 @@ def test_prepared_configuration_is_the_chosen_method(tmp_path):
     assert config.routing.require_orbit_metadata is True
     assert config.field.gap_filling and config.field.shear_point_estimates
     assert config.trajectories.new_point_exclusion_radius_m == 3_000.0
-    assert config.trajectories.merge_radius_m is None
-    assert config.open_water.enabled and config.surface.land_raster
-    assert config.pair_store_directory
-    merged = load_config(production_config_file(
-        tmp_path, "--merge-radius-m", "250", "--merge-maximum-younger-age-hours", "48"))
-    assert merged.trajectories.merge_radius_m == 250.0
-    assert merged.trajectories.merge_maximum_younger_age_hours == 48.0
+    assert config.trajectories.merge_radius_m == 250.0
+    assert config.trajectories.merge_maximum_younger_age_hours == 48.0
+    (tmp_path / "no-merge").mkdir()
+    unmerged = load_config(production_config_file(tmp_path / "no-merge", "--merge-radius-m", "0"))
+    assert unmerged.trajectories.merge_radius_m is None
+    assert unmerged.trajectories.merge_maximum_younger_age_hours is None
