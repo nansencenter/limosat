@@ -8,8 +8,8 @@ never scores, filters or alters a link. Keep it independent of `limosat.qc`: the
 contract, while the internal files may change.
 
 The result is one Parquet point table per processing period (one row per observation, sorted by time, with
-the Sentinel-1 scene name and an `is_primary` flag for the period's own date window), plus a manifest, a
-generated data dictionary and checksums.
+the Sentinel-1 scene name and an `is_primary` flag for the period's own date window), plus a manifest. The README
+(column definitions, flags, attribution) is written by hand and kept with the deposit, not generated.
 
 ## Format
 
@@ -17,8 +17,6 @@ One Parquet file per processing period, `limosat_<period>.parquet`, flat in the 
 
 - `manifest.json`: schema version, release id, column definitions, flag bits, the primary window of every
   period, and per file the checksum, size, row, trajectory and displacement counts, time and spatial bounds.
-- `DATA_DICTIONARY.md`: generated from the schema constants in `limosat/publish.py`. Do not edit by hand.
-- `checksums.sha256`.
 
 A row is one **observation** of a feature in one Sentinel-1 scene, carrying the displacement from the previous observation.
 A trajectory is the rows with one `trajectory_id` (unique within a period) ordered by `point_index`; the first

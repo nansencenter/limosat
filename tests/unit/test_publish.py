@@ -177,13 +177,12 @@ def test_row_groups_follow_time_and_schema_metadata(tmp_path):
 
 def test_public_outputs_carry_no_local_paths_or_internal_detail(tmp_path):
     manifest, source, _, out = build(tmp_path)
-    public = (out / "manifest.json").read_text() + (out / "DATA_DICTIONARY.md").read_text()
+    public = (out / "manifest.json").read_text()
     assert str(tmp_path) not in public and "internal_protocol" not in public and "qc_" not in public
-    assert (out / "checksums.sha256").read_text() == f"{manifest['files'][0]['sha256']}  limosat_{PERIOD}.parquet\n"
+    assert sorted(p.name for p in out.iterdir()) == sorted(["manifest.json", f"limosat_{PERIOD}.parquet"])  # the README is written by hand
     sidecar = json.loads((tmp_path / "out.provenance.json").read_text())
     assert sidecar["periods"][PERIOD]["protocol_id"] == "internal_protocol"
     assert str(source) in sidecar["source_root"] and not (out / "out.provenance.json").exists()
-    assert "`is_primary`" in (out / "DATA_DICTIONARY.md").read_text()
     assert manifest["totals"] == {"rows": 9, "trajectories": 3, "displacements": 6, "primary_rows": 6, "primary_displacements": 4}
 
 
@@ -244,10 +243,16 @@ def test_existing_output_is_not_overwritten_unless_requested(tmp_path):
     assert again["files"][0]["rows"] == 9
 
 
-def test_data_dictionary_is_generated_from_the_schema():
-    text = publish.data_dictionary()
-    for column in publish.COLUMN_NAMES:
-        assert f"`{column}`" in text
-    for name in publish.FLAG_BITS:
-        assert name in text
+def test_manifest_defines_every_column_and_flag():
+    spec = publish.columns_spec()
+    assert [c["name"] for c in spec] == list(publish.COLUMN_NAMES)
+    assert all(c["description"] for c in spec) and set(publish.FLAG_DESCRIPTIONS) == set(publish.FLAG_BITS)
     assert np.array([c.nullable for c in publish.COLUMNS]).any()
+
+
+@pytest.mark.parametrize("unit", ["ms", "us", "ns"])
+def test_source_time_columns_of_any_unit_give_epoch_milliseconds(unit):
+    import pyarrow as pa
+
+    column = pa.array([1_700_000_000_000], type=pa.int64()).cast(pa.timestamp("ms", tz="UTC")).cast(pa.timestamp(unit, tz="UTC"))
+    assert publish._epoch_ms_array(column).tolist() == [1_700_000_000_000]
