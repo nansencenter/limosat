@@ -49,6 +49,15 @@ def test_each_step_removes_its_own_case():
     assert set(d.index[d.qc_exclusion != ""]) == {5, 40, 70}
 
 
+def test_infinite_correlation_is_removed_but_missing_correlation_is_not():
+    links = pair_links()
+    links.loc[7, "target_corr"] = np.inf
+    links.loc[8, "target_corr"] = np.nan  # interpolated: no correlation, still a valid link
+    d = run(links)
+    assert d.loc[7, "qc_exclusion"] == "INVALID_CORR"
+    assert d.loc[8, "qc_exclusion"] == ""
+
+
 def test_2_to_3_km_needs_correlation_0_50_and_1_to_2_km_needs_0_40():
     links = shift(pair_links(), [69, 70], 2_500.0, 0.0)  # 69 (direct) corroborates 70, so no rogue vector
     links = shift(links, [30], 1_500.0, 0.0)

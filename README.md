@@ -56,9 +56,10 @@ and limitations.
 
 `limosat.publish` converts the internal database outputs into the public dataset
 format and leaves out everything an ordinary data user does not need. The result is
-one Parquet point table per processing period (one row per observation, sorted by
-time, with the Sentinel-1 scene name and an `is_primary` flag for the period's own
-date window), plus a manifest, a generated data dictionary and checksums. See
+one CF-1.8 trajectory NetCDF4 file per processing period (every column a variable,
+trajectories stored in start-time order as a contiguous ragged array, the
+Sentinel-1 scene names as a lookup table, and an `is_primary` flag for the period's
+own date window), plus a manifest. See
 [the published-trajectory format and commands](docs/published_trajectories.md).
 
 ## License

@@ -1,22 +1,32 @@
-"""Convert the internal database outputs into the public LiMOSAT trajectory dataset (schema 2).
+"""Build the public LiMOSAT trajectory dataset (schema 2) as CF NetCDF4, one file per processing period.
 
-The internal outputs of each processing period (kept-link Parquet and manifest, removed links, SQLite) are
-built for our own analysis and checking. This module turns them into a format fit for public use and leaves
-out what an ordinary data user does not need: internal ids and row numbers, quality-control bookkeeping,
-removed links, raw points and local file paths. It never re-scores or alters a link.
+The internal outputs of each processing period (kept-link Parquet and manifest, removed links, SQLite) are built for our
+own analysis and checking. This module turns the internal kept-link Parquet and the period's image catalogue into a format
+fit for public use and leaves out what an ordinary data user does not need: internal ids and row numbers, quality-control
+bookkeeping, removed links, raw points and local file paths. It never re-scores or alters a link.
 
-The public dataset is a *point table*: one row per observation of a trajectory, carrying the displacement
-from the previous observation (dx, dy, speed, interpolation status, correlation, pair statistics and flags), the
-Sentinel-1 scene it belongs to, and an ``is_primary`` flag that marks the rows belonging to the period's own
-date window (selecting ``is_primary`` rows from all periods covers each date once). Rows are sorted by time.
+The released files are self-describing CF-1.8 *trajectory* files in the contiguous ragged array representation (CF 9.3.3):
 
-It reads the internal kept-link Parquet of each period (``<period>/<period>_qc.parquet`` and its manifest)
-and the period's image catalogue. The public schema is defined once, here (``COLUMNS``, ``FLAG_BITS``); the
-schema and a generated data dictionary are written into the release so that readers do not need a second
-copy.
+* dimensions ``trajectory`` (one entry per trajectory), ``obs`` (one per observation) and ``scene`` (Sentinel-1 scene names);
+* ``rowsize(trajectory)`` carries ``sample_dimension = "obs"`` and gives the number of observations of each trajectory, so
+  trajectory *i* is the slice ``offset[i]:offset[i] + rowsize[i]`` of every ``obs`` variable;
+* trajectories are ordered by start time (``time_start``) and the observations of a trajectory by ``point_index``, so a date
+  window is a few contiguous runs and one trajectory is a single slice;
+* a row of the underlying point table is one observation of a feature in one scene, carrying the displacement from the
+  previous observation (dx, dy, speed, interpolation status, correlation, pair statistics and flags) and an ``is_primary``
+  flag that marks the observations belonging to the period's own date window (selecting them from all periods covers each
+  date once); every column is its own variable, ``lon`` and ``lat`` (CF requires them) are added next to the EPSG:3413
+  ``x_m``/``y_m`` the tracker works in, and the scene names are a lookup table (``scene_name``) indexed by ``scene_index``.
 
-Public outputs carry no local paths and no internal protocol detail. Internal provenance (source paths,
-checksums, protocol ids) goes to a sidecar next to, not inside, the output directory.
+No value is rounded or packed: floating point variables are float64/float32 exactly as in the internal files, times are
+float64 seconds, and nulls become the variable's ``_FillValue`` (NaN, or -1 / 255 for the integer flags). Compression is
+lossless (zlib with shuffle). The public schema is defined once, here (``COLUMNS``, ``FLAG_BITS``). ``build`` writes the
+files and ``validate`` re-reads them and compares every Nth trajectory with the source links, value by value.
+
+Public outputs carry no local paths and no internal protocol detail. Internal provenance (source paths, checksums, protocol
+ids) goes to a sidecar next to, not inside, the output directory.
+
+    python -m limosat.publish build --source-root ... --catalog-dir ... --output-dir ... --release-id limosat_v1 --metadata m.json
 """
 
 from __future__ import annotations
@@ -26,6 +36,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -37,7 +48,6 @@ SCHEMA_VERSION = "2.0.0"
 CRS = "EPSG:3413"
 OWNERSHIP_POLICY = "limosat_release_august_annual_v1"
 FIRST_PERIOD_YEAR = 2015  # the first period also owns its first three months (from 1 May 2015)
-ROWS_PER_GROUP = 250_000
 PERIOD_PATTERN = re.compile(r"(\d{4})05_(\d{4})07")
 
 FLAG_BITS = {"FEW_NEIGHBOURS": 0, "LOW_PAIR_DIRECT_SHARE": 1, "MASK_FALSE_LAND": 2}
@@ -124,15 +134,6 @@ def _pyarrow():
     return pa, pc, ds, pq
 
 
-def _arrow_type(name: str):
-    pa, _, _, _ = _pyarrow()
-    return {
-        "string": pa.string(), "int64": pa.int64(), "int32": pa.int32(), "float64": pa.float64(),
-        "float32": pa.float32(), "bool": pa.bool_(), "uint8": pa.uint8(),
-        "timestamp_ms_utc": pa.timestamp("ms", tz="UTC"),
-    }[name]
-
-
 def sha256(path: Path) -> str:
     """Return the SHA-256 checksum of a closed file."""
     digest = hashlib.sha256()
@@ -158,6 +159,13 @@ def ownership_window(period: str) -> tuple[datetime, datetime]:
     year = int(match[1])
     start = datetime(year, 5 if year == FIRST_PERIOD_YEAR else 8, 1, tzinfo=timezone.utc)
     return start, datetime(year + 1, 8, 1, tzinfo=timezone.utc)
+
+
+def _epoch_ms_array(column) -> np.ndarray:
+    """Epoch milliseconds of a source timestamp column of any unit (the internal QC Parquet is ms or us depending on
+    the writer's library versions); fails rather than silently truncating sub-millisecond values."""
+    pa, _, _, _ = _pyarrow()
+    return column.cast(pa.timestamp("ms", tz="UTC")).cast(pa.int64()).to_numpy()
 
 
 def _ms(value: datetime) -> int:
@@ -293,36 +301,61 @@ def inspect_source(parquet: Path, verify_checksum: bool = False) -> Source:
     return Source(period, parquet, manifest_path, manifest)
 
 
-# --------------------------------------------------------------------------------------------- schema
-
-
-def public_schema(release_id: str | None = None, period: str | None = None):
-    pa, _, _, _ = _pyarrow()
-    fields = [
-        pa.field(c.name, _arrow_type(c.type), nullable=c.nullable,
-                 metadata={b"unit": c.unit.encode(), b"description": c.description.encode()})
-        for c in COLUMNS
-    ]
-    metadata = {
-        b"limosat.schema_version": SCHEMA_VERSION.encode(),
-        b"limosat.crs": CRS.encode(),
-        b"limosat.coordinate_units": b"metres",
-        b"limosat.time_units": b"UTC timestamps (millisecond); speed in metres per day",
-        b"limosat.flag_bits": json.dumps(FLAG_BITS).encode(),
-        b"limosat.primary_policy": OWNERSHIP_POLICY.encode(),
-    }
-    if release_id:
-        metadata[b"limosat.release_id"] = release_id.encode()
-    if period:
-        start, stop = ownership_window(period)
-        metadata[b"limosat.period"] = period.encode()
-        metadata[b"limosat.primary_window"] = json.dumps(
-            {"start": _utc_text(start), "stop_exclusive": _utc_text(stop)}).encode()
-    return pa.schema(fields, metadata=metadata)
-
 
 def columns_spec() -> list[dict[str, Any]]:
     return [dict(name=c.name, type=c.type, nullable=c.nullable, unit=c.unit, description=c.description) for c in COLUMNS]
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(text)
+    os.replace(temporary, path)
+
+
+def _read_sample(path: Path, columns: list[str], key: str, modulus: int):
+    """Rows whose trajectory key is divisible by ``modulus``, read row group by row group."""
+    pa, _, _, pq = _pyarrow()
+    parquet = pq.ParquetFile(path)
+    pieces = []
+    for index in range(parquet.num_row_groups):
+        group = parquet.read_row_group(index, columns=columns)
+        mask = (group[key].to_numpy() % modulus) == 0
+        if mask.any():
+            pieces.append(group.filter(pa.array(mask)))
+    return pa.concat_tables(pieces) if pieces else parquet.schema_arrow.empty_table().select(columns)
+
+
+def _netcdf4():
+    try:
+        import netCDF4
+    except ImportError as error:  # pragma: no cover - dependent on environment
+        raise RuntimeError("Writing NetCDF requires netCDF4 (`conda install -c conda-forge netcdf4`).") from error
+    return netCDF4
+
+
+def _pyproj():
+    try:
+        import pyproj
+    except ImportError as error:  # pragma: no cover - dependent on environment
+        raise RuntimeError("Computing longitude and latitude requires pyproj (`conda install -c conda-forge pyproj`).") from error
+    return pyproj
+
+
+FORMAT = "NetCDF-4 (HDF5), CF-1.8 trajectory featureType, contiguous ragged array"
+CHUNK = 65_536
+COMPRESSION_LEVEL = 4
+TIME_UNITS = "seconds since 1970-01-01 00:00:00"
+DEFAULT_METADATA: dict[str, Any] = {
+    "title": "LiMOSAT: Lagrangian sea-ice trajectories from Sentinel-1",
+    "summary": ("Trajectories of features on the Arctic sea ice tracked through consecutive Sentinel-1 EW scenes with "
+                "the LiMOSAT algorithm. One observation per feature and scene; the displacement from the previous "
+                "observation of the trajectory is stored with it."),
+    "keywords": "sea ice drift, Lagrangian trajectories, Sentinel-1, SAR, Arctic",
+    "institution": "Nansen Environmental and Remote Sensing Centre",
+    "source": "Copernicus Sentinel-1 EW GRD scenes, processed with LiMOSAT (https://github.com/nansencenter/limosat)",
+}
+FLAG_MASKS = np.array([1 << bit for bit in FLAG_BITS.values()], dtype=np.uint8)
+SENTINEL_FILL = {"flags": 255, "interpolated": -1}
 
 
 # --------------------------------------------------------------------------------------------- building
@@ -335,19 +368,18 @@ class _Context:
     traj_ids: np.ndarray  # sorted trajectory ids of the source
     first_index: np.ndarray  # first trajectory_link_index of each trajectory
     window_ms: tuple[int, int]
-    schema: Any
     used_scenes: np.ndarray
 
 
-def _column(value, field):
-    if value.type != field.type:
-        value = value.cast(field.type, safe=False)
-    return value
+def _floats(column, dtype) -> np.ndarray:
+    """A float column as numpy with nulls as NaN."""
+    if column.null_count:
+        column = column.fill_null(float("nan"))
+    return column.to_numpy(zero_copy_only=False).astype(dtype, copy=False)
 
 
-def _arrays(ctx: _Context, table, *, ends: bool):
-    """Public columns for the end points (``ends``) or the start points of a table of source links."""
-    pa, pc, _, _ = _pyarrow()
+def _chunk(ctx: _Context, table, *, ends: bool) -> dict[str, np.ndarray]:
+    """Observation arrays for the end points (``ends``) or the start points of a table of source links."""
     n = table.num_rows
     for name in ("qc_trajectory_id", "trajectory_link_index", "source_image_id", "target_image_id",
                  "start_time_utc", "end_time_utc", "x0_m", "y0_m", "x1_m", "y1_m", "target_interpolated", "qc_flags"):
@@ -356,24 +388,21 @@ def _arrays(ctx: _Context, table, *, ends: bool):
     pos = np.searchsorted(ctx.traj_ids, table["qc_trajectory_id"].to_numpy())
     first = ctx.first_index[pos]
     link = table["trajectory_link_index"].to_numpy().astype(np.int64)
-    start_ms = table["start_time_utc"].cast(pa.int64()).to_numpy()
-    end_ms = table["end_time_utc"].cast(pa.int64()).to_numpy()
+    start_ms = _epoch_ms_array(table["start_time_utc"])
+    end_ms = _epoch_ms_array(table["end_time_utc"])
     primary = (start_ms >= ctx.window_ms[0]) & (start_ms < ctx.window_ms[1])
     side = "target" if ends else "source"
-    images = table[f"{side}_image_id"].to_numpy()
     when = end_ms if ends else start_ms
-    scene_pos = _lookup(ctx.catalog, images, when)
+    scene_pos = _lookup(ctx.catalog, table[f"{side}_image_id"].to_numpy(), when)
     ctx.used_scenes[scene_pos] = True
-    schema = ctx.schema
-    values = {
-        "period": pa.repeat(pa.scalar(ctx.period), n),
-        "trajectory_id": table["qc_trajectory_id"],
-        "point_index": pa.array((link - first + 1) if ends else np.zeros(n, dtype=np.int64)),
-        "time": table["end_time_utc" if ends else "start_time_utc"],
-        "scene": ctx.catalog.scenes.take(pa.array(scene_pos)),
-        "x_m": table["x1_m" if ends else "x0_m"],
-        "y_m": table["y1_m" if ends else "y0_m"],
-        "is_primary": pa.array(primary),
+    out = {
+        "tid": table["qc_trajectory_id"].to_numpy().astype(np.int64),
+        "pidx": ((link - first + 1) if ends else np.zeros(n, dtype=np.int64)).astype(np.int32),
+        "ms": when,
+        "x": table["x1_m" if ends else "x0_m"].to_numpy().astype(np.float64),
+        "y": table["y1_m" if ends else "y0_m"].to_numpy().astype(np.float64),
+        "primary": primary.astype(np.int8),
+        "scene": scene_pos.astype(np.int32),
     }
     if ends:
         flags = table["qc_flags"].to_numpy().astype(np.int64)
@@ -382,16 +411,15 @@ def _arrays(ctx: _Context, table, *, ends: bool):
         interpolated = table["target_interpolated"].to_numpy()
         if interpolated.size and not np.isin(interpolated, (0, 1)).all():
             raise ValueError(f"{ctx.period}: target_interpolated is not 0/1")
-        values.update(
-            dx_m=table["dx_m"], dy_m=table["dy_m"], speed_m_per_day=table["speed_m_per_day"],
-            interpolated=pa.array(interpolated.astype(bool)), correlation=table["target_corr"],
-            direct_match_share=table["pair_direct_share"], quality_flags=pa.array(flags.astype(np.uint8)),
-        )
+        out.update(dx=_floats(table["dx_m"], np.float64), dy=_floats(table["dy_m"], np.float64),
+                   speed=_floats(table["speed_m_per_day"], np.float64), interp=interpolated.astype(np.int8),
+                   corr=_floats(table["target_corr"], np.float32), share=_floats(table["pair_direct_share"], np.float32),
+                   flags=flags.astype(np.uint8))
     else:
-        for name in ("dx_m", "dy_m", "speed_m_per_day", "interpolated", "correlation", "direct_match_share", "quality_flags"):
-            values[name] = pa.nulls(n, schema.field(name).type)
-    columns = [_column(values[name], schema.field(name)) for name in COLUMN_NAMES]
-    return pa.Table.from_arrays(columns, schema=pa.schema(list(schema)))
+        nan64, nan32 = np.full(n, np.nan), np.full(n, np.nan, dtype=np.float32)
+        out.update(dx=nan64, dy=nan64.copy(), speed=nan64.copy(), interp=np.full(n, SENTINEL_FILL["interpolated"], dtype=np.int8),
+                   corr=nan32, share=nan32.copy(), flags=np.full(n, SENTINEL_FILL["flags"], dtype=np.uint8))
+    return out
 
 
 def _time_filter(field: str, lo: datetime, hi: datetime):
@@ -400,15 +428,180 @@ def _time_filter(field: str, lo: datetime, hi: datetime):
     return (ds.field(field) >= pa.scalar(lo, type=kind)) & (ds.field(field) < pa.scalar(hi, type=kind))
 
 
-def build_period(
-    source: Source,
-    catalog_path: Path,
-    output: Path,
-    release_id: str,
-    overwrite: bool = False,
-    rows_per_group: int = ROWS_PER_GROUP,
-) -> dict[str, Any]:
-    """Write one period's public Parquet. Streams month by month; returns the manifest entry."""
+def _lonlat(x: np.ndarray, y: np.ndarray, block: int = 4_000_000) -> tuple[np.ndarray, np.ndarray]:
+    transformer = _pyproj().Transformer.from_crs(CRS, "EPSG:4326", always_xy=True)
+    lon, lat = np.empty(len(x)), np.empty(len(x))
+    for start in range(0, len(x), block):
+        stop = start + block
+        lon[start:stop], lat[start:stop] = transformer.transform(x[start:stop], y[start:stop])
+    return lon, lat
+
+
+def _trajectory_order(a: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Row order of the file: trajectories by start time (then id), the observations of a trajectory by point_index."""
+    tid, pidx, ms = a["tid"], a["pidx"], a["ms"]
+    unique, inverse = np.unique(tid, return_inverse=True)
+    first = pidx == 0
+    if int(first.sum()) != len(unique):
+        raise ValueError("every trajectory needs exactly one observation with point_index 0")
+    start = np.empty(len(unique), dtype=np.int64)
+    start[inverse[first]] = ms[first]
+    order = np.lexsort((pidx, unique[inverse], start[inverse]))
+    del inverse, start
+    tid_o, pidx_o, ms_o = tid[order], pidx[order], ms[order]
+    starts = np.r_[0, np.flatnonzero(np.diff(tid_o)) + 1]
+    sizes = np.diff(np.r_[starts, len(tid_o)]).astype(np.int32)
+    if len(starts) != len(unique) or np.any(pidx_o != np.arange(len(pidx_o)) - np.repeat(starts, sizes)):
+        raise ValueError("point_index is not 0, 1, 2, ... within every trajectory")
+    return dict(order=order, tid=tid_o, ms=ms_o, starts=starts, rowsize=sizes)
+
+
+def _crs_variable(ds) -> None:
+    crs = ds.createVariable("crs", "i4")
+    crs.grid_mapping_name = "polar_stereographic"
+    crs.straight_vertical_longitude_from_pole = -45.0
+    crs.latitude_of_projection_origin = 90.0
+    crs.standard_parallel = 70.0
+    crs.false_easting = 0.0
+    crs.false_northing = 0.0
+    crs.semi_major_axis = 6378137.0
+    crs.inverse_flattening = 298.257223563
+    crs.long_name = "NSIDC Sea Ice Polar Stereographic North (EPSG:3413)"
+    crs.epsg_code = CRS
+    crs.crs_wkt = _pyproj().CRS.from_user_input(CRS).to_wkt()
+
+
+def _write_netcdf(path: Path, a: dict[str, np.ndarray], o: dict[str, np.ndarray], scene_names: list[str], scene_index: np.ndarray,
+                  period: str, release_id: str, window: tuple[datetime, datetime], metadata: dict[str, Any],
+                  counts: dict[str, int]) -> None:
+    netCDF4 = _netcdf4()
+    describe = {c.name: c for c in COLUMNS}
+    order, n, ntraj = o["order"], len(o["order"]), len(o["starts"])
+    kw = dict(zlib=True, complevel=COMPRESSION_LEVEL, shuffle=True, chunksizes=(min(CHUNK, n),))
+    kw_traj = dict(zlib=True, complevel=COMPRESSION_LEVEL, shuffle=True, chunksizes=(min(CHUNK, ntraj),))
+    ds = netCDF4.Dataset(path, "w", format="NETCDF4")
+    try:
+        ds.createDimension("trajectory", ntraj)
+        ds.createDimension("obs", n)
+        ds.createDimension("scene", len(scene_names))
+        # ---- trajectory variables
+        v = ds.createVariable("trajectory_id", "i8", ("trajectory",), **kw_traj)
+        v.cf_role = "trajectory_id"
+        v.long_name = "trajectory identifier, unique within the period"
+        v[:] = o["tid"][o["starts"]]
+        v = ds.createVariable("rowsize", "i4", ("trajectory",), **kw_traj)
+        v.long_name = "number of observations in the trajectory"
+        v.sample_dimension = "obs"
+        v[:] = o["rowsize"]
+        ends = np.r_[o["starts"][1:], n] - 1
+        for name, idx, text in (("time_start", o["starts"], "time of the first observation of the trajectory"),
+                                ("time_end", ends, "time of the last observation of the trajectory")):
+            v = ds.createVariable(name, "f8", ("trajectory",), **kw_traj)
+            v.long_name, v.units, v.calendar = text, TIME_UNITS, "standard"
+            v[:] = o["ms"][idx] / 1000.0
+        # ---- observation coordinates
+        coords = "time lat lon"
+        time = ds.createVariable("time", "f8", ("obs",), **kw)
+        time.standard_name, time.long_name = "time", describe["time"].description
+        time.units, time.calendar, time.axis = TIME_UNITS, "standard", "T"
+        time[:] = o["ms"] / 1000.0
+        x, y = a["x"][order], a["y"][order]
+        lon, lat = _lonlat(x, y)
+        for name, values, std, units, axis in (("lat", lat, "latitude", "degrees_north", "Y"),
+                                               ("lon", lon, "longitude", "degrees_east", "X")):
+            v = ds.createVariable(name, "f8", ("obs",), **kw)
+            v.standard_name, v.long_name, v.units, v.axis = std, f"{std} of the observation (WGS 84)", units, axis
+            v[:] = values
+        _crs_variable(ds)
+        for name, values, std in (("x_m", x, "projection_x_coordinate"), ("y_m", y, "projection_y_coordinate")):
+            v = ds.createVariable(name, "f8", ("obs",), **kw)
+            v.standard_name, v.long_name, v.units = std, describe[name].description, "m"
+            v.grid_mapping = "crs"
+            v.coordinates = coords
+            v[:] = values
+        # ---- observation data variables
+        v = ds.createVariable("point_index", "i4", ("obs",), **kw)
+        v.long_name, v.coordinates = describe["point_index"].description, coords
+        v[:] = a["pidx"][order]
+        for name, key, units in (("dx_m", "dx", "m"), ("dy_m", "dy", "m"), ("speed_m_per_day", "speed", "m day-1")):
+            v = ds.createVariable(name, "f8", ("obs",), fill_value=np.nan, **kw)
+            v.long_name, v.units, v.coordinates = describe[name].description, units, coords
+            v[:] = a[key][order]
+        for name, key in (("correlation", "corr"), ("direct_match_share", "share")):
+            v = ds.createVariable(name, "f4", ("obs",), fill_value=np.float32(np.nan), **kw)
+            v.long_name, v.units, v.coordinates = describe[name].description, "1", coords
+            v[:] = a[key][order]
+        v = ds.createVariable("interpolated", "i1", ("obs",), fill_value=np.int8(SENTINEL_FILL["interpolated"]), **kw)
+        v.long_name = describe["interpolated"].description + " (-1 where null)"
+        v.flag_values = np.array([0, 1], dtype=np.int8)
+        v.flag_meanings = "matched interpolated"
+        v.coordinates = coords
+        v[:] = a["interp"][order]
+        v = ds.createVariable("quality_flags", "u1", ("obs",), fill_value=np.uint8(SENTINEL_FILL["flags"]), **kw)
+        v.long_name = describe["quality_flags"].description
+        v.flag_masks = FLAG_MASKS
+        v.flag_meanings = " ".join(FLAG_BITS)
+        v.comment = "; ".join(f"{name}: {text}" for name, text in FLAG_DESCRIPTIONS.items())
+        v.coordinates = coords
+        v[:] = a["flags"][order]
+        v = ds.createVariable("is_primary", "i1", ("obs",), **kw)
+        v.long_name = describe["is_primary"].description
+        v.flag_values = np.array([0, 1], dtype=np.int8)
+        v.flag_meanings = "not_primary primary"
+        v.coordinates = coords
+        v[:] = a["primary"][order]
+        v = ds.createVariable("scene_index", "i4", ("obs",), **kw)
+        v.long_name = "index of the Sentinel-1 scene of the observation into scene_name"
+        v.coordinates = coords
+        v[:] = scene_index
+        width = max(len(name) for name in scene_names)
+        ds.createDimension("scene_strlen", width)
+        v = ds.createVariable("scene_name", "S1", ("scene", "scene_strlen"))  # a char array: valid CF in every NetCDF tool
+        v.long_name = describe["scene"].description
+        v._Encoding = "ascii"
+        v[:] = netCDF4.stringtochar(np.array([name.encode("ascii") for name in scene_names], dtype=f"S{width}"))
+
+        # ---- global attributes
+        meta = {**DEFAULT_METADATA, **metadata}
+        creators = meta.pop("creators", [])
+        ds.Conventions = "CF-1.8, ACDD-1.3"
+        ds.featureType = "trajectory"
+        ds.title = f"{meta.pop('title')} ({period})"
+        ds.summary = meta.pop("summary")
+        ds.keywords = meta.pop("keywords")
+        ds.institution = meta.pop("institution")
+        ds.source = meta.pop("source")
+        if creators:
+            ds.creator_name = "; ".join(c["name"] for c in creators)
+            ds.creator_institution = "; ".join(dict.fromkeys(c.get("affiliation", "") for c in creators if c.get("affiliation")))
+            ds.creator_id = "; ".join(f"https://orcid.org/{c['orcid']}" for c in creators if c.get("orcid"))
+        for key, value in meta.items():
+            ds.setncattr(key, value)
+        ds.product_version = release_id
+        ds.release_id = release_id
+        ds.schema_version = SCHEMA_VERSION
+        ds.period = period
+        ds.primary_window_start = _utc_text(window[0])
+        ds.primary_window_stop_exclusive = _utc_text(window[1])
+        ds.primary_rule = OWNERSHIP_POLICY
+        ds.time_coverage_start = _utc_text(_ms_to_datetime(int(o["ms"].min())))
+        ds.time_coverage_end = _utc_text(_ms_to_datetime(int(o["ms"].max())))
+        ds.geospatial_lat_min, ds.geospatial_lat_max = float(lat.min()), float(lat.max())
+        ds.geospatial_lon_min, ds.geospatial_lon_max = float(lon.min()), float(lon.max())
+        ds.observations, ds.trajectories = np.int64(n), np.int64(ntraj)
+        ds.displacements = np.int64(counts["displacements"])
+        ds.primary_displacements = np.int64(counts["primary_displacements"])
+        ds.history = f"{datetime.now(timezone.utc):%Y-%m-%d}: written by limosat.publish from the internal kept-link table, release {release_id}"
+        ds.comment = ("Contiguous ragged array (CF 9.3.3): trajectory i is obs[offset_i : offset_i + rowsize_i] with offset = "
+                      "cumsum(rowsize) shifted by one. Trajectories are ordered by time_start. Scene names: "
+                      "scene_name[scene_index]. Null displacement values (first observation of a trajectory) are _FillValue.")
+    finally:
+        ds.close()
+
+
+def build_period(source: Source, catalog_path: Path, output: Path, release_id: str, metadata: dict[str, Any] | None = None,
+                 overwrite: bool = False) -> dict[str, Any]:
+    """Write one period's NetCDF file. Reads the source month by month; returns the manifest entry."""
     pa, pc, ds, pq = _pyarrow()
     output = Path(output)
     if output.exists() and not overwrite:
@@ -435,63 +628,55 @@ def build_period(
     span = grouped["trajectory_link_index_max"].to_numpy().astype(np.int64) - first_index + 1
     if not np.array_equal(span, grouped["trajectory_link_index_count"].to_numpy().astype(np.int64)):
         raise ValueError(f"{source.period}: link indices of a trajectory are not consecutive")
-    start_ms = head["start_time_utc"].cast(pa.int64()).to_numpy()
-    end_ms = head["end_time_utc"].cast(pa.int64()).to_numpy()
+    start_ms = _epoch_ms_array(head["start_time_utc"])
+    end_ms = _epoch_ms_array(head["end_time_utc"])
     expected_primary_links = int(((start_ms >= window_ms[0]) & (start_ms < window_ms[1])).sum())
     first_ms, last_ms = int(start_ms.min()), int(end_ms.max())
     n_trajectories = len(traj_ids)
     del head, grouped, start_ms, end_ms
 
-    ctx = _Context(source.period, catalog, traj_ids, first_index, window_ms, public_schema(release_id, source.period),
-                   np.zeros(len(catalog.image_ids), dtype=bool))
+    ctx = _Context(source.period, catalog, traj_ids, first_index, window_ms, np.zeros(len(catalog.image_ids), dtype=bool))
     dataset = ds.dataset(source.parquet, format="parquet")
-    rows = primary_rows = primary_links = end_rows = start_rows = 0
-    time_min = time_max = None
-    bounds = {"x_min": None, "x_max": None, "y_min": None, "y_max": None}
-    months = _month_starts(first_ms, last_ms)
+    pieces: list[dict[str, np.ndarray]] = []
+    end_rows = start_rows = 0
+    for lo in _month_starts(first_ms, last_ms):
+        hi = datetime(lo.year + lo.month // 12, lo.month % 12 + 1, 1, tzinfo=timezone.utc)
+        ends = dataset.to_table(columns=list(SOURCE_COLUMNS), filter=_time_filter("end_time_utc", lo, hi))
+        if ends.num_rows:
+            pieces.append(_chunk(ctx, ends, ends=True))
+            end_rows += ends.num_rows
+        starts = dataset.to_table(columns=list(SOURCE_COLUMNS), filter=_time_filter("start_time_utc", lo, hi))
+        if starts.num_rows:
+            pos = np.searchsorted(ctx.traj_ids, starts["qc_trajectory_id"].to_numpy())
+            is_first = starts["trajectory_link_index"].to_numpy().astype(np.int64) == ctx.first_index[pos]
+            starts = starts.filter(pa.array(is_first))
+            if starts.num_rows:
+                pieces.append(_chunk(ctx, starts, ends=False))
+                start_rows += starts.num_rows
+        del ends, starts
+    arrays = {key: np.concatenate([piece[key] for piece in pieces]) for key in pieces[0]}
+    del pieces
+    rows = len(arrays["tid"])
+    if end_rows != n_links or start_rows != n_trajectories or rows != n_links + n_trajectories:
+        raise ValueError(
+            f"{source.period}: built {rows} rows ({end_rows} displacements, {start_rows} first observations) but the source has "
+            f"{n_links} links and {n_trajectories} trajectories"
+        )
+    primary_rows = int(arrays["primary"].sum())
+    primary_links = int((arrays["primary"].astype(bool) & (arrays["pidx"] > 0)).sum())
+    if primary_links != expected_primary_links:
+        raise ValueError(f"{source.period}: {primary_links} primary displacements, expected {expected_primary_links}")
+    bounds = {"x_min": float(arrays["x"].min()), "x_max": float(arrays["x"].max()),
+              "y_min": float(arrays["y"].min()), "y_max": float(arrays["y"].max())}
+    time_min, time_max = int(arrays["ms"].min()), int(arrays["ms"].max())
+
+    o = _trajectory_order(arrays)
+    used = np.flatnonzero(ctx.used_scenes)
+    scene_names = catalog.scenes.take(pa.array(used)).to_pylist()
+    scene_index = np.searchsorted(used, arrays["scene"][o["order"]]).astype(np.int32)
     try:
-        with pq.ParquetWriter(temporary, ctx.schema, compression="zstd") as writer:
-            for lo in months:
-                hi = datetime(lo.year + lo.month // 12, lo.month % 12 + 1, 1, tzinfo=timezone.utc)
-                pieces = []
-                ends = dataset.to_table(columns=list(SOURCE_COLUMNS), filter=_time_filter("end_time_utc", lo, hi))
-                if ends.num_rows:
-                    pieces.append(_arrays(ctx, ends, ends=True))
-                    end_rows += ends.num_rows
-                starts = dataset.to_table(columns=list(SOURCE_COLUMNS), filter=_time_filter("start_time_utc", lo, hi))
-                if starts.num_rows:
-                    pos = np.searchsorted(ctx.traj_ids, starts["qc_trajectory_id"].to_numpy())
-                    is_first = starts["trajectory_link_index"].to_numpy().astype(np.int64) == ctx.first_index[pos]
-                    starts = starts.filter(pa.array(is_first))
-                    if starts.num_rows:
-                        pieces.append(_arrays(ctx, starts, ends=False))
-                        start_rows += starts.num_rows
-                if not pieces:
-                    continue
-                chunk = pa.concat_tables(pieces).sort_by(
-                    [("time", "ascending"), ("trajectory_id", "ascending"), ("point_index", "ascending")])
-                writer.write_table(chunk, row_group_size=rows_per_group)
-                rows += chunk.num_rows
-                flags_primary = chunk["is_primary"].to_numpy(zero_copy_only=False)
-                primary_rows += int(flags_primary.sum())
-                primary_links += int((flags_primary & (chunk["point_index"].to_numpy() > 0)).sum())
-                span_time = pc.min_max(chunk["time"])
-                lo_t, hi_t = _ms(span_time["min"].as_py()), _ms(span_time["max"].as_py())
-                time_min = lo_t if time_min is None else min(time_min, lo_t)
-                time_max = hi_t if time_max is None else max(time_max, hi_t)
-                for axis in ("x", "y"):
-                    span_axis = pc.min_max(chunk[f"{axis}_m"])
-                    low, high = span_axis["min"].as_py(), span_axis["max"].as_py()
-                    bounds[f"{axis}_min"] = low if bounds[f"{axis}_min"] is None else min(bounds[f"{axis}_min"], low)
-                    bounds[f"{axis}_max"] = high if bounds[f"{axis}_max"] is None else max(bounds[f"{axis}_max"], high)
-                del chunk, pieces, ends, starts
-        if end_rows != n_links or start_rows != n_trajectories or rows != n_links + n_trajectories:
-            raise ValueError(
-                f"{source.period}: wrote {rows} rows ({end_rows} displacements, {start_rows} first observations) but the source has "
-                f"{n_links} links and {n_trajectories} trajectories"
-            )
-        if primary_links != expected_primary_links:
-            raise ValueError(f"{source.period}: {primary_links} primary displacements, expected {expected_primary_links}")
+        _write_netcdf(temporary, arrays, o, scene_names, scene_index, source.period, release_id, window, metadata or {},
+                      {"displacements": n_links, "primary_displacements": primary_links})
         os.replace(temporary, output)
     except Exception:
         if temporary.exists():
@@ -507,7 +692,7 @@ def build_period(
         "displacements": n_links,
         "primary_rows": primary_rows,
         "primary_displacements": primary_links,
-        "scenes": int(ctx.used_scenes.sum()),
+        "scenes": len(scene_names),
         "primary_window": {"start": _utc_text(window[0]), "stop_exclusive": _utc_text(window[1])},
         "time_start": _utc_text(_ms_to_datetime(time_min)),
         "time_end": _utc_text(_ms_to_datetime(time_max)),
@@ -526,58 +711,6 @@ def build_period(
     }
 
 
-def data_dictionary() -> str:
-    """Markdown data dictionary generated from the schema constants."""
-    lines = [
-        f"# LiMOSAT trajectory dataset: data dictionary (schema {SCHEMA_VERSION})",
-        "",
-        "Generated by `limosat.publish` from the schema definition. One Parquet file per processing period.",
-        "",
-        "## What a row is",
-        "",
-        "A row is one **observation** of a feature in one Sentinel-1 scene. The observations of a trajectory",
-        "share `trajectory_id` and are ordered by `point_index`. Every row after the first of a trajectory also",
-        "describes the **displacement** from the previous observation of the same trajectory: `dx_m`, `dy_m`,",
-        "`speed_m_per_day` and the properties of that displacement (`interpolated`, `correlation`,",
-        "`direct_match_share`, `quality_flags`). These displacement columns are null on a trajectory's first row.",
-        "Rows are sorted by `time`.",
-        "Trajectory identifiers are unique only within a period; use (`period`, `trajectory_id`).",
-        "",
-        f"Coordinates are {CRS} metres. Times are UTC.",
-        "",
-        "## Columns",
-        "",
-        "| Column | Type | Unit | Nullable | Description |",
-        "| --- | --- | --- | --- | --- |",
-    ]
-    for c in COLUMNS:
-        lines.append(f"| `{c.name}` | {c.type} | {c.unit} | {'yes' if c.nullable else 'no'} | {c.description} |")
-    lines += ["", "## Flags", "", "| Bit | Name | Meaning |", "| --- | --- | --- |"]
-    for name, bit in FLAG_BITS.items():
-        lines.append(f"| {bit} | `{name}` | {FLAG_DESCRIPTIONS[name]} |")
-    lines += [
-        "",
-        "## Overlapping periods and `is_primary`",
-        "",
-        "Processing periods are 15 months long and overlap their neighbours by three months (May to July). All rows",
-        "of every period are published. The rule `" + OWNERSHIP_POLICY + "` assigns each displacement to one period by its",
-        "start time: a period owns start times from 1 August of its first year up to (not including) 1 August of",
-        "the next year, and the first period also owns its first three months. `is_primary` is true on rows that",
-        "belong to that window. To use each date once, keep `is_primary` rows of all periods. Do not combine non-primary",
-        "rows with primary rows of the neighbouring period: they are independent processings of the same dates.",
-        "",
-        "Windows (start inclusive, stop exclusive) are in `manifest.json`.",
-        "",
-    ]
-    return "\n".join(lines)
-
-
-def _atomic_write(path: Path, text: str) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(text)
-    os.replace(temporary, path)
-
-
 def build(
     source_root: Path,
     catalog_dir: Path,
@@ -586,8 +719,11 @@ def build(
     periods: list[str] | None = None,
     overwrite: bool = False,
     verify_source: bool = True,
+    metadata: dict[str, Any] | None = None,
+    validate_output: bool = True,
+    sample_modulus: int = 50,
 ) -> dict[str, Any]:
-    """Publish every (or the selected) period of an internal release into a flat output directory."""
+    """Publish every (or the selected) period of an internal release into a flat output directory and validate it."""
     source_root, catalog_dir, output_dir = Path(source_root), Path(catalog_dir), Path(output_dir)
     sources = find_sources(source_root, periods)
     if verify_source:
@@ -595,126 +731,142 @@ def build(
     output_dir.mkdir(parents=True, exist_ok=True)
     entries = []
     for source in sources:
-        output = output_dir / f"limosat_{source.period}.parquet"
-        entries.append(build_period(source, find_catalog(catalog_dir, source.period), output, release_id, overwrite))
+        output = output_dir / f"limosat_{source.period}.nc"
+        entries.append(build_period(source, find_catalog(catalog_dir, source.period), output, release_id, metadata, overwrite))
+        print(f"{source.period}: {entries[-1]['bytes'] / 1e6:.0f} MB", flush=True)
     provenance = {entry["period"]: entry.pop("_provenance") for entry in entries}
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "release_id": release_id,
         "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "format": FORMAT,
         "crs": CRS,
         "primary": {"policy_id": OWNERSHIP_POLICY,
                     "definition": "start time of the arriving displacement (own time for point_index 0) in the period's "
                     "half-open window"},
         "flag_bits": FLAG_BITS,
         "columns": columns_spec(),
+        "compression": {"codec": "zlib", "level": COMPRESSION_LEVEL, "shuffle": True, "chunk_observations": CHUNK},
+        "layout": {"dimensions": {"trajectory": "trajectories", "obs": "observations", "scene": "Sentinel-1 scene names"},
+                   "length_variable": "rowsize", "sample_dimension": "obs", "trajectory_order": "time_start ascending"},
         "files": entries,
         "totals": {key: sum(e[key] for e in entries) for key in ("rows", "trajectories", "displacements", "primary_rows", "primary_displacements")},
     }
     _atomic_write(output_dir / "manifest.json", json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-    _atomic_write(output_dir / "DATA_DICTIONARY.md", data_dictionary())
-    _atomic_write(output_dir / "checksums.sha256", "".join(f"{e['sha256']}  {e['file']}\n" for e in entries))
     sidecar = output_dir.with_name(output_dir.name + ".provenance.json")
     _atomic_write(sidecar, json.dumps({"release_id": release_id, "source_root": str(source_root), "periods": provenance},
                                       indent=2, sort_keys=True) + "\n")
+    if validate_output:
+        validate(source_root, catalog_dir, output_dir, sample_modulus)
     return manifest
 
 
 # --------------------------------------------------------------------------------------------- validation
 
 
-def _read_sample(path: Path, columns: list[str], key: str, modulus: int):
-    """Rows whose trajectory key is divisible by ``modulus``, read row group by row group."""
-    pa, _, _, pq = _pyarrow()
-    parquet = pq.ParquetFile(path)
-    pieces = []
-    for index in range(parquet.num_row_groups):
-        group = parquet.read_row_group(index, columns=columns)
-        mask = (group[key].to_numpy() % modulus) == 0
-        if mask.any():
-            pieces.append(group.filter(pa.array(mask)))
-    return pa.concat_tables(pieces) if pieces else parquet.schema_arrow.empty_table().select(columns)
+def _same(a, b, what: str, name: str) -> None:
+    a, b = np.asarray(a), np.asarray(b)
+    if a.shape != b.shape or not np.array_equal(a, b, equal_nan=a.dtype.kind == "f"):
+        raise ValueError(f"{name}: sampled {what} differ from the source")
 
 
 def validate_period(source: Source, catalog_path: Path, output: Path, entry: dict[str, Any], release_id: str,
                     sample_modulus: int = 50) -> dict[str, Any]:
     """Check a published file against the manifest entry and, on a sample of trajectories, against the source."""
+    netCDF4 = _netcdf4()
     pa, pc, _, pq = _pyarrow()
     output = Path(output)
-    if sha256(output) != entry["sha256"]:
-        raise ValueError(f"{output.name}: checksum differs from the manifest")
-    parquet = pq.ParquetFile(output)
-    expected = public_schema(release_id, source.period)
-    if [(f.name, f.type, f.nullable) for f in parquet.schema_arrow] != [(f.name, f.type, f.nullable) for f in expected]:
-        raise ValueError(f"{output.name}: columns differ from the schema")
-    metadata = parquet.schema_arrow.metadata or {}
-    for key, value in (expected.metadata or {}).items():
-        if metadata.get(key) != value:
-            raise ValueError(f"{output.name}: schema metadata {key.decode()} differs")
-    if parquet.metadata.num_rows != entry["rows"]:
-        raise ValueError(f"{output.name}: {parquet.metadata.num_rows} rows, manifest says {entry['rows']}")
-    core = pq.read_table(output, columns=["trajectory_id", "point_index", "time", "is_primary"])
-    time = core["time"].cast(pa.int64()).to_numpy()
-    if (np.diff(time) < 0).any():
-        raise ValueError(f"{output.name}: rows are not sorted by time")
-    per = core.group_by("trajectory_id").aggregate([("point_index", "min"), ("point_index", "max"), ("point_index", "count")])
-    if (per["point_index_min"].to_numpy() != 0).any() or \
-            (per["point_index_max"].to_numpy().astype(np.int64) + 1 != per["point_index_count"].to_numpy()).any():
-        raise ValueError(f"{output.name}: point_index is not 0..n-1 within every trajectory")
-    if per.num_rows != entry["trajectories"]:
-        raise ValueError(f"{output.name}: {per.num_rows} trajectories, manifest says {entry['trajectories']}")
-    primary = core["is_primary"].to_numpy(zero_copy_only=False)
-    if int(primary.sum()) != entry["primary_rows"] or int((primary & (core["point_index"].to_numpy() > 0)).sum()) != entry["primary_displacements"]:
-        raise ValueError(f"{output.name}: primary counts differ from the manifest")
-    del core, per, time
-
-    # Source cross-check on a sample of trajectories: every published displacement must equal its source link.
-    catalog = load_catalog(catalog_path)
+    if sha256(output) != entry["sha256"] or output.stat().st_size != entry["bytes"]:
+        raise ValueError(f"{output.name}: checksum or size differs from the manifest")
     window = ownership_window(source.period)
     w0, w1 = _ms(window[0]), _ms(window[1])
+    d = netCDF4.Dataset(output)
+    d.set_auto_maskandscale(False)
+    try:
+        expected = {"release_id": release_id, "product_version": release_id, "period": source.period, "schema_version": SCHEMA_VERSION,
+                    "featureType": "trajectory", "primary_window_start": _utc_text(window[0]),
+                    "primary_window_stop_exclusive": _utc_text(window[1]), "primary_rule": OWNERSHIP_POLICY}
+        for key, value in expected.items():
+            if getattr(d, key, None) != value:
+                raise ValueError(f"{output.name}: global attribute {key} is {getattr(d, key, None)!r}, expected {value!r}")
+        rowsize = d["rowsize"][:].astype(np.int64)
+        ntraj, n = len(rowsize), int(rowsize.sum())
+        if n != d.dimensions["obs"].size or n != entry["rows"]:
+            raise ValueError(f"{output.name}: {n} observations, manifest says {entry['rows']}")
+        if ntraj != entry["trajectories"] or ntraj != d.dimensions["trajectory"].size:
+            raise ValueError(f"{output.name}: {ntraj} trajectories, manifest says {entry['trajectories']}")
+        ids = d["trajectory_id"][:]
+        if len(np.unique(ids)) != ntraj:
+            raise ValueError(f"{output.name}: trajectory ids are not unique")
+        offset = np.r_[0, np.cumsum(rowsize)]
+        pidx = d["point_index"][:]
+        if np.any(pidx != np.arange(n) - np.repeat(offset[:-1], rowsize)):
+            raise ValueError(f"{output.name}: point_index is not 0..n-1 within every trajectory")
+        time = np.rint(d["time"][:] * 1000).astype(np.int64)
+        tstart, tend = d["time_start"][:], d["time_end"][:]
+        if np.any(np.diff(tstart) < 0) or not np.array_equal(np.rint(tstart * 1000).astype(np.int64), time[offset[:-1]]) \
+                or not np.array_equal(np.rint(tend * 1000).astype(np.int64), time[offset[1:] - 1]):
+            raise ValueError(f"{output.name}: trajectories are not ordered by start time, or time_start/time_end are wrong")
+        primary = d["is_primary"][:].astype(bool)
+        if int(primary.sum()) != entry["primary_rows"] or int((primary & (pidx > 0)).sum()) != entry["primary_displacements"]:
+            raise ValueError(f"{output.name}: primary counts differ from the manifest")
+        if list(d["quality_flags"].flag_masks) != [1 << b for b in FLAG_BITS.values()] or d["quality_flags"].flag_meanings.split() != list(FLAG_BITS):
+            raise ValueError(f"{output.name}: flag masks or meanings differ from the schema")
+
+        # Source cross-check on a sample of trajectories: every published displacement must equal its source link.
+        catalog = load_catalog(catalog_path)
+        keep = np.repeat((ids % sample_modulus) == 0, rowsize)
+        sampled = {name: d[name][:][keep] for name in ("x_m", "y_m", "dx_m", "dy_m", "speed_m_per_day", "correlation",
+                                                          "direct_match_share", "interpolated", "quality_flags", "is_primary")}
+        d.set_auto_chartostring(False)
+        names = np.array(netCDF4.chartostring(d["scene_name"][:], encoding="ascii").tolist(), dtype=object)
+        scene = names[d["scene_index"][:][keep]]
+        tid_s, pidx_s, ms_s = np.repeat(ids, rowsize)[keep], pidx[keep], time[keep]
+    finally:
+        d.close()
     src = _read_sample(source.parquet, list(SOURCE_COLUMNS), "qc_trajectory_id", sample_modulus)
-    pub = _read_sample(output, list(COLUMN_NAMES), "trajectory_id", sample_modulus)
 
-    def col(table, name):
-        return table[name].to_numpy(zero_copy_only=False)
+    def col(name):
+        return src[name].to_numpy(zero_copy_only=False)
 
-    s_order = np.lexsort((col(src, "trajectory_link_index"), col(src, "qc_trajectory_id")))
-    p_order = np.lexsort((col(pub, "point_index"), col(pub, "trajectory_id")))
-    src, pub = src.take(pa.array(s_order)), pub.take(pa.array(p_order))
-    if pub.num_rows != src.num_rows + len(set(col(src, "qc_trajectory_id").tolist())):
+    s_order = np.lexsort((col("trajectory_link_index"), col("qc_trajectory_id")))
+    p_order = np.lexsort((pidx_s, tid_s))
+    src = src.take(pa.array(s_order))
+    tid_s, pidx_s, ms_s, scene = tid_s[p_order], pidx_s[p_order], ms_s[p_order], scene[p_order]
+    sampled = {k: v[p_order] for k, v in sampled.items()}
+    if len(tid_s) != src.num_rows + len(set(col("qc_trajectory_id").tolist())):
         raise ValueError(f"{output.name}: sampled row count is not links + trajectories")
-    p_idx = col(pub, "point_index")
-    is_step = p_idx > 0
-    step = pub.filter(pa.array(is_step))
-    first = pub.filter(pa.array(~is_step))
-    start_ms = src["start_time_utc"].cast(pa.int64()).to_numpy()
-    end_ms = src["end_time_utc"].cast(pa.int64()).to_numpy()
-
-    def same(a, b, name):
-        if not np.array_equal(np.asarray(a), np.asarray(b), equal_nan=np.asarray(a).dtype.kind == "f"):
-            raise ValueError(f"{output.name}: sampled {name} differ from the source")
-
-    same(col(step, "trajectory_id"), col(src, "qc_trajectory_id"), "trajectory ids")
-    same(step["time"].cast(pa.int64()).to_numpy(), end_ms, "end times")
-    same(col(step, "x_m"), col(src, "x1_m"), "x"); same(col(step, "y_m"), col(src, "y1_m"), "y")
-    same(col(step, "dx_m"), col(src, "dx_m"), "dx"); same(col(step, "dy_m"), col(src, "dy_m"), "dy")
-    same(col(step, "speed_m_per_day"), col(src, "speed_m_per_day"), "speed")
-    same(col(step, "interpolated"), col(src, "target_interpolated").astype(bool), "interpolated")
-    same(col(step, "correlation"), col(src, "target_corr").astype(np.float32), "correlation")
-    same(col(step, "direct_match_share"), col(src, "pair_direct_share").astype(np.float32), "direct_match_share")
-    same(col(step, "quality_flags"), col(src, "qc_flags").astype(np.uint8), "quality_flags")
-    same(col(step, "is_primary"), (start_ms >= w0) & (start_ms < w1), "is_primary flags")
-    position = np.searchsorted(catalog.image_ids, col(src, "target_image_id"))
-    same(col(step, "scene"), np.asarray(catalog.scenes.take(pa.array(position)).to_pylist(), dtype=object), "scenes")
-    # chain: the observation before each displacement is its source (position and time)
-    previous = pub.take(pa.array(np.flatnonzero(is_step) - 1))
-    same(col(previous, "x_m"), col(src, "x0_m"), "chain x"); same(col(previous, "y_m"), col(src, "y0_m"), "chain y")
-    same(previous["time"].cast(pa.int64()).to_numpy(), start_ms, "chain times")
-    same(col(previous, "trajectory_id"), col(src, "qc_trajectory_id"), "chain trajectory")
-    # first rows have no displacement values
-    for name in ("dx_m", "dy_m", "speed_m_per_day", "interpolated", "correlation", "direct_match_share", "quality_flags"):
-        if first[name].null_count != first.num_rows:
-            raise ValueError(f"{output.name}: first observations carry values in {name}")
+    is_step = pidx_s > 0
+    step = np.flatnonzero(is_step)
+    first = np.flatnonzero(~is_step)
+    start_ms, end_ms = _epoch_ms_array(src["start_time_utc"]), _epoch_ms_array(src["end_time_utc"])
+    name = output.name
+    _same(tid_s[step], col("qc_trajectory_id"), "trajectory ids", name)
+    _same(ms_s[step], end_ms, "end times", name)
+    _same(sampled["x_m"][step], col("x1_m"), "x", name)
+    _same(sampled["y_m"][step], col("y1_m"), "y", name)
+    _same(sampled["dx_m"][step], col("dx_m"), "dx", name)
+    _same(sampled["dy_m"][step], col("dy_m"), "dy", name)
+    _same(sampled["speed_m_per_day"][step], col("speed_m_per_day"), "speed", name)
+    _same(sampled["interpolated"][step], col("target_interpolated").astype(np.int8), "interpolated", name)
+    _same(sampled["correlation"][step], _floats(src["target_corr"], np.float32), "correlation", name)
+    _same(sampled["direct_match_share"][step], _floats(src["pair_direct_share"], np.float32), "direct_match_share", name)
+    _same(sampled["quality_flags"][step], col("qc_flags").astype(np.uint8), "quality_flags", name)
+    _same(sampled["is_primary"][step].astype(bool), (start_ms >= w0) & (start_ms < w1), "is_primary flags", name)
+    catalog_names = np.asarray(catalog.scenes.to_pylist(), dtype=object)
+    _same(scene[step], catalog_names[np.searchsorted(catalog.image_ids, col("target_image_id"))], "scenes", name)
+    # chain: the observation before each displacement is its source (position, time and scene)
+    prev = step - 1
+    _same(sampled["x_m"][prev], col("x0_m"), "chain x", name)
+    _same(sampled["y_m"][prev], col("y0_m"), "chain y", name)
+    _same(ms_s[prev], start_ms, "chain times", name)
+    _same(tid_s[prev], col("qc_trajectory_id"), "chain trajectory", name)
+    _same(scene[prev], catalog_names[np.searchsorted(catalog.image_ids, col("source_image_id"))], "chain scenes", name)
+    # first observations have no displacement values
+    if not (np.isnan(sampled["dx_m"][first]).all() and np.isnan(sampled["dy_m"][first]).all() and np.isnan(sampled["speed_m_per_day"][first]).all()
+            and np.isnan(sampled["correlation"][first]).all() and np.isnan(sampled["direct_match_share"][first]).all()
+            and (sampled["interpolated"][first] == SENTINEL_FILL["interpolated"]).all() and (sampled["quality_flags"][first] == SENTINEL_FILL["flags"]).all()):
+        raise ValueError(f"{name}: first observations carry displacement values")
     return {"period": source.period, "status": "passed", "rows": entry["rows"], "sampled_displacements": int(is_step.sum()),
             "sample_modulus": sample_modulus}
 
@@ -728,6 +880,7 @@ def validate(source_root: Path, catalog_dir: Path, output_dir: Path, sample_modu
         source = inspect_source(Path(source_root) / period / f"{period}_qc.parquet")
         results.append(validate_period(source, find_catalog(catalog_dir, period), output_dir / entry["file"],
                                        entry, manifest["release_id"], sample_modulus))
+        print(json.dumps(results[-1]), flush=True)
     return results
 
 
@@ -735,7 +888,7 @@ def validate(source_root: Path, catalog_dir: Path, output_dir: Path, sample_modu
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     commands = parser.add_subparsers(dest="command", required=True)
     for name in ("build", "validate"):
         command = commands.add_parser(name)
@@ -745,21 +898,24 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--output-dir", type=Path, required=True)
         if name == "build":
             command.add_argument("--release-id", required=True)
+            command.add_argument("--metadata", type=Path, help="JSON with title, summary, keywords, creators, license, acknowledgement, ...")
             command.add_argument("--period", action="append", dest="periods")
             command.add_argument("--overwrite", action="store_true")
             command.add_argument("--skip-source-checksum", action="store_true",
                                  help="do not hash the source Parquet files against their manifests")
-        else:
-            command.add_argument("--sample-modulus", type=int, default=50,
-                                 help="check every Nth trajectory against the source (1 checks all)")
+            command.add_argument("--no-validate", action="store_true", help="skip the validation that normally follows the build")
+        command.add_argument("--sample-modulus", type=int, default=50,
+                             help="check every Nth trajectory against the source (1 checks all)")
     return parser
 
 
 def main(argv: list[str] | None = None) -> None:
     args = _parser().parse_args(argv)
     if args.command == "build":
-        result = build(args.source_root, args.catalog_dir, args.output_dir, args.release_id, args.periods,
-                       args.overwrite, not args.skip_source_checksum)
+        metadata = json.loads(args.metadata.read_text()) if args.metadata else None
+        result = build(args.source_root, args.catalog_dir, args.output_dir, args.release_id, args.periods, args.overwrite,
+                       not args.skip_source_checksum, metadata, not args.no_validate, args.sample_modulus)
+        result = result["totals"]
     else:
         result = validate(args.source_root, args.catalog_dir, args.output_dir, args.sample_modulus)
     print(json.dumps(result, indent=2, sort_keys=True, default=str))

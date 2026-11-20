@@ -22,6 +22,7 @@ in act first. A removed link gets the code of the step that removed it and split
 | Step | Code | A link is removed when |
 | --- | --- | --- |
 | 0 | `SPEED` | its speed over the actual image gap is above 60 km/day |
+| 0 | `INVALID_CORR` | its matching correlation is infinite (flat-window division by zero in the template matcher; only in periods processed before limosat PR #69). Missing correlations, i.e. interpolated points, are kept |
 | 1 | `OPEN_WATER` | sea-ice concentration is below 15% at either endpoint; links with no value are kept |
 | 1 | `LAND` | its deeper endpoint is at least 1 km inland on the land raster |
 | 2 | `ISOLATED_UNVERIFIED` | no other surviving link of its image pair lies within 30 km, and the gap is over 54 h or the speed over 25 km/day |

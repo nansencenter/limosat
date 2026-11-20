@@ -6,6 +6,9 @@ and later neighbour tests use cleaner neighbours. Every removed link gets the co
 removed it and splits its trajectory.
 
 0. ``SPEED``: speed over the actual image gap above 60 km/day (physically impossible).
+   ``INVALID_CORR``: the link's matching correlation is infinite (a flat-window division by zero in the
+   template matcher, fixed upstream in PR #69, so it only occurs in older periods): not a valid match.
+   Missing correlations (interpolated points) are not affected.
 1. ``OPEN_WATER``: sea-ice concentration below 15% at either endpoint (links with no value kept);
    ``LAND``: the deeper endpoint at least 1 km inland on the supplied land raster.
 2. ``ISOLATED_UNVERIFIED``: no other link of the image pair within 30 km, and a gap over 54 h or a
@@ -39,7 +42,7 @@ from .v3 import score_pair_isolation
 
 PROTOCOL_ID = "limosat_qc_v1_draft_20261028"
 PROTOCOL_PATH = Path(__file__).resolve().parent / "protocols" / "limosat_qc.json"
-STEPS = ("SPEED", "OPEN_WATER", "LAND", "ISOLATED_UNVERIFIED", "ROGUE_VECTOR", "INTERP_UNSUPPORTED")
+STEPS = ("SPEED", "INVALID_CORR", "OPEN_WATER", "LAND", "ISOLATED_UNVERIFIED", "ROGUE_VECTOR", "INTERP_UNSUPPORTED")
 # Bit 2, MASK_FALSE_LAND, is added to a finished release by an amendment (see docs/trajectory_qc.md); this module never sets it.
 FLAG_BITS = {"FEW_NEIGHBOURS": 0, "LOW_PAIR_DIRECT_SHARE": 1}
 
@@ -150,6 +153,11 @@ def decide(links: pd.DataFrame, cfg: LimosatQCConfig, land, sic, local: QCConfig
     speed = (d.speed_m_per_day > cfg.max_speed_m_per_day).to_numpy()
     reason[speed] = "SPEED"
     alive = ~speed
+
+    # step 0: infinite correlation is not a valid match (missing correlation, i.e. interpolation, is fine)
+    invalid_corr = alive & np.isinf(d.target_corr.to_numpy(float))
+    reason[invalid_corr] = "INVALID_CORR"
+    alive &= ~invalid_corr
 
     # step 1: position (sea-ice concentration, land)
     d["inland_start_km"] = land.lookup(d.x0_m.to_numpy(), d.y0_m.to_numpy())
@@ -487,11 +495,15 @@ def write_points_sqlite(raw_database: Path, output_dir: Path, period: str, manif
     tmp = out.with_suffix(".sqlite.part")
     tmp.unlink(missing_ok=True)
     points = point_trajectories(output_dir, period, int(manifest["new_trajectory_id_base"]))
-    con = sqlite3.connect(tmp)
+    # URI filenames in ATTACH only work when the main connection itself was opened with uri=True
+    # (some Python builds, e.g. uv's, do not enable them by default)
+    from urllib.parse import quote
+
+    con = sqlite3.connect(f"file:{quote(str(tmp.resolve()))}", uri=True)
     try:
         for pragma in ("journal_mode=OFF", "synchronous=OFF", "temp_store=MEMORY", "cache_size=-400000"):
             con.execute(f"PRAGMA {pragma}")
-        con.execute("ATTACH DATABASE ? AS src", (f"file:{Path(raw_database).resolve()}?mode=ro",))
+        con.execute("ATTACH DATABASE ? AS src", (f"file:{quote(str(Path(raw_database).resolve()))}?mode=ro",))
         table = con.execute("select name, sql from src.sqlite_master where type = 'table'").fetchone()
         name, ddl = table[0], table[1]
         qc_table = f"{name}__qc"
