@@ -35,7 +35,7 @@ MATCHING_MODULES = (
     "efficientloftr.py", "field.py", "imagery.py", "models.py", "pairs.py",
     "routing.py", "surface.py", "tile_gates.py",
 )
-MATCHING_MODULES_SHA256 = "f6824bea95bec3e43b902503001e6eab47f17631744243c5137edb02ba2056d4"
+MATCHING_MODULES_SHA256 = "026e06e135459eb7c879ad37761468ab6801a53a61b6a20fb49207fdfa925824"
 
 
 def test_every_configuration_setting_is_classified_for_pair_identity():
@@ -153,19 +153,3 @@ def test_compose_mixes_producer_versions_only_under_a_shared_fingerprint():
     _check_producers({"a" * 64, "b" * 64}, {3}, "recovery")
     with pytest.raises(ValueError, match="recovery pair products have multiple"):
         _check_producers({"a" * 64, "b" * 64}, {2}, "recovery")
-
-
-def test_prior_displacement_file_changes_identity_only_when_set(tmp_path):
-    from dataclasses import replace
-    from limosat.config import RoutingConfig, RunConfig
-    from limosat.pair_identity import matching_sha256
-    from limosat.pairs import _prior_displacement
-    base = RunConfig("run", "catalogue", "database", "output")
-    assert "prior_displacement_file" not in base.to_dict()["routing"]
-    priors = tmp_path / "priors.json"
-    priors.write_text('{"a__b": [1000.0, -2000.0]}')
-    with_prior = replace(base, routing=RoutingConfig(prior_displacement_file=str(priors)))
-    assert matching_sha256(with_prior) != matching_sha256(base)
-    assert _prior_displacement(str(priors), "a__b") == (1000.0, -2000.0)
-    assert _prior_displacement(str(priors), "c__d") is None
-    assert _prior_displacement("", "a__b") is None

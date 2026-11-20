@@ -83,7 +83,6 @@ EXCLUDED_SETTINGS = {
         "source_coverage_completion", "source_coverage_minimum_cells",
         "primary_selection", "next_observation_minimum_cells",
         "next_observation_backup_after_hours", "plan_surface_cells",
-        "prior_displacement_file", "primary_tiles",
     ),
     "open_water": ("sic_root",),
     "surface": (
@@ -102,27 +101,19 @@ def matching_settings(config) -> dict:
     if not config.surface.land_raster:
         # Without a land raster the inland distance threshold has no effect.
         settings["surface"] = {}
-    if config.routing.primary_tiles != "all":
-        # Partial primary products (assigned tiles only) must never mix with full ones;
-        # only present when set, so full products keep their identity.
-        settings["routing"]["primary_tiles"] = config.routing.primary_tiles
     return json.loads(json.dumps(settings))
 
 
 def matching_inputs(config) -> dict:
     """Content checksums of the run-wide inputs a pair product depends on."""
     matcher = config.matcher
-    inputs = {
+    return {
         "model_checkpoint_sha256": _file_checksum(matcher.checkpoint) if matcher.checkpoint else None,
         "model_source_sha256": _source_tree_sha256(matcher.repository) if matcher.repository else None,
         "land_raster_sha256": (
             _file_checksum(config.surface.land_raster) if config.surface.land_raster else None
         ),
     }
-    if config.routing.prior_displacement_file:
-        # Only present when set, so products without priors keep their identity.
-        inputs["prior_displacement_sha256"] = _file_checksum(config.routing.prior_displacement_file)
-    return inputs
 
 
 def matching_identity(config) -> dict:

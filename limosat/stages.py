@@ -26,7 +26,7 @@ from .pair_identity import write_scene_checksums
 from .pair_products import PAIR_PRODUCT_SCHEMA_VERSION, PairProductStore
 from .pair_queue import loss_targeted_pairs
 from .pairs import PairProcessor
-from .planning import PlannedPair, assigned_positions, run_plan, recovery_candidates
+from .planning import PlannedPair, run_plan, recovery_candidates
 from .recovery import RecoveryTargetStore, load_recovery_target_manifest
 from .store import RunStore
 from .trajectory import (
@@ -503,14 +503,6 @@ class RunStages:
             if index % batch_count == batch_index
         )
         if kind == "primary":
-            if self.config.routing.primary_tiles == "assigned":
-                plan = run_plan(self.config, self.catalogue)
-                spacing = self.config.routing.planning_grid_spacing_m
-                yield from (
-                    PairWork(item, assigned_positions(plan, item.pair.pair_id, spacing))
-                    for item in assigned
-                )
-                return
             yield from (PairWork(item) for item in assigned)
             return
         by_id = {item.pair.pair_id: item for item in assigned}

@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import math
-from functools import lru_cache
-from pathlib import Path
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field as dataclass_field, replace
@@ -231,10 +229,6 @@ class PairProcessor:
                 diagnostics["phase_correlation_status"] = "same_center_fallback"
                 if self.config.routing.phase_correlation_failure == "error":
                     raise
-        prior = _prior_displacement(self.config.routing.prior_displacement_file, pair.pair_id)
-        if prior is not None and previous_field is None and not domain.is_empty:
-            hypotheses.append(("drift_prior", prior))
-            diagnostics["drift_prior_displacement_m"] = float(np.hypot(*prior))
         evaluated = [
             (
                 name,
@@ -1144,19 +1138,6 @@ def _combine(batches: list[MotionMatches]) -> MotionMatches:
         np.concatenate([item.source_tile for item in batches]),
         np.concatenate([item.target_tile for item in batches]),
     )
-
-
-@lru_cache(maxsize=2)
-def _prior_displacements(path: str) -> dict:
-    import json
-
-    return {key: (float(value[0]), float(value[1])) for key, value in json.loads(Path(path).read_text()).items()}
-
-
-def _prior_displacement(path: str, pair_id: str) -> tuple[float, float] | None:
-    if not path:
-        return None
-    return _prior_displacements(path).get(pair_id)
 
 
 def _hypothesis_quality(result: _HypothesisResult) -> tuple:

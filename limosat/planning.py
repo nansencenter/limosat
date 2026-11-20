@@ -34,9 +34,6 @@ class PlannedPair:
 class CandidatePlan:
     pairs: tuple[PlannedPair, ...]
     exclusion_counts: Mapping[str, int]
-    # pair_id -> (n, 2) int32 planning-cell indices the pair is the next observation (or
-    # backup) for; only with routing.primary_tiles == "assigned".
-    assigned_cells: Mapping[str, np.ndarray] | None = None
 
 
 def run_plan(config: RunConfig, catalogue: ImageCatalogue) -> CandidatePlan:
@@ -244,17 +241,14 @@ def build_candidate_plan(
     for candidate in candidates:
         by_target.setdefault(candidate[0].target.image_id, []).append(candidate)
     next_observation_counts: dict[str, int] = {}
-    assigned_cells = None
     if config.candidate_pair_ids:
         primary_ids.update(pair.pair_id for pair, *_rest in candidates)
         primary_pairs_before_target_maximum = len(primary_ids)
     elif next_observation:
-        assigned_cells = {} if config.primary_tiles == "assigned" else None
         next_observation_counts = _next_observation_selection(
             candidates, primary_ids,
             config.next_observation_minimum_cells,
             config.next_observation_backup_after_hours,
-            assigned_cells,
         )
     else:
         for target_candidates in by_target.values():
@@ -355,17 +349,7 @@ def build_candidate_plan(
             selected_recovery
         ),
     }
-    return CandidatePlan(pairs, counts, assigned_cells)
-
-
-def assigned_positions(plan: CandidatePlan, pair_id: str, grid_spacing_m: float) -> np.ndarray:
-    """Centres (m) of the planning cells a primary pair was assigned, for targeted matching."""
-    if plan.assigned_cells is None:
-        raise ValueError("the plan records no assigned cells (routing.primary_tiles != assigned)")
-    cells = plan.assigned_cells.get(pair_id)
-    if cells is None:
-        raise KeyError(f"no assigned cells for primary pair {pair_id}")
-    return np.asarray(cells, dtype=np.float64) * grid_spacing_m
+    return CandidatePlan(pairs, counts)
 
 
 def recovery_candidates(
@@ -526,7 +510,6 @@ def _surface_cell_filter(gate, grid_spacing_m: float):
 
 def _next_observation_selection(
     candidates, primary_ids: set[str], minimum_cells: int, backup_after_hours: float | None,
-    assigned_cells: dict | None = None,
 ) -> dict[str, int]:
     """Keep, per source image, the pairs to the next observation of its cells.
 
@@ -554,8 +537,6 @@ def _next_observation_selection(
             if len(first) + len(second) < minimum_cells:
                 continue
             primary_ids.add(pair.pair_id)
-            if assigned_cells is not None:
-                assigned_cells[pair.pair_id] = np.array(sorted(first | second), dtype=np.int32).reshape(-1, 2)
             kept += 1
             backups += int(len(first) < minimum_cells)
             assigned += len(first) + len(second)
