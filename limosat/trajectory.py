@@ -113,11 +113,95 @@ class TrajectoryBatch:
 @dataclass(frozen=True)
 class _Continuation:
     source_step: int
-    edge: FieldEdge
+    pair_id: str
+    source_time_utc: datetime
     displacement_m: np.ndarray
     selected_matches: float
     support_radius_m: float
     maximum_residual_m: float
+    edge: FieldEdge | None = None
+
+
+@dataclass(frozen=True)
+class PairSpec:
+    """A primary pair as composition schedules it (no field data)."""
+
+    pair_id: str
+    source_image_id: str
+    target_image_id: str
+    source_time_utc: datetime
+
+
+@dataclass(frozen=True)
+class PairSamples:
+    """One pair's field sampled at the positions of its source image: the tracks it can
+    continue (ascending identity, target validity applied) and their step values."""
+
+    pair_id: str
+    identities: tuple[str, ...]
+    displacement_m: np.ndarray
+    selected_matches: np.ndarray
+    support_radius_m: np.ndarray
+    maximum_residual_m: np.ndarray
+    product: dict | None = None
+
+
+def sample_edge(
+    edge: FieldEdge,
+    identities: Sequence[str],
+    queries: np.ndarray,
+    field_config: FieldConfig,
+    target_validity: TargetValidity | None = None,
+) -> PairSamples:
+    """Sample a pair field at ``queries`` (the positions of ``identities``, ascending)."""
+    empty = PairSamples(edge.field.pair_id, (), np.empty((0, 2)), np.empty(0), np.empty(0), np.empty(0))
+    if not len(identities):
+        return empty
+    sampled = sample_field_with_fallback(
+        edge.field, edge.fallback_field, queries,
+        field_config.maximum_triangle_edge_m,
+        field_config=field_config, gap_matches=edge.gap_matches,
+    )
+    indices = np.flatnonzero(sampled.available)
+    if target_validity is not None and len(indices):
+        target_xy = queries[indices] + sampled.displacement_m[indices]
+        valid = np.asarray(target_validity(target_xy), dtype=bool)
+        if valid.shape != (len(indices),):
+            raise ValueError("target validity must return one flag per endpoint")
+        indices = indices[valid]
+    return PairSamples(
+        edge.field.pair_id,
+        tuple(identities[i] for i in indices),
+        np.asarray(sampled.displacement_m[indices], dtype=np.float64),
+        np.asarray(sampled.selected_matches[indices], dtype=np.float64),
+        np.asarray(sampled.support_radius_m[indices], dtype=np.float64),
+        np.asarray(sampled.maximum_residual_m[indices], dtype=np.float64),
+    )
+
+
+def _choose(
+    samples: Sequence[tuple[int, datetime, PairSamples, FieldEdge | None]],
+    excluded: set[str] | frozenset[str] = frozenset(),
+) -> dict[str, _Continuation]:
+    """The best supported continuation per track over the incoming pairs, visited in
+    their composition order (``_continuation_key``; ties keep the earlier one)."""
+    chosen: dict[str, _Continuation] = {}
+    for source_step, source_time, values, edge in samples:
+        for k, identity in enumerate(values.identities):
+            if identity in excluded:
+                continue
+            candidate = _Continuation(
+                source_step, values.pair_id, source_time,
+                values.displacement_m[k],
+                float(values.selected_matches[k]),
+                float(values.support_radius_m[k]),
+                float(values.maximum_residual_m[k]),
+                edge,
+            )
+            current = chosen.get(identity)
+            if current is None or _continuation_key(candidate) > _continuation_key(current):
+                chosen[identity] = candidate
+    return chosen
 
 
 def iter_global_trajectory_batches(
@@ -129,11 +213,62 @@ def iter_global_trajectory_batches(
     target_validity_factory: TargetValidityFactory | None = None,
     seed_filter_factory: SeedFilterFactory | None = None,
 ) -> Iterator[TrajectoryBatch]:
+    """Compose in-memory pair fields (see ``compose_batches``), sampling each pair in this
+    process as soon as its source image is complete."""
+    by_id = {edge.field.pair_id: edge for edge in edges}
+    ordered = tuple(sorted(images, key=lambda image: (image.time_utc, image.image_id)))
+    validity: dict[int, TargetValidity | None] = {}
+
+    def submit(pair_id, identities, queries, target_step):
+        if target_validity_factory is not None and target_step not in validity and len(identities):
+            validity[target_step] = target_validity_factory(ordered[target_step])
+        return _Done(sample_edge(by_id[pair_id], identities, queries, field_config, validity.get(target_step)))
+
+    def nodes(pair_id):
+        field = by_id[pair_id].field
+        return field.source_xy_m[field.available]
+
+    specs = [
+        PairSpec(edge.field.pair_id, edge.field.source_image_id, edge.field.target_image_id,
+                 edge.field.source_time_utc)
+        for edge in edges
+    ]
+    yield from compose_batches(specs, images, trajectory_config, nodes=nodes, submit=submit,
+                               seed_filter_factory=seed_filter_factory, edges=by_id)
+
+
+class _Done:
+    """A completed result with the ``Future.result()`` interface."""
+
+    def __init__(self, value):
+        self._value = value
+
+    def result(self):
+        return self._value
+
+
+def compose_batches(
+    pairs: Sequence[PairSpec],
+    images: Sequence[ImageRecord],
+    trajectory_config: TrajectoryConfig,
+    *,
+    nodes: Callable[[str], np.ndarray],
+    submit: Callable[[str, tuple[str, ...], np.ndarray, int], object],
+    seed_filter_factory: SeedFilterFactory | None = None,
+    edges: dict[str, FieldEdge] | None = None,
+) -> Iterator[TrajectoryBatch]:
     """Yield deterministic points and direct extensions for each image.
 
     At each image a trajectory continues from its most recent position through the best
     supported incoming primary pair field. Gaps are not stored: a trajectory simply has
     no row on an image that a pair from its last position reaches without supporting it.
+
+    Pair fields are not held here. Once an image is complete (continuations, merges and
+    new seeds), each pair leaving it is handed to ``submit(pair_id, identities, queries,
+    target_step)``, which returns a future of the pair's ``PairSamples`` at those
+    positions; the futures are collected when the pair's target image is composed. So
+    sampling can run in other processes, ahead of the sequential choice of continuations.
+    ``nodes(pair_id)`` gives a pair's field nodes with a displacement (new seeds).
     """
     ordered_images = tuple(
         sorted(images, key=lambda image: (image.time_utc, image.image_id))
@@ -144,19 +279,22 @@ def iter_global_trajectory_batches(
     if len(image_keys) != len(set(image_keys)):
         raise ValueError("trajectory image identity must be globally unique")
     image_index = {image_id: index for index, image_id in enumerate(image_keys)}
-    indexed: list[tuple[int, int, FieldEdge]] = []
-    for edge in edges:
-        source = image_index.get(edge.source_image_id)
-        target = image_index.get(edge.target_image_id)
+    indexed: list[tuple[int, int, PairSpec]] = []
+    for spec in pairs:
+        source = image_index.get(spec.source_image_id)
+        target = image_index.get(spec.target_image_id)
         if source is None or target is None or source >= target:
             raise ValueError("every pair field must point forward between listed images")
-        indexed.append((source, target, edge))
-    indexed.sort(key=lambda item: (item[1], item[0], item[2].field.pair_id))
-    incoming_by_target: dict[int, list[tuple[int, int, FieldEdge]]] = {}
+        indexed.append((source, target, spec))
+    indexed.sort(key=lambda item: (item[1], item[0], item[2].pair_id))
+    incoming_by_target: dict[int, list[tuple[int, int, PairSpec]]] = {}
+    outgoing_by_source: dict[int, list[tuple[int, int, PairSpec]]] = {}
     for item in indexed:
         incoming_by_target.setdefault(item[1], []).append(item)
+        outgoing_by_source.setdefault(item[0], []).append(item)
 
     positions: list[dict[str, np.ndarray]] = [dict() for _ in ordered_images]
+    pending: dict[str, object] = {}
     identities: set[str] = set()
     observations: dict[str, int] = {}
     merged: set[str] = set()
@@ -165,7 +303,7 @@ def iter_global_trajectory_batches(
     created_step: dict[str, int] = {}
     young_steps: dict[str, list[int]] = {}
     last_use: dict[int, int] = {}
-    for source, target, _edge in indexed:
+    for source, target, _spec in indexed:
         last_use[source] = max(last_use.get(source, target), target)
 
     for step, image in enumerate(ordered_images):
@@ -173,26 +311,14 @@ def iter_global_trajectory_batches(
         extensions: list[TrajectoryExtension] = []
         merges: list[MergeEvent] = []
         if step:
-            incoming = incoming_by_target.get(step, ())
-            eligible = sorted(
-                {
-                    identity
-                    for source_step, _target_step, _edge in incoming
-                    for identity in positions[source_step]
-                } - merged
-            )
-            target_validity = (
-                target_validity_factory(image)
-                if target_validity_factory is not None and eligible else None
-            )
-            chosen = _supported_continuations(
-                incoming, positions, eligible, field_config,
-                target_validity=target_validity,
-            )
-            for identity in eligible:
-                continuation = chosen.get(identity)
-                if continuation is None:
-                    continue
+            samples = [
+                (source_step, spec.source_time_utc, pending.pop(spec.pair_id).result(),
+                 edges.get(spec.pair_id) if edges else None)
+                for source_step, _target_step, spec in incoming_by_target.get(step, ())
+            ]
+            chosen = _choose(samples, merged)
+            for identity in sorted(chosen):
+                continuation = chosen[identity]
                 source_xy = positions[continuation.source_step][identity]
                 xy = source_xy + continuation.displacement_m
                 positions[step][identity] = xy
@@ -203,7 +329,7 @@ def iter_global_trajectory_batches(
                         "observed",
                         "primary_pair_field",
                         xy,
-                        continuation.edge.field.pair_id,
+                        continuation.pair_id,
                         continuation.selected_matches,
                         continuation.support_radius_m,
                         continuation.maximum_residual_m,
@@ -213,7 +339,7 @@ def iter_global_trajectory_batches(
                 extensions.append(
                     TrajectoryExtension(
                         trajectory_id=identity,
-                        pair_id=continuation.edge.field.pair_id,
+                        pair_id=continuation.pair_id,
                         source_image_id=source_image.image_id,
                         target_image_id=image.image_id,
                         start_time_utc=source_image.time_utc,
@@ -273,7 +399,7 @@ def iter_global_trajectory_batches(
                 del young_steps[identity]
 
         if trajectory_config.add_as_coverage_enters:
-            candidates = _outgoing_primary_points(indexed, step)
+            candidates = _outgoing_points(outgoing_by_source.get(step, ()), nodes)
             if seed_filter_factory is not None and len(candidates):
                 candidates = candidates[
                     np.asarray(seed_filter_factory(image)(candidates), dtype=bool)
@@ -296,6 +422,15 @@ def iter_global_trajectory_batches(
                 points.append(
                     _point(identity, image, "created", "seed_grid", xy, None)
                 )
+        # The image is complete: sample every pair leaving it at its positions.
+        if outgoing_by_source.get(step):
+            identities_here = tuple(sorted(positions[step]))
+            queries = (
+                np.vstack([positions[step][identity] for identity in identities_here])
+                if identities_here else np.empty((0, 2), dtype=np.float64)
+            )
+            for _source_step, target_step, spec in outgoing_by_source[step]:
+                pending[spec.pair_id] = submit(spec.pair_id, identities_here, queries, target_step)
         yield TrajectoryBatch(
             points=tuple(sorted(points, key=lambda point: point.trajectory_id)),
             extensions=tuple(
@@ -406,52 +541,28 @@ def _supported_continuations(
     *,
     target_validity: TargetValidity | None = None,
 ) -> dict[str, _Continuation]:
-    chosen: dict[str, _Continuation] = {}
+    """Best continuation per identity over in-memory incoming pair fields."""
     identity_set = set(identities)
+    samples = []
     for source_step, _target_step, edge in incoming:
-        eligible = sorted(identity_set.intersection(positions[source_step]))
+        eligible = tuple(sorted(identity_set.intersection(positions[source_step])))
         if not eligible:
             continue
         queries = np.vstack([positions[source_step][identity] for identity in eligible])
-        sampled = sample_field_with_fallback(
-            edge.field, edge.fallback_field, queries,
-            field_config.maximum_triangle_edge_m,
-            field_config=field_config, gap_matches=edge.gap_matches,
-        )
-        candidate_indices = np.flatnonzero(sampled.available)
-        if target_validity is not None and len(candidate_indices):
-            target_xy = queries[candidate_indices] + sampled.displacement_m[candidate_indices]
-            valid = np.asarray(target_validity(target_xy), dtype=bool)
-            if valid.shape != (len(candidate_indices),):
-                raise ValueError("target validity must return one flag per endpoint")
-            candidate_indices = candidate_indices[valid]
-        for local_index in candidate_indices:
-            identity = eligible[local_index]
-            candidate = _Continuation(
-                source_step,
-                edge,
-                sampled.displacement_m[local_index],
-                float(sampled.selected_matches[local_index]),
-                float(sampled.support_radius_m[local_index]),
-                float(sampled.maximum_residual_m[local_index]),
-            )
-            current = chosen.get(identity)
-            if current is None or _continuation_key(candidate) > _continuation_key(
-                current
-            ):
-                chosen[identity] = candidate
-    return chosen
+        samples.append((source_step, edge.field.source_time_utc,
+                        sample_edge(edge, eligible, queries, field_config, target_validity), edge))
+    return _choose(samples)
 
 
 def _continuation_key(candidate: _Continuation) -> tuple:
     residual = candidate.maximum_residual_m
     radius = candidate.support_radius_m
     return (
-        candidate.edge.field.source_time_utc,
+        candidate.source_time_utc,
         candidate.selected_matches,
         -residual if np.isfinite(residual) else -np.inf,
         -radius if np.isfinite(radius) else -np.inf,
-        _reverse_text(candidate.edge.field.pair_id),
+        _reverse_text(candidate.pair_id),
     )
 
 
@@ -466,12 +577,8 @@ def _utc(value: datetime, name: str) -> datetime:
     return value.astimezone(timezone.utc)
 
 
-def _outgoing_primary_points(indexed, source_step: int) -> np.ndarray:
-    values = [
-        edge.field.source_xy_m[edge.field.available]
-        for source, _target, edge in indexed
-        if source == source_step
-    ]
+def _outgoing_points(outgoing, nodes) -> np.ndarray:
+    values = [nodes(spec.pair_id) for _source, _target, spec in outgoing]
     values = [value for value in values if len(value)]
     return (
         np.unique(np.vstack(values), axis=0)

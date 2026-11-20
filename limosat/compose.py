@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
 import os
-from collections import Counter, deque
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict
+from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import asdict, replace
 from pathlib import Path
 
 from .catalog import load_catalogue
@@ -15,12 +16,11 @@ from .config import RunConfig
 from .field import field_edge_with_fallback
 from .imagery import pass_pixel_validity_factory
 from .surface import seed_filter_factory, surface_gate, surface_validity_factory
-from .models import FieldEdge
 from .pair_products import PAIR_PRODUCT_SCHEMA_VERSION, PairProductStore
 from .planning import run_plan
 from .qc import QC_PROTOCOL_ID, ExtensionQCConfig, ScoredExtension, score_extensions
 from .store import file_sha256
-from .trajectory import TrajectoryPoint, iter_global_trajectory_batches
+from .trajectory import PairSpec, TrajectoryPoint, _Done, compose_batches, sample_edge
 
 
 COMPOSITION_SCHEMA_VERSION = 1
@@ -57,22 +57,37 @@ def compose_primary_parquet(
     plan = run_plan(config, catalogue)
     primary = tuple(item for item in plan.pairs if item.selection == "primary")
     # A shared store may hold other runs' pairs too; every planned pair must load
-    # (a missing one raises below), extra ones are ignored.
+    # (a missing one raises when it is sampled), extra ones are ignored.
     products = PairProductStore(config)
+    images = catalogue.chronological()
+    ordered_images = tuple(sorted(images, key=lambda image: (image.time_utc, image.image_id)))
+    by_pair_id = {item.pair.pair_id: item for item in primary}
+    specs = [
+        PairSpec(item.pair.pair_id, item.pair.source.image_id, item.pair.target.image_id,
+                 item.pair.source.time_utc)
+        for item in primary
+    ]
+    validity_factory = surface_validity_factory(
+        pass_pixel_validity_factory(images, config.analysis_epsg, config.matcher.scene_mask_invalid_from),
+        surface_gate(config),
+    )
+    digests: dict[str, tuple[str, str, str]] = {}
+    global _COMPOSE
+    _COMPOSE = {"config": config, "products": products, "pairs": by_pair_id,
+                "images": ordered_images, "validity_factory": validity_factory, "validity": {}}
+    workers = _compose_workers()
+    executor = (
+        ProcessPoolExecutor(workers, mp_context=multiprocessing.get_context("fork"))
+        if workers > 1 else None
+    )
 
-    edges: list[FieldEdge] = []
-    producer_hashes: set[str] = set()
-    product_set = hashlib.sha256()
-    for item, product in zip(primary, _load_primary_products(products, primary)):
-        if product is None:
-            raise RuntimeError(f"primary pair product is missing: {item.pair.pair_id}")
-        producer_hashes.add(product.producer_implementation_sha256)
-        product_set.update(item.pair.pair_id.encode("utf-8"))
-        product_set.update(product.sha256.encode("ascii"))
-        product_set.update(product.content_sha256.encode("ascii"))
-        edges.append(field_edge_with_fallback(
-            product.result.field, product.result.matches, config.field
-        ))
+    def submit(pair_id, identities, queries, target_step):
+        if executor is None:
+            return _Done(_sample_pair(pair_id, identities, queries, target_step))
+        return executor.submit(_sample_pair, pair_id, identities, queries, target_step)
+
+    def nodes(pair_id):
+        return products.field_nodes(by_pair_id[pair_id].pair)
 
     point_schema = _point_schema(pa, config)
     extension_schema = _extension_schema(pa, config, qc)
@@ -88,18 +103,12 @@ def compose_primary_parquet(
     qc_statuses: Counter[str] = Counter()
     merge_rows: list[dict] = []
     try:
-        for batch in iter_global_trajectory_batches(
-            edges,
-            catalogue.chronological(),
-            config.field,
+        for batch in compose_batches(
+            specs,
+            images,
             config.trajectories,
-            target_validity_factory=surface_validity_factory(
-                pass_pixel_validity_factory(
-                    catalogue.chronological(), config.analysis_epsg,
-                    config.matcher.scene_mask_invalid_from,
-                ),
-                surface_gate(config),
-            ),
+            nodes=nodes,
+            submit=_recording(submit, digests),
             seed_filter_factory=seed_filter_factory(surface_gate(config)),
         ):
             if batch.points:
@@ -144,6 +153,9 @@ def compose_primary_parquet(
                            merges_temporary, compression="zstd")
             os.replace(merges_temporary, merges_path)
     finally:
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+        _COMPOSE = {}
         if point_writer is not None:
             point_writer.close()
         if extension_writer is not None:
@@ -151,6 +163,16 @@ def compose_primary_parquet(
         points_temporary.unlink(missing_ok=True)
         extensions_temporary.unlink(missing_ok=True)
 
+    missing = [item.pair.pair_id for item in primary if item.pair.pair_id not in digests]
+    if missing:
+        raise RuntimeError(f"primary pair products were never sampled: {missing[:3]}")
+    producer_hashes = {digests[item.pair.pair_id][2] for item in primary}
+    product_set = hashlib.sha256()
+    for item in primary:
+        sha256, content_sha256, _producer = digests[item.pair.pair_id]
+        product_set.update(item.pair.pair_id.encode("utf-8"))
+        product_set.update(sha256.encode("ascii"))
+        product_set.update(content_sha256.encode("ascii"))
     manifest = {
         "composition_schema_version": COMPOSITION_SCHEMA_VERSION,
         "trajectory_point_schema_version": TRAJECTORY_POINT_SCHEMA_VERSION,
@@ -208,24 +230,56 @@ def compose_primary_parquet(
     }
 
 
-def _load_primary_products(products: PairProductStore, primary, workers: int = 8):
-    """Load (and checksum) primary products on threads, in plan order.
+# Composition state shared with forked sampling workers (set in compose_primary_parquet).
+_COMPOSE: dict = {}
 
-    At most twice ``workers`` products are held at once, since each carries its
-    full match arrays.
-    """
 
-    def load(item):
-        return products.load(item.pair)
+def _compose_workers() -> int:
+    """Sampling processes: LIMOSAT_COMPOSE_WORKERS, else the CPUs this process may use."""
+    value = os.environ.get("LIMOSAT_COMPOSE_WORKERS")
+    if value:
+        return max(1, int(value))
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:  # pragma: no cover - macOS
+        return max(1, os.cpu_count() or 1)
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        pending = deque()
-        for item in primary:
-            pending.append(pool.submit(load, item))
-            if len(pending) >= 2 * workers:
-                yield pending.popleft().result()
-        while pending:
-            yield pending.popleft().result()
+
+def _sample_pair(pair_id, identities, queries, target_step):
+    """Load and verify one pair product, sample it at its source positions with the
+    target image's validity, and return the samples with the product's checksums."""
+    state = _COMPOSE
+    config = state["config"]
+    item = state["pairs"][pair_id]
+    product = state["products"].load(item.pair)
+    if product is None:
+        raise RuntimeError(f"primary pair product is missing: {pair_id}")
+    validity = None
+    if len(identities):
+        cache = state["validity"]
+        if target_step not in cache:
+            if len(cache) > 8:
+                cache.pop(next(iter(cache)))
+            cache[target_step] = state["validity_factory"](state["images"][target_step])
+        validity = cache[target_step]
+    edge = field_edge_with_fallback(product.result.field, product.result.matches, config.field)
+    samples = sample_edge(edge, identities, queries, config.field, validity)
+    return replace(samples, product=(product.sha256, product.content_sha256,
+                                     product.producer_implementation_sha256))
+
+
+def _recording(submit, digests):
+    """Wrap ``submit`` so each result's product checksums are kept for the manifest."""
+    class _Recorded:
+        def __init__(self, future, pair_id):
+            self.future, self.pair_id = future, pair_id
+
+        def result(self):
+            value = self.future.result()
+            digests[self.pair_id] = value.product
+            return value
+
+    return lambda pair_id, *args: _Recorded(submit(pair_id, *args), pair_id)
 
 
 def _point_row(point: TrajectoryPoint) -> dict:

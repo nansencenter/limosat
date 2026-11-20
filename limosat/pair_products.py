@@ -306,6 +306,15 @@ class PairProductStore:
             producer_implementation_sha256,
         )
 
+    def field_nodes(self, pair: ImagePair) -> np.ndarray:
+        """The pair field's nodes with a displacement (source coordinates), read without
+        the matches; the full product is verified when it is sampled."""
+        data_path, _marker_path = self._paths(pair.pair_id)
+        with np.load(data_path, allow_pickle=False) as values:
+            xy = np.asarray(values["source_xy_m"], dtype=np.float64)
+            available = np.asarray(values["available"], dtype=bool)
+        return xy[available]
+
     def count(self) -> int:
         """Completed products in the store (a shared store also holds other runs' pairs)."""
         directory = self.directory
