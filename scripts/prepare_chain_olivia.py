@@ -4,7 +4,8 @@
 Writes ``control/catalogue.json`` and ``control/config.json`` under the run root for
 ``submit_chain_olivia.sh``. The configuration is the production one: next-observation
 planning on ice cells (land and AMSR2 ASI open water dropped) with backups for pairs
-longer than 30 h, the OSI-SAF tile gate, land (OSM inland distance) plus ASI point
+longer than 30 h and for cells within 10 km/day times the interval of the target's edge,
+the OSI-SAF tile gate, land (OSM inland distance) plus ASI point
 open-water exclusion, composition with gap filling and shear point estimates, new points
 seeded 3 km from existing ones, and young duplicate trajectories (within 250 m, at most
 48 h old, never in an image with the survivor) merged. Matching ignores the scenes'
