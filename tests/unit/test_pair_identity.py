@@ -20,6 +20,7 @@ from limosat.pair_identity import (
     EXCLUDED_SETTINGS,
     MATCHING_SETTINGS,
     MATCHING_VERSION,
+    OPTIONAL_MATCHING_SETTINGS,
     SceneChecksums,
     matching_sha256,
     write_scene_checksums,
@@ -35,7 +36,7 @@ MATCHING_MODULES = (
     "efficientloftr.py", "field.py", "imagery.py", "models.py", "pairs.py",
     "routing.py", "surface.py", "tile_gates.py",
 )
-MATCHING_MODULES_SHA256 = "4dbce451b5fcc268f2b3090e6b2f09b81aa5e51bdfa14d9a166ce1ae5ecaa968"
+MATCHING_MODULES_SHA256 = "7016cb2fdfa1116e3eba5dcd9e0f40aa4520dfb92bcd4542b505ae40a9379966"
 
 
 def test_every_configuration_setting_is_classified_for_pair_identity():
@@ -47,6 +48,7 @@ def test_every_configuration_setting_is_classified_for_pair_identity():
         names = {item.name for item in fields(cls)}
         matching = set(MATCHING_SETTINGS[name])
         excluded = set(EXCLUDED_SETTINGS[name])
+        matching |= set(OPTIONAL_MATCHING_SETTINGS.get(name, {}))
         assert not matching & excluded, name
         assert matching | excluded == names, f"unclassified {name} settings: {names - matching - excluded}"
     run_fields = {item.name for item in fields(RunConfig)} - set(sections) - {"analysis_epsg"}
@@ -139,3 +141,23 @@ def test_matching_modules_digest_is_recorded():
         "matching code changed: bump MATCHING_VERSION in limosat/pair_identity.py if pair "
         f"products change, then record {digest.hexdigest()} in this test"
     )
+
+
+def test_optional_matcher_settings_change_the_fingerprint_only_when_set(tmp_path):
+    from dataclasses import replace
+    base = config(tmp_path)
+    same = replace(base, matcher=replace(base.matcher, tile_contrast="scene", coarse_confidence_threshold=None))
+    assert matching_sha256(same) == matching_sha256(base)
+    for matcher in (replace(base.matcher, tile_contrast="tile_percentile"),
+                    replace(base.matcher, coarse_confidence_threshold=20.0)):
+        assert matching_sha256(replace(base, matcher=matcher)) != matching_sha256(base)
+
+
+def test_tile_percentile_stretch_keeps_invalid_pixels_and_spreads_valid_ones():
+    import numpy as np
+    from limosat.efficientloftr import tile_percentile_stretch
+    tile = np.zeros((64, 64), np.uint8)
+    tile[:, 16:] = np.tile(np.arange(100, 148, dtype=np.uint8), (64, 1))
+    out = tile_percentile_stretch(tile)
+    assert (out[:, :16] == 0).all() and (out[:, 16:] >= 1).all()
+    assert out[:, 16:].max() == 255 and out[:, 16:].min() == 1

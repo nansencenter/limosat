@@ -29,6 +29,7 @@ class EfficientLoFTR:
             Path(config.checkpoint),
             self.device,
             graph_mode=config.prefix_cuda_graph and self.device.type == "cuda",
+            coarse_threshold=config.coarse_confidence_threshold,
         )
         if self.device.type == "cuda":
             torch.backends.cuda.matmul.allow_tf32 = False
@@ -74,7 +75,8 @@ class EfficientLoFTR:
 
         def tensor(images: Sequence[np.ndarray]):
             values = np.stack(
-                [_tile_image(image, self.config.tile_size_px) for image in images]
+                [_tile_image(image, self.config.tile_size_px, self.config.tile_contrast)
+                 for image in images]
             )
             return (
                 torch.from_numpy(values)
@@ -182,13 +184,29 @@ def _run_dynamic_suffix(model: Any, encoded, image_shape) -> dict[str, Any]:
     return data
 
 
-def _tile_image(image: np.ndarray, tile_size_px: int) -> np.ndarray:
+def _tile_image(image: np.ndarray, tile_size_px: int, contrast: str = "scene") -> np.ndarray:
     values = np.asarray(image)
     if values.shape != (tile_size_px, tile_size_px):
         raise ValueError(
             f"matcher tile must have shape {(tile_size_px, tile_size_px)}"
         )
+    if contrast == "tile_percentile":
+        values = tile_percentile_stretch(values)
     return np.ascontiguousarray(values)
+
+
+def tile_percentile_stretch(values: np.ndarray, minimum_valid: int = 1024) -> np.ndarray:
+    """Stretch a tile's valid (non-zero) grey levels between their 1st and 99th
+    percentiles onto 1-255; invalid pixels stay 0. Tiles with too few valid pixels or
+    no spread are returned unchanged."""
+    valid = values > 0
+    if valid.sum() < minimum_valid:
+        return values
+    low, high = np.percentile(values[valid], [1, 99])
+    if high - low < 1:
+        return values
+    stretched = np.clip((values.astype(np.float32) - low) * (254.0 / (high - low)) + 1.0, 1.0, 255.0)
+    return np.where(valid, np.rint(stretched), 0).astype(np.uint8)
 
 
 def _split_matches(
@@ -297,7 +315,8 @@ def _synchronize(device) -> None:
 
 
 def _load_optimized_model(
-    repo: Path, checkpoint: Path, device, *, graph_mode: bool = False
+    repo: Path, checkpoint: Path, device, *, graph_mode: bool = False,
+    coarse_threshold: float | None = None,
 ):
     import torch
     from kornia.geometry import create_meshgrid
@@ -339,6 +358,8 @@ def _load_optimized_model(
     if graph_mode:
         # Avoid a tensor-to-Python finite check inside CUDA Graph capture.
         model_config["replace_nan"] = False
+    if coarse_threshold is not None:
+        model_config["match_coarse"]["thr"] = float(coarse_threshold)
     model = LoFTR(config=model_config)
     model.load_state_dict(state)
     return reparameter(model).eval().to(device)

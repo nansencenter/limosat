@@ -50,8 +50,24 @@ class MatcherConfig:
     # line, long strips of sea ice); 3 ignores that land mask, leaving land to
     # surface.land_raster, which must then be set.
     scene_mask_invalid_from: int = 2
+    # EfficientLoFTR coarse match threshold on the optimized model's logits (None: the
+    # model's 25). Lower keeps weaker matches, for low-contrast (wet, melt-season) ice;
+    # the field consensus still rejects outliers.
+    coarse_confidence_threshold: float | None = None
+    # Grey levels the matcher sees: "scene" passes the scene's own 8-bit stretch;
+    # "tile_percentile" stretches each tile's valid pixels between its 1st and 99th
+    # percentiles (invalid pixels stay 0), restoring local contrast where wet ice
+    # compresses the backscatter range.
+    tile_contrast: str = "scene"
 
     def __post_init__(self) -> None:
+        if self.tile_contrast not in ("scene", "tile_percentile"):
+            raise ValueError("tile_contrast must be 'scene' or 'tile_percentile'")
+        if self.coarse_confidence_threshold is not None and not (
+            isinstance(self.coarse_confidence_threshold, (int, float))
+            and float("-inf") < self.coarse_confidence_threshold < float("inf")
+        ):
+            raise ValueError("coarse_confidence_threshold must be a finite number")
         if self.scene_mask_invalid_from not in (2, 3):
             raise ValueError("scene_mask_invalid_from must be 2 or 3")
         _require_positive(

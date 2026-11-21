@@ -53,6 +53,12 @@ MATCHING_SETTINGS = {
     "surface": ("land_minimum_inland_km",),
 }
 
+# Matching settings added after products were stored: part of the fingerprint only when
+# they differ from these values, so products made before them keep their identity.
+OPTIONAL_MATCHING_SETTINGS = {
+    "matcher": {"coarse_confidence_threshold": None, "tile_contrast": "scene"},
+}
+
 # A former setting of targeted (continuation) matching. Primary products never depended
 # on it, but it is part of the identity of every stored product, so it keeps its value.
 FORMER_MATCHING_SETTINGS = {"targeted_selection_buffer_m": 6_400.0}
@@ -97,6 +103,10 @@ def matching_settings(config) -> dict:
     for section, names in MATCHING_SETTINGS.items():
         settings[section] = {name: values[section][name] for name in names}
     settings["routing"].update(FORMER_MATCHING_SETTINGS)
+    for section, defaults in OPTIONAL_MATCHING_SETTINGS.items():
+        for name, default in defaults.items():
+            if values[section][name] != default:
+                settings[section][name] = values[section][name]
     if not config.surface.land_raster:
         # Without a land raster the inland distance threshold has no effect.
         settings["surface"] = {}
