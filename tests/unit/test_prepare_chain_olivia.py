@@ -81,6 +81,7 @@ def test_prepared_configuration_is_the_chosen_method(tmp_path):
     assert config.routing.plan_surface_cells is True
     assert config.routing.next_observation_backup_after_hours == 30.0
     assert config.routing.next_observation_minimum_cells == 25
+    assert config.routing.next_observation_edge_drift_m_per_day == 10_000.0
     assert config.routing.require_orbit_metadata is True
     assert config.field.gap_filling and config.field.shear_point_estimates
     assert config.trajectories.new_point_exclusion_radius_m == 3_000.0
@@ -90,3 +91,6 @@ def test_prepared_configuration_is_the_chosen_method(tmp_path):
     unmerged = load_config(production_config_file(tmp_path / "no-merge", "--merge-radius-m", "0"))
     assert unmerged.trajectories.merge_radius_m is None
     assert unmerged.trajectories.merge_maximum_younger_age_hours is None
+    (tmp_path / "no-edge").mkdir()
+    plain = load_config(production_config_file(tmp_path / "no-edge", "--edge-drift-m-per-day", "0"))
+    assert plain.routing.next_observation_edge_drift_m_per_day is None

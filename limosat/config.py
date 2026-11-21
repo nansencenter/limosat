@@ -238,7 +238,8 @@ class RoutingConfig:
     # point open water) before planning (production: on).
     # next_observation_edge_drift_m_per_day: cells closer to the target footprint's edge than
     # this speed times the interval may drift out of the target before it is acquired; they
-    # keep the pair but also get the following observation as a backup (None: off).
+    # keep the pair but also get the following observation as a backup (None: off;
+    # production: 10 km/day, set by scripts/prepare_chain_olivia.py).
     next_observation_minimum_cells: int = 25
     next_observation_backup_after_hours: float | None = None
     next_observation_edge_drift_m_per_day: float | None = None

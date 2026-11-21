@@ -255,6 +255,7 @@ def run_config(arguments, catalogue, run_root):
             "require_orbit_metadata": True,
             "next_observation_minimum_cells": 25,
             "next_observation_backup_after_hours": arguments.backup_after_hours,
+            "next_observation_edge_drift_m_per_day": arguments.edge_drift_m_per_day or None,
             "plan_surface_cells": True,
         },
         "open_water": {
@@ -320,6 +321,9 @@ def parser():
     )
     result.add_argument("--backup-after-hours", type=float, default=30.0,
                         help="next-observation pairs longer than this get a backup pair")
+    result.add_argument("--edge-drift-m-per-day", type=float, default=10000.0,
+                        help="cells this drift speed times the interval from the target's edge get a "
+                        "backup pair (0: off; 1-14 March 2020: avoidable losses -12 %% for +14 %% pairs)")
     result.add_argument("--new-point-exclusion-radius-m", type=float, default=3000.0)
     result.add_argument("--merge-radius-m", type=float, default=250.0,
                         help="merge duplicate trajectories closer than this (0: no merging)")
