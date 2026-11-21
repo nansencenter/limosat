@@ -71,18 +71,22 @@ def compose_primary_parquet(
         surface_gate(config),
     )
     digests: dict[str, tuple[str, str, str]] = {}
-    global _COMPOSE
-    _COMPOSE = {"config": config, "products": products, "pairs": by_pair_id}
     workers = _compose_workers()
+    # Workers are started with forkserver, not fork: composition runs threads (target
+    # validity), and forking a threaded process can deadlock.
     executor = (
-        ProcessPoolExecutor(workers, mp_context=multiprocessing.get_context("fork"))
+        ProcessPoolExecutor(workers, mp_context=multiprocessing.get_context("forkserver"),
+                            initializer=_start_worker, initargs=(config,))
         if workers > 1 else None
     )
+    if executor is None:
+        _start_worker(config, products)
 
     def submit(pair_id, identities, queries, target_step):
+        pair = by_pair_id[pair_id].pair
         if executor is None:
-            return _Done(_sample_pair(pair_id, identities, queries, target_step))
-        return executor.submit(_sample_pair, pair_id, identities, queries, target_step)
+            return _Done(_sample_pair(pair, identities, queries))
+        return executor.submit(_sample_pair, pair, identities, queries)
 
     def nodes(pair_id):
         return products.field_nodes(by_pair_id[pair_id].pair)
@@ -154,7 +158,7 @@ def compose_primary_parquet(
     finally:
         if executor is not None:
             executor.shutdown(wait=False, cancel_futures=True)
-        _COMPOSE = {}
+        _COMPOSE.clear()
         if point_writer is not None:
             point_writer.close()
         if extension_writer is not None:
@@ -229,7 +233,7 @@ def compose_primary_parquet(
     }
 
 
-# Composition state shared with forked sampling workers (set in compose_primary_parquet).
+# Composition state of a sampling worker (set by _start_worker).
 _COMPOSE: dict = {}
 
 
@@ -244,15 +248,19 @@ def _compose_workers() -> int:
         return max(1, os.cpu_count() or 1)
 
 
-def _sample_pair(pair_id, identities, queries, target_step):
+def _start_worker(config: RunConfig, products: PairProductStore | None = None) -> None:
+    global _COMPOSE
+    _COMPOSE = {"config": config, "products": products or PairProductStore(config)}
+
+
+def _sample_pair(pair, identities, queries):
     """Load and verify one pair product, sample it at its source positions and return
     the samples with the product's checksums (target validity is applied by the caller)."""
     state = _COMPOSE
     config = state["config"]
-    item = state["pairs"][pair_id]
-    product = state["products"].load(item.pair)
+    product = state["products"].load(pair)
     if product is None:
-        raise RuntimeError(f"primary pair product is missing: {pair_id}")
+        raise RuntimeError(f"primary pair product is missing: {pair.pair_id}")
     edge = field_edge_with_fallback(product.result.field, product.result.matches, config.field)
     samples = sample_edge(edge, identities, queries, config.field)
     return replace(samples, product=(product.sha256, product.content_sha256,

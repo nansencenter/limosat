@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+from bisect import bisect_right
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import lru_cache
 from datetime import datetime, timezone
@@ -19,6 +21,7 @@ from .models import FieldEdge
 
 
 TargetValidity = Callable[[np.ndarray], np.ndarray]
+_VALIDITY_LOOKAHEAD = 8
 TargetValidityFactory = Callable[[ImageRecord], TargetValidity]
 # ``image -> (xy -> keep mask)`` for new seeds, e.g. excluding land and open water.
 SeedFilterFactory = Callable[[ImageRecord], Callable[[np.ndarray], np.ndarray]]
@@ -199,24 +202,44 @@ def _choose(
     samples: Sequence[tuple[int, datetime, PairSamples, FieldEdge | None]],
     excluded: set[str] | frozenset[str] = frozenset(),
 ) -> dict[str, _Continuation]:
-    """The best supported continuation per track over the incoming pairs, visited in
-    their composition order (``_continuation_key``; ties keep the earlier one)."""
+    """The best supported continuation per track over the incoming pairs: the largest
+    ``_continuation_key`` (most recent source, most matches, smallest residual, smallest
+    support radius, then pair ID), computed on arrays."""
+    used = [item for item in samples if item[2].identities]
+    if not used:
+        return {}
+    identities = np.concatenate([np.asarray(values.identities, dtype=object) for _s, _t, values, _e in used])
+    which = np.concatenate([np.full(len(values.identities), k) for k, (_s, _t, values, _e) in enumerate(used)])
+    row = np.concatenate([np.arange(len(values.identities)) for _s, _t, values, _e in used])
+    time_key = np.array([item[1].timestamp() for item in used])[which]
+    # _reverse_text orders pair IDs so that the lexicographically smaller one wins.
+    pair_rank = {pair_id: -order for order, pair_id in enumerate(sorted({values.pair_id for _s, _t, values, _e in used}))}
+    pair_key = np.array([pair_rank[values.pair_id] for _s, _t, values, _e in used])[which]
+    selected = np.concatenate([values.selected_matches for _s, _t, values, _e in used])
+    residual = np.concatenate([values.maximum_residual_m for _s, _t, values, _e in used])
+    radius = np.concatenate([values.support_radius_m for _s, _t, values, _e in used])
+    residual_key = np.where(np.isfinite(residual), -residual, -np.inf)
+    radius_key = np.where(np.isfinite(radius), -radius, -np.inf)
+    order = np.lexsort((pair_key, radius_key, residual_key, selected, time_key))
+    identity_order = identities[order]
+    # The last candidate of each identity in key order is its best.
+    _unique, last_reversed = np.unique(identity_order[::-1], return_index=True)
+    best = order[len(order) - 1 - last_reversed]
     chosen: dict[str, _Continuation] = {}
-    for source_step, source_time, values, edge in samples:
-        for k, identity in enumerate(values.identities):
-            if identity in excluded:
-                continue
-            candidate = _Continuation(
-                source_step, values.pair_id, source_time,
-                values.displacement_m[k],
-                float(values.selected_matches[k]),
-                float(values.support_radius_m[k]),
-                float(values.maximum_residual_m[k]),
-                edge,
-            )
-            current = chosen.get(identity)
-            if current is None or _continuation_key(candidate) > _continuation_key(current):
-                chosen[identity] = candidate
+    for index in best:
+        identity = identities[index]
+        if identity in excluded:
+            continue
+        source_step, source_time, values, edge = used[which[index]]
+        k = row[index]
+        chosen[identity] = _Continuation(
+            source_step, values.pair_id, source_time,
+            values.displacement_m[k],
+            float(values.selected_matches[k]),
+            float(values.support_radius_m[k]),
+            float(values.maximum_residual_m[k]),
+            edge,
+        )
     return chosen
 
 
@@ -322,18 +345,29 @@ def compose_batches(
     for source, target, _spec in indexed:
         last_use[source] = max(last_use.get(source, target), target)
 
+    # Target validity reads the target scene's rasters: build it ahead on threads.
+    validity_pool = ThreadPoolExecutor(4) if target_validity_factory is not None else None
+    validity_ahead: dict[int, object] = {}
+    validity_targets = sorted(incoming_by_target)
+
     for step, image in enumerate(ordered_images):
         points: list[TrajectoryPoint] = []
         extensions: list[TrajectoryExtension] = []
         merges: list[MergeEvent] = []
+        if validity_pool is not None:
+            start = bisect_right(validity_targets, step - 1)
+            for ahead in validity_targets[start:start + _VALIDITY_LOOKAHEAD]:
+                if ahead not in validity_ahead:
+                    validity_ahead[ahead] = validity_pool.submit(target_validity_factory, ordered_images[ahead])
         if step:
             samples = [
                 (source_step, spec.source_time_utc, pending.pop(spec.pair_id).result(),
                  edges.get(spec.pair_id) if edges else None)
                 for source_step, _target_step, spec in incoming_by_target.get(step, ())
             ]
+            ahead = validity_ahead.pop(step, None)
             if target_validity_factory is not None and any(values.identities for _s, _t, values, _e in samples):
-                target_validity = target_validity_factory(image)
+                target_validity = ahead.result() if ahead is not None else target_validity_factory(image)
                 samples = [
                     (source_step, source_time,
                      _valid_targets(values, positions[source_step], target_validity), edge)
@@ -472,6 +506,8 @@ def compose_batches(
                 positions[source_step].clear()
         if step not in last_use:
             positions[step].clear()
+    if validity_pool is not None:
+        validity_pool.shutdown(wait=False, cancel_futures=True)
 
 
 def _merge_duplicates(
