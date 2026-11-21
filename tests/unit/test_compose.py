@@ -1,3 +1,4 @@
+import os
 import json
 from datetime import datetime, timedelta, timezone
 from dataclasses import replace
@@ -247,3 +248,23 @@ def test_compose_uses_pair_products_without_creating_sqlite(tmp_path):
     assert json.loads(Path(composed["manifest"]).read_text())[
         "target_pixel_validity"
     ] == "same_pass_raster_bounds_and_band2_lt2"
+
+
+def _worker_state_marker(value):
+    from limosat import compose
+    return value * 2, os.getpid(), compose._COMPOSE["config"] is not None
+
+
+def test_recycling_pool_replaces_workers_and_finishes_every_task():
+    from limosat.compose import _RecyclingPool
+    config = RunConfig(run_id="t", catalogue=Path("c.json"), database=Path("d.sqlite"), output_directory=Path("o"))
+    pool = _RecyclingPool(2, config, tasks_per_worker=3)
+    try:
+        futures = [pool.submit(_worker_state_marker, i) for i in range(20)]
+        results = [f.result(timeout=120) for f in futures]
+    finally:
+        pool.shutdown(wait=True)
+    assert [r[0] for r in results] == [2 * i for i in range(20)]
+    assert all(r[2] for r in results)
+    # 20 tasks with 6 per pool: at least four pools, so more than two worker processes
+    assert len({r[1] for r in results}) > 2

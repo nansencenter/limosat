@@ -74,13 +74,7 @@ def compose_primary_parquet(
     workers = _compose_workers()
     # Workers are started with forkserver, not fork: composition runs threads (target
     # validity), and forking a threaded process can deadlock.
-    executor = (
-        ProcessPoolExecutor(workers, mp_context=multiprocessing.get_context("forkserver"),
-                            initializer=_start_worker, initargs=(config,),
-                            # fresh workers now and then: their freed memory is not returned
-                            max_tasks_per_child=200)
-        if workers > 1 else None
-    )
+    executor = _RecyclingPool(workers, config) if workers > 1 else None
     if executor is None:
         _start_worker(config, products)
 
@@ -233,6 +227,39 @@ def compose_primary_parquet(
         "trajectory_extensions": str(extensions_path),
         "counts": manifest["counts"],
     }
+
+
+class _RecyclingPool:
+    """A forkserver process pool replaced by a fresh one every ``tasks_per_worker`` tasks per
+    worker, because a worker's freed memory is not returned to the system. The replaced pool
+    finishes the tasks it already has and then exits. (ProcessPoolExecutor's own
+    max_tasks_per_child can leave the pool with no workers and the caller waiting forever:
+    seen on Olivia in November 2026, a 1-14 July 2020 composition hung for hours with every
+    worker gone.)"""
+
+    def __init__(self, workers: int, config: RunConfig, tasks_per_worker: int = 200):
+        self._workers = workers
+        self._config = config
+        self._limit = workers * tasks_per_worker
+        self._pool = self._new()
+        self._submitted = 0
+
+    def _new(self) -> ProcessPoolExecutor:
+        return ProcessPoolExecutor(
+            self._workers, mp_context=multiprocessing.get_context("forkserver"),
+            initializer=_start_worker, initargs=(self._config,),
+        )
+
+    def submit(self, *arguments):
+        if self._submitted >= self._limit:
+            self._pool.shutdown(wait=False)
+            self._pool = self._new()
+            self._submitted = 0
+        self._submitted += 1
+        return self._pool.submit(*arguments)
+
+    def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
+        self._pool.shutdown(wait=wait, cancel_futures=cancel_futures)
 
 
 # Composition state of a sampling worker (set by _start_worker).
