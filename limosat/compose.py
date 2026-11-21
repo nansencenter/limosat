@@ -76,7 +76,9 @@ def compose_primary_parquet(
     # validity), and forking a threaded process can deadlock.
     executor = (
         ProcessPoolExecutor(workers, mp_context=multiprocessing.get_context("forkserver"),
-                            initializer=_start_worker, initargs=(config,))
+                            initializer=_start_worker, initargs=(config,),
+                            # fresh workers now and then: their freed memory is not returned
+                            max_tasks_per_child=200)
         if workers > 1 else None
     )
     if executor is None:

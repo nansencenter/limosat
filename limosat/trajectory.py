@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from bisect import bisect_right
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -42,12 +43,13 @@ class TrajectoryPoint:
     maximum_residual_m: float | None = None
 
     def __post_init__(self) -> None:
-        if self.time_utc.tzinfo is None or self.time_utc.utcoffset() is None:
-            raise ValueError("trajectory times must be timezone-aware")
-        object.__setattr__(self, "time_utc", self.time_utc.astimezone(timezone.utc))
+        if self.time_utc.tzinfo is not timezone.utc:
+            if self.time_utc.tzinfo is None or self.time_utc.utcoffset() is None:
+                raise ValueError("trajectory times must be timezone-aware")
+            object.__setattr__(self, "time_utc", self.time_utc.astimezone(timezone.utc))
         if self.state not in {"created", "observed"}:
             raise ValueError(f"unknown trajectory state: {self.state}")
-        if not np.isfinite([self.x_m, self.y_m]).all():
+        if not (math.isfinite(self.x_m) and math.isfinite(self.y_m)):
             raise ValueError("trajectory coordinates must be finite")
 
 
@@ -78,7 +80,7 @@ class TrajectoryExtension:
         object.__setattr__(self, "end_time_utc", end)
         if end <= start:
             raise ValueError("trajectory extension time must increase")
-        if not np.isfinite([self.x0_m, self.y0_m, self.x1_m, self.y1_m]).all():
+        if not all(math.isfinite(value) for value in (self.x0_m, self.y0_m, self.x1_m, self.y1_m)):
             raise ValueError("trajectory extension coordinates must be finite")
 
     @property
@@ -631,6 +633,8 @@ def _reverse_text(value: str) -> tuple[int, ...]:
 
 
 def _utc(value: datetime, name: str) -> datetime:
+    if value.tzinfo is timezone.utc:
+        return value
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{name} must be timezone-aware")
     return value.astimezone(timezone.utc)
