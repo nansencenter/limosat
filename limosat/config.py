@@ -149,6 +149,14 @@ class FieldConfig:
     maximum_neighbour_distance_m: float = 6_000.0
     agreement_distance_m: float = 1_000.0
     maximum_triangle_edge_m: float = 6_400.0
+    # Strong-first node consensus (off by default; field.py estimate_field). With a low
+    # matcher threshold (matcher.coarse_confidence_threshold) the nearest matches of a
+    # node are mostly weak ones, which dilute the consensus: nodes are first estimated
+    # from matches scoring at least strong_match_score, and only nodes that fail are
+    # re-estimated from every match, with fallback_neighbour_count nearest (None: the
+    # node rule's neighbour_count).
+    strong_match_score: float | None = None
+    fallback_neighbour_count: int | None = None
     # Off by default since October 2026: at MOSAiC and Beaufort buoys the points it
     # adds were 2-3x less accurate than measured nodes at the same lags.
     missing_node_fallback: bool = False
@@ -184,7 +192,7 @@ class FieldConfig:
     def __post_init__(self) -> None:
         _require_positive({
             key: value for key, value in asdict(self).items()
-            if key not in ("missing_node_fallback", "shear_point_estimates") and value is not None
+            if key not in ("missing_node_fallback", "shear_point_estimates", "strong_match_score") and value is not None
         })
         if not isinstance(self.missing_node_fallback, bool):
             raise ValueError("missing_node_fallback must be a boolean")

@@ -36,7 +36,7 @@ MATCHING_MODULES = (
     "efficientloftr.py", "field.py", "imagery.py", "models.py", "pairs.py",
     "routing.py", "surface.py", "tile_gates.py",
 )
-MATCHING_MODULES_SHA256 = "7016cb2fdfa1116e3eba5dcd9e0f40aa4520dfb92bcd4542b505ae40a9379966"
+MATCHING_MODULES_SHA256 = "285a05353096bf25b18b4696ed370dcb5928b442201295e5e75f6001053aea78"
 
 
 def test_every_configuration_setting_is_classified_for_pair_identity():
@@ -161,3 +161,28 @@ def test_tile_percentile_stretch_keeps_invalid_pixels_and_spreads_valid_ones():
     out = tile_percentile_stretch(tile)
     assert (out[:, :16] == 0).all() and (out[:, 16:] >= 1).all()
     assert out[:, 16:].max() == 255 and out[:, 16:].min() == 1
+
+
+def test_strong_first_consensus_keeps_strong_nodes_and_fills_from_weak_matches():
+    import numpy as np
+    from shapely.geometry import box
+    from limosat import FieldConfig, MotionMatches
+    from limosat.field import estimate_queries, _strong_first_estimates
+    rng = np.random.default_rng(0)
+    # node A: 10 strong matches moving 1 km east plus 14 weak random ones nearer to it;
+    # node B (20 km away): only weak matches, 10 of them agreeing on 2 km north.
+    a_strong = np.c_[rng.uniform(-2000, 2000, 10), rng.uniform(-2000, 2000, 10)]
+    a_weak = np.c_[rng.uniform(-500, 500, 14), rng.uniform(-500, 500, 14)]
+    b_weak = np.c_[20000 + rng.uniform(-1500, 1500, 10), rng.uniform(-1500, 1500, 10)]
+    source = np.vstack([a_strong, a_weak, b_weak])
+    shift = np.vstack([np.tile([1000.0, 0.0], (10, 1)), rng.uniform(-8000, 8000, (14, 2)), np.tile([0.0, 2000.0], (10, 1))])
+    score = np.r_[np.full(10, 0.8), np.full(14, 0.2), np.full(10, 0.2)]
+    tiles = np.zeros(len(source), dtype=np.int32)
+    matches = MotionMatches(source, source + shift, score, tiles, tiles)
+    query = np.array([[0.0, 0.0], [20000.0, 0.0]])
+    plain = estimate_queries(matches, query, FieldConfig())
+    first = _strong_first_estimates(matches, query, FieldConfig(strong_match_score=0.5))
+    assert not plain["available"][0]          # weak matches crowd out the strong ones
+    assert first["available"].all()
+    assert np.allclose(first["displacement_m"][0], [1000.0, 0.0])
+    assert np.allclose(first["displacement_m"][1], [0.0, 2000.0])

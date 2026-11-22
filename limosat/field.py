@@ -46,7 +46,10 @@ def estimate_field(
     config: FieldConfig,
 ) -> DisplacementField:
     rows, columns, query = regular_grid(domain, config.grid_spacing_m)
-    estimates = estimate_queries(matches, query, config)
+    if config.strong_match_score is None:
+        estimates = estimate_queries(matches, query, config)
+    else:
+        estimates = _strong_first_estimates(matches, query, config)
     return DisplacementField(
         pair_id=pair.pair_id,
         source_image_id=pair.source.image_id,
@@ -58,6 +61,27 @@ def estimate_field(
         source_xy_m=query,
         **estimates,
     )
+
+
+def _strong_first_estimates(
+    matches: MotionMatches, query: np.ndarray, config: FieldConfig
+) -> dict[str, np.ndarray]:
+    """Node consensus from the strong matches, then from every match where that fails."""
+    strong = np.flatnonzero(matches.score >= config.strong_match_score)
+    first = estimate_queries(_match_subset(matches, strong), query, config)
+    failed = np.flatnonzero(~first["available"])
+    if len(failed) and len(strong) < len(matches):
+        fallback = replace(config, strong_match_score=None,
+                           neighbour_count=config.fallback_neighbour_count or config.neighbour_count)
+        second = estimate_queries(matches, query[failed], fallback)
+        for name, values in first.items():
+            values[failed] = second[name]
+    return first
+
+
+def _match_subset(matches: MotionMatches, keep: np.ndarray) -> MotionMatches:
+    return MotionMatches(matches.source_xy_m[keep], matches.target_xy_m[keep], matches.score[keep],
+                         matches.source_tile[keep], matches.target_tile[keep])
 
 
 def estimate_queries(

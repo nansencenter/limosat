@@ -57,6 +57,7 @@ MATCHING_SETTINGS = {
 # they differ from these values, so products made before them keep their identity.
 OPTIONAL_MATCHING_SETTINGS = {
     "matcher": {"coarse_confidence_threshold": None, "tile_contrast": "scene"},
+    "field": {"strong_match_score": None, "fallback_neighbour_count": None},
 }
 
 # A former setting of targeted (continuation) matching. Primary products never depended
