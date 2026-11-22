@@ -154,9 +154,13 @@ class FieldConfig:
     # node are mostly weak ones, which dilute the consensus: nodes are first estimated
     # from matches scoring at least strong_match_score, and only nodes that fail are
     # re-estimated from every match, with fallback_neighbour_count nearest (None: the
-    # node rule's neighbour_count).
+    # node rule's neighbour_count) and, if set, a stricter agreement for those fallback
+    # nodes (August 2020: 24 nearest with 8 agreeing within 1 km gave 24 % gross errors at
+    # buoys among the nodes it added; 10 within 500 m gave 9 %).
     strong_match_score: float | None = None
     fallback_neighbour_count: int | None = None
+    fallback_minimum_agreeing_matches: int | None = None
+    fallback_agreement_distance_m: float | None = None
     # Off by default since October 2026: at MOSAiC and Beaufort buoys the points it
     # adds were 2-3x less accurate than measured nodes at the same lags.
     missing_node_fallback: bool = False

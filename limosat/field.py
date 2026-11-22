@@ -70,9 +70,13 @@ def _strong_first_estimates(
     strong = np.flatnonzero(matches.score >= config.strong_match_score)
     first = estimate_queries(_match_subset(matches, strong), query, config)
     failed = np.flatnonzero(~first["available"])
-    if len(failed) and len(strong) < len(matches):
-        fallback = replace(config, strong_match_score=None,
-                           neighbour_count=config.fallback_neighbour_count or config.neighbour_count)
+    if len(failed):
+        fallback = replace(
+            config, strong_match_score=None,
+            neighbour_count=config.fallback_neighbour_count or config.neighbour_count,
+            minimum_agreeing_matches=config.fallback_minimum_agreeing_matches or config.minimum_agreeing_matches,
+            agreement_distance_m=config.fallback_agreement_distance_m or config.agreement_distance_m,
+        )
         second = estimate_queries(matches, query[failed], fallback)
         for name, values in first.items():
             values[failed] = second[name]

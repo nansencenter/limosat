@@ -36,7 +36,7 @@ MATCHING_MODULES = (
     "efficientloftr.py", "field.py", "imagery.py", "models.py", "pairs.py",
     "routing.py", "surface.py", "tile_gates.py",
 )
-MATCHING_MODULES_SHA256 = "285a05353096bf25b18b4696ed370dcb5928b442201295e5e75f6001053aea78"
+MATCHING_MODULES_SHA256 = "bae6c2eade756000ea1cb68ea51936829a1b764681d9ff39525595e6865cb284"
 
 
 def test_every_configuration_setting_is_classified_for_pair_identity():
@@ -186,3 +186,21 @@ def test_strong_first_consensus_keeps_strong_nodes_and_fills_from_weak_matches()
     assert first["available"].all()
     assert np.allclose(first["displacement_m"][0], [1000.0, 0.0])
     assert np.allclose(first["displacement_m"][1], [0.0, 2000.0])
+
+
+def test_fallback_nodes_can_require_stricter_agreement():
+    import numpy as np
+    from limosat import FieldConfig, MotionMatches
+    from limosat.field import _strong_first_estimates
+    rng = np.random.default_rng(1)
+    # 9 weak matches agree within 1 km but not within 500 m: the default fallback accepts
+    # the node, a fallback needing 8 within 500 m does not.
+    source = np.c_[rng.uniform(-1000, 1000, 9), rng.uniform(-1000, 1000, 9)]
+    shift = np.c_[np.linspace(0, 1800, 9), np.zeros(9)]
+    tiles = np.zeros(9, dtype=np.int32)
+    matches = MotionMatches(source, source + shift, np.full(9, 0.2), tiles, tiles)
+    query = np.array([[0.0, 0.0]])
+    loose = _strong_first_estimates(matches, query, FieldConfig(strong_match_score=0.5, fallback_neighbour_count=24))
+    strict = _strong_first_estimates(matches, query, FieldConfig(strong_match_score=0.5, fallback_neighbour_count=24,
+                                                                 fallback_agreement_distance_m=500.0))
+    assert loose["available"][0] and not strict["available"][0]
