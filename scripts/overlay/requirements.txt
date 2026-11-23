@@ -1,0 +1,15 @@
+# Packages the EfficientLoFTR chain needs on top of NVIDIA's PyTorch container
+# (pytorch_nvidia_25.06_arm64.sif). torch, numpy and the rest of the base image are not
+# reinstalled: build_overlay_olivia.sh constrains pip to the base image's versions.
+# limosat (pyproject.toml): kornia, opencv, pyproj, PyYAML, rasterio, scipy, shapely; pyarrow
+# for parquet composition. EfficientLoFTR's model code (src/loftr): einops, kornia, loguru, yacs.
+kornia
+einops
+yacs
+loguru
+pyproj
+PyYAML
+rasterio
+shapely
+pyarrow
+opencv-python-headless

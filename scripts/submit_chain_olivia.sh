@@ -42,7 +42,7 @@ else
   official_repository="${ELOFTR_REPO:-$project_root/EfficientLoFTR}"
   checkpoint="${CHECKPOINT:-$project_root/checkpoints/efficientloftr/eloftr_outdoor.ckpt}"
   container="${CONTAINER:-/cluster/work/support/container/pytorch_nvidia_25.06_arm64.sif}"
-  overlay="${OVERLAY:-$work_root/method-neutral-benchmark/environments/efficientloftr/efficientloftr-apptainer-v3.img}"
+  overlay="${OVERLAY:-/cluster/projects/nn9878k/seachu/envs/efficientloftr-apptainer-v4.img}"  # built by scripts/overlay/ (v3 on /cluster/work was purged 22 Nov 2026)
   data_binds="${DATA_BINDS:?set DATA_BINDS to the colon-separated input roots (scenes, OSI-SAF, ASI, land raster dir)}"
   for required in "$method_root/.git" "$config" "$catalogue" "$official_repository/.git" \
     "$checkpoint" "$container" "$overlay"; do
