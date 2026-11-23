@@ -10,8 +10,8 @@
 #
 #   build_overlay_olivia.sh OVERLAY_PATH [SIZE_MB]
 #
-# Writes OVERLAY_PATH, OVERLAY_PATH.base-freeze.txt (the base image's packages, used as pip
-# constraints so nothing in the base image is replaced) and OVERLAY_PATH.lock.txt (what was
+# Writes OVERLAY_PATH, OVERLAY_PATH.base-freeze.txt (the base image's packages; its numerical
+# stack is used as pip constraints so the overlay never replaces it) and OVERLAY_PATH.lock.txt (what was
 # installed into the overlay, with versions). Commit the lock file next to this script.
 set -euo pipefail
 overlay="${1:?usage: $0 OVERLAY_PATH [SIZE_MB]}"
@@ -29,9 +29,11 @@ run() {
     "$container" "$@"
 }
 run python -m pip freeze --all > "$overlay.base-freeze.txt"
-# Constraints: pin every package the base image already has; drop editable/URL lines.
-grep -E '^[A-Za-z0-9_.-]+==' "$overlay.base-freeze.txt" > "$overlay.constraints.txt"
-run python -m pip install --user --no-cache-dir -c "$overlay.constraints.txt" -r "$here/requirements.txt"
+# Constraints: pin the base image's numerical stack (torch and NVIDIA libraries, numpy, scipy,
+# pyarrow, pillow) so the overlay never replaces it. Pinning every base package over-constrains
+# pip (on 23 Nov 2026 it fell back to a rasterio source build); the rest may be added alongside.
+grep -E -i '^(torch|torchvision|triton|nvidia-[a-z0-9-]+|numpy|scipy|pyarrow|pillow)==' "$overlay.base-freeze.txt" > "$overlay.constraints.txt"
+run python -m pip install --user --no-cache-dir --only-binary=:all: -c "$overlay.constraints.txt" -r "$here/requirements.txt"
 run python -m pip freeze --user > "$overlay.lock.txt"
 run python - <<'PY'
 import importlib, sys
