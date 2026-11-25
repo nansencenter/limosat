@@ -13,11 +13,15 @@ same layout as the ORB release of LiMOSAT (``limosat.publish`` of the ``olivia``
   trajectory *i* is the slice ``offset[i]:offset[i] + rowsize[i]`` of every ``obs`` variable;
 * trajectories are ordered by start time (``time_start``) and the observations of a trajectory by ``point_index``;
 * a row of the observation table is one observation of a feature in one scene, carrying the displacement from the previous
-  observation it starts from (dx, dy, speed) and the tracker's own statistics at the position (selected matches, support radius,
-  maximum residual) and the review flags. A trajectory does not have an observation on every scene and it continues through any
-  later scene pair that supports it, also from an observation earlier than the previous one when no pair reaches the new scene
-  from the latest observation; ``source_point_index`` gives, for every observation, the ``point_index`` of the observation its
-  displacement starts at (point_index - 1 in a simple chain), so the time step between observations varies.
+  observation of the trajectory (dx, dy, speed) and the tracker's own statistics at the position (selected matches, support radius,
+  maximum residual) and the review flags. A trajectory does not have an observation on every scene, so the time step between
+  observations varies.
+
+The composition stores a trajectory as a tree, not a chain: when no scene pair leads from a trajectory's latest observation to a new
+scene, the trajectory continues from an older observation, and the observation it skipped is left without a continuation. The
+release publishes one chain per trajectory, the path from the first observation to the trajectory's latest one (``select_chain``;
+the default rule ``latest`` keeps the branch that continues furthest in time), so that every displacement starts at the previous
+row. Links off that path (about 19% of the links of a month) are not published; their number is recorded in the manifest.
 
 No value is rounded or packed: positions, times and displacements are float64 exactly as in the composition, the three match
 statistics float32 (a float32 of the composition's float64), and nulls become the variable's ``_FillValue``. Compression is lossless
@@ -81,21 +85,18 @@ COLUMNS = (
            "Trajectory identifier, the running number of the trajectory in the file (0, 1, 2, ...). A trajectory is the track of one "
            "feature through Sentinel-1 scenes."),
     Column("point_index", "int32", False, "",
-           "Position along the trajectory in time order: 0 for its first observation, then 1, 2, ..."),
-    Column("source_point_index", "int32", True, "",
-           "point_index of the observation of the same trajectory at which the displacement arriving here starts. Usually "
-           "point_index - 1; it is smaller where the trajectory continued from an earlier observation because no scene pair "
-           "reached this scene from the latest one. Null at point_index 0."),
+           "Position along the trajectory in time order: 0 for its first observation, then 1, 2, ... Every displacement "
+           "starts at the observation with the previous point_index."),
     Column("time", "timestamp_s_utc", False, "UTC", "Acquisition time of the Sentinel-1 scene of this observation."),
     Column("scene", "string", False, "", "Sentinel-1 product name of the scene this observation belongs to."),
     Column("x_m", "float64", False, "m", "Position, EPSG:3413 x."),
     Column("y_m", "float64", False, "m", "Position, EPSG:3413 y."),
     Column("dx_m", "float64", True, "m",
-           "Displacement in x from the observation source_point_index of the trajectory. Null at point_index 0."),
+           "Displacement in x from the previous observation of the trajectory. Null at point_index 0."),
     Column("dy_m", "float64", True, "m",
-           "Displacement in y from the observation source_point_index of the trajectory. Null at point_index 0."),
+           "Displacement in y from the previous observation of the trajectory. Null at point_index 0."),
     Column("speed_m_per_day", "float64", True, "m/day",
-           "Distance from the source observation divided by the elapsed time since it. Null at point_index 0."),
+           "Distance from the previous observation divided by the elapsed time. Null at point_index 0."),
     Column("selected_matches", "float32", True, "1",
            "Number of feature matches that support the displacement field at this position: the count at each of the three "
            "surrounding field nodes, weighted by the position's barycentric weights (so not an integer). Null at point_index 0."),
@@ -129,7 +130,7 @@ DEFAULT_METADATA: dict[str, Any] = {
     "title": "LiMOSAT-EfficientLoFTR: Lagrangian sea-ice trajectories from Sentinel-1",
     "summary": ("Trajectories of features on the Arctic sea ice tracked through Sentinel-1 EW scenes with the LiMOSAT "
                 "algorithm and the EfficientLoFTR matcher. One observation per feature and scene; the displacement from the "
-                "observation it starts at is stored with it (see source_point_index). A trajectory continues through any later scene pair "
+                "previous observation of the trajectory is stored with it. A trajectory continues through any later scene pair "
                 "that supports it, so it does not have an observation on every scene."),
     "keywords": "sea ice drift, Lagrangian trajectories, Sentinel-1, SAR, Arctic",
     "institution": "Nansen Environmental and Remote Sensing Centre",
@@ -293,6 +294,69 @@ def _id_keys(column) -> tuple[np.ndarray, np.ndarray]:
     return keys, tails
 
 
+CHAIN_RULES = ("latest", "deepest")
+_MIX = np.uint64(1000003)
+
+
+def select_chain(tk: np.ndarray, start_ms: np.ndarray, end_ms: np.ndarray, rule: str = "latest",
+                 chunk: int = 20_000_000) -> tuple[np.ndarray, dict[str, int]]:
+    """Which links lie on the published chain of their trajectory.
+
+    The composition stores a trajectory as a tree: a link starts at an observation (its trajectory and ``start_ms``) and ends at a new
+    one (``end_ms``); a new scene may be reached from an older observation when no pair from the latest one exists, so an observation
+    can have no continuation (a side observation) or several. The published chain is the single path from the first observation to the
+    observation that ends the trajectory: the latest one (``rule="latest"``, the default: it keeps the branch that continues furthest
+    in time) or the one with the most links above it (``"deepest"``). Returns a boolean mask over the links (True = on the chain) and
+    counts. Observations are identified by trajectory key and time, which must be unique within a trajectory.
+    """
+    if rule not in CHAIN_RULES:
+        raise ValueError(f"rule must be one of {CHAIN_RULES}")
+    n = len(tk)
+    if n >= 2**31 - 1:
+        raise ValueError("too many links for 32-bit link indices")
+    tk = np.asarray(tk, dtype=np.uint64)
+    end_u = np.asarray(end_ms).astype(np.uint64)
+    key_obs = tk * _MIX + end_u
+    order = np.argsort(key_obs, kind="stable")
+    sorted_obs = key_obs[order]
+    del key_obs
+    if n > 1 and (sorted_obs[1:] == sorted_obs[:-1]).any():
+        raise ValueError("two links of one trajectory end at the same time")
+    order = order.astype(np.int32)
+    parent = np.full(n, -1, dtype=np.int32)
+    for a in range(0, n, chunk):
+        ks = tk[a:a + chunk] * _MIX + np.asarray(start_ms[a:a + chunk]).astype(np.uint64)
+        pos = np.minimum(np.searchsorted(sorted_obs, ks), n - 1)
+        found = sorted_obs[pos] == ks
+        parent[a:a + chunk] = np.where(found, order[pos], -1)
+    del sorted_obs, order
+    has_child = np.zeros(n, dtype=bool)
+    has_child[parent[parent >= 0]] = True
+    leaves = np.flatnonzero(~has_child)
+    tk_l, end_l = tk[leaves], np.asarray(end_ms)[leaves]
+    if rule == "latest":
+        o = np.lexsort((end_l, tk_l))
+    else:
+        anc = np.append(np.where(parent >= 0, parent, n), np.int32(n)).astype(np.int32)
+        steps = np.append((parent >= 0).astype(np.int32), np.int32(0))
+        while (anc[:n] != n).any():                         # pointer doubling: number of links above every link
+            steps = steps + steps[anc]
+            anc = anc[anc]
+        o = np.lexsort((end_l, steps[leaves], tk_l))
+        del anc, steps
+    tk_sorted = tk_l[o]
+    last = np.r_[tk_sorted[1:] != tk_sorted[:-1], True] if len(o) else np.zeros(0, dtype=bool)
+    chosen = leaves[o][last]
+    kept = np.zeros(n, dtype=bool)
+    current = chosen
+    while len(current):
+        kept[current] = True
+        current = parent[current]
+        current = current[current >= 0]
+    return kept, {"links": n, "kept": int(kept.sum()), "leaves": int(len(leaves)), "trajectories": int(len(chosen)),
+                  "side_observations": int(len(leaves) - len(chosen))}
+
+
 @dataclass
 class Index:
     ukeys: np.ndarray          # sorted unique 64-bit keys
@@ -301,30 +365,39 @@ class Index:
     first_ms: np.ndarray       # by rank
     offset: np.ndarray         # by rank: first observation row of the trajectory
     rowsize: np.ndarray        # by rank: nlinks + 1
-    links: int                 # accepted extensions
-    rejected: int
+    links: int                 # published links (on the chain)
+    rejected: int              # extensions rejected by the composition (not published)
+    off_chain: int = 0         # accepted extensions off the published chain (not published)
+    keep_rows: np.ndarray | None = None  # over the accepted extensions in file order: True = published
+    chain_rule: str = "latest"
 
 
-def index_source(extensions: Path, batch_rows: int = BATCH_ROWS) -> Index:
-    """Pass 1: per trajectory the number of published links and its first start time; fixes the order of the file."""
+def index_source(extensions: Path, batch_rows: int = BATCH_ROWS, chain_rule: str = "latest") -> Index:
+    """Pass 1: choose the published chain of every trajectory, then per trajectory the number of links and its first start time;
+    fixes the order of the file."""
     pa, pc, pq = _pyarrow()
-    keys_list, tails_list, start_list = [], [], []
+    keys_list, tails_list, start_list, end_list = [], [], [], []
     rejected = 0
-    for batch in pq.ParquetFile(extensions).iter_batches(batch_size=batch_rows, columns=["trajectory_id", "start_time_utc", "accepted"]):
+    for batch in pq.ParquetFile(extensions).iter_batches(batch_size=batch_rows, columns=["trajectory_id", "start_time_utc", "end_time_utc", "accepted"]):
         table = pa.Table.from_batches([batch])
         if table["accepted"].null_count:
             raise ValueError("nulls in source column accepted")
         keep = _array(table["accepted"]).to_numpy(zero_copy_only=False).astype(bool)
         rejected += int((~keep).sum())
         keys, tails = _id_keys(table["trajectory_id"])
-        starts = _epoch_ms_array(table["start_time_utc"])
-        keys_list.append(keys[keep]); tails_list.append(tails[keep]); start_list.append(starts[keep])
+        keys_list.append(keys[keep]); tails_list.append(tails[keep])
+        start_list.append(_epoch_ms_array(table["start_time_utc"])[keep]); end_list.append(_epoch_ms_array(table["end_time_utc"])[keep])
     if not keys_list:
         raise ValueError("the extensions table is empty")
-    keys, tails, starts = np.concatenate(keys_list), np.concatenate(tails_list), np.concatenate(start_list)
-    del keys_list, tails_list, start_list
+    keys, tails = np.concatenate(keys_list), np.concatenate(tails_list)
+    starts, ends = np.concatenate(start_list), np.concatenate(end_list)
+    del keys_list, tails_list, start_list, end_list
     if not len(keys):
         raise ValueError("no accepted extensions to publish")
+    accepted_links = len(keys)
+    keep_rows, _ = select_chain(keys, starts, ends, chain_rule)
+    del ends
+    keys, tails, starts = keys[keep_rows], tails[keep_rows], starts[keep_rows]
     order = np.argsort(keys, kind="stable")
     keys_sorted = keys[order]
     bounds = np.r_[0, np.flatnonzero(keys_sorted[1:] != keys_sorted[:-1]) + 1]
@@ -342,7 +415,7 @@ def index_source(extensions: Path, batch_rows: int = BATCH_ROWS) -> Index:
     nlinks, first = counts[by_rank], first[by_rank]
     rowsize = nlinks + 1
     offset = np.r_[0, np.cumsum(rowsize)[:-1]]
-    return Index(ukeys, rank_of_ukey, nlinks, first, offset, rowsize, links, rejected)
+    return Index(ukeys, rank_of_ukey, nlinks, first, offset, rowsize, links, rejected, accepted_links - links, keep_rows, chain_rule)
 
 
 # --------------------------------------------------------------------------------------------- spill
@@ -372,12 +445,19 @@ def spill_source(extensions: Path, index: Index, directory: Path, bucket_observa
     scene_time: dict[int, int] = {}
     first_emitted = np.zeros(len(index.ukeys), dtype=bool)
     observations = 0
+    accepted_seen = 0
     try:
         for batch in pq.ParquetFile(extensions).iter_batches(batch_size=batch_rows, columns=list(SOURCE_COLUMNS)):
             table = pa.Table.from_batches([batch])
             keep = _array(table["accepted"]).to_numpy(zero_copy_only=False).astype(bool)
             if not keep.all():
                 table = table.filter(pa.array(keep))
+            if not table.num_rows:
+                continue
+            on_chain = index.keep_rows[accepted_seen:accepted_seen + table.num_rows]
+            accepted_seen += table.num_rows
+            if not on_chain.all():
+                table = table.filter(pa.array(on_chain))
             if not table.num_rows:
                 continue
             n = table.num_rows
@@ -442,6 +522,8 @@ def spill_source(extensions: Path, index: Index, directory: Path, bucket_observa
     finally:
         for handle in handles.values():
             handle.close()
+    if accepted_seen != len(index.keep_rows):
+        raise ValueError("the extensions table changed between passes")
     if not first_emitted.all():
         raise ValueError(f"{int((~first_emitted).sum())} trajectories have no first observation")
     names = list(scene_id)
@@ -529,8 +611,6 @@ def write_netcdf(path: Path, index: Index, spill: Spill, period: str, release_id
             v.standard_name, v.long_name, v.units, v.grid_mapping, v.coordinates = std, describe[name].description, "m", "crs", coords
         v_pidx = ds.createVariable("point_index", "i4", ("obs",), **kw)
         v_pidx.long_name, v_pidx.coordinates = describe["point_index"].description, coords
-        v_src = ds.createVariable("source_point_index", "i4", ("obs",), fill_value=np.int32(-1), **kw)
-        v_src.long_name, v_src.coordinates = describe["source_point_index"].description + " (-1 where null)", coords
         v_disp = {}
         for name, units in (("dx_m", "m"), ("dy_m", "m"), ("speed_m_per_day", "m day-1")):
             v_disp[name] = ds.createVariable(name, "f8", ("obs",), fill_value=np.nan, **kw)
@@ -576,28 +656,18 @@ def write_netcdf(path: Path, index: Index, spill: Spill, period: str, release_id
                 raise ValueError(f"bucket {bucket}: first observations are not the first links' sources")
             step = ~is_first
             ms, x, y = records["ms"], records["x"], records["y"]
-            # the observation every displacement starts at: same trajectory, time = end time - elapsed, position = end - displacement
-            span = int(ms.max() - ms.min()) + 1
-            key_all = (rank - lo) * span + (ms - ms.min())
-            if np.any(np.diff(key_all) <= 0):
-                raise ValueError(f"bucket {bucket}: two observations of a trajectory have the same time")
+            # a chain: every displacement starts at the previous observation of its trajectory (time, position)
             rows = np.flatnonzero(step)
-            src_ms = ms[rows] - records["el"][rows].astype(np.int64) * 1000
-            key_src = (rank[rows] - lo) * span + (src_ms - ms.min())
-            found = np.searchsorted(key_all, key_src)
-            found = np.minimum(found, len(key_all) - 1)
-            if (key_all[found] != key_src).any() or (found >= rows).any() \
-                    or (np.abs(x[found] - (x[rows] - records["dx"][rows])) > 1e-6).any() \
-                    or (np.abs(y[found] - (y[rows] - records["dy"][rows])) > 1e-6).any():
-                raise ValueError(f"bucket {bucket}: a displacement does not start at an earlier observation of its trajectory")
-            source_index = np.full(len(rank), -1, dtype=np.int32)
-            source_index[rows] = pidx[found]
+            if (ms[rows - 1] != ms[rows] - records["el"][rows].astype(np.int64) * 1000).any() \
+                    or (np.abs(x[rows - 1] - (x[rows] - records["dx"][rows])) > 1e-6).any() \
+                    or (np.abs(y[rows - 1] - (y[rows] - records["dy"][rows])) > 1e-6).any():
+                raise ValueError(f"bucket {bucket}: a displacement does not start at the previous observation of its trajectory")
             if (flags_bad := (records["flags"][step] & ~np.uint8(KNOWN_FLAG_MASK)) != 0).any():
                 raise ValueError(f"bucket {bucket}: {int(flags_bad.sum())} flag values carry unknown bits")
             sl = slice(written, written + len(rank))
             time[sl] = ms / 1000.0
             lon, lat = _lonlat(x, y)
-            v_lat[sl], v_lon[sl], v_x[sl], v_y[sl], v_pidx[sl], v_src[sl] = lat, lon, x, y, pidx, source_index
+            v_lat[sl], v_lon[sl], v_x[sl], v_y[sl], v_pidx[sl] = lat, lon, x, y, pidx
             for name, key in (("dx_m", "dx"), ("dy_m", "dy"), ("speed_m_per_day", "speed")):
                 v_disp[name][sl] = records[key]
             for name, key in (("selected_matches", "sel"), ("support_radius_m", "sup"), ("maximum_residual_m", "res")):
@@ -649,6 +719,8 @@ def write_netcdf(path: Path, index: Index, spill: Spill, period: str, release_id
         ds.geospatial_lat_min, ds.geospatial_lat_max = stats["lat_min"], stats["lat_max"]
         ds.geospatial_lon_min, ds.geospatial_lon_max = stats["lon_min"], stats["lon_max"]
         ds.observations, ds.trajectories, ds.displacements = np.int64(n), np.int64(ntraj), np.int64(n - ntraj)
+        ds.chain_rule = (f"one chain per trajectory: the path from its first observation to its {'latest' if index.chain_rule == 'latest' else 'deepest'} "
+                         "observation; observations and displacements off that path are not published")
         ds.qc_policy = ("displacements above the hard speed limit are not published; displacements flagged for review are published "
                         "with quality_flags: " + "; ".join(f"{k}: {v}" for k, v in qc.items()))
         ds.history = f"{datetime.now(timezone.utc):%Y-%m-%d}: written by limosat.publish from the primary composition, release {release_id}"
@@ -690,13 +762,14 @@ def default_period(index: Index) -> str:
 def build(source_dir: Path, output_dir: Path, release_id: str, period: str | None = None, overwrite: bool = False,
           verify_source: bool = True, metadata: dict[str, Any] | None = None, validate_output: bool = True,
           sample_modulus: int = 50, tmp_dir: Path | None = None, bucket_observations: int = BUCKET_OBSERVATIONS,
-          batch_rows: int = BATCH_ROWS) -> dict[str, Any]:
+          batch_rows: int = BATCH_ROWS, chain_rule: str = "latest") -> dict[str, Any]:
     """Publish a primary composition into one NetCDF file plus manifest.json in the output directory and validate it."""
     source_dir, output_dir = Path(source_dir), Path(output_dir)
     source = inspect_source(source_dir, verify_checksum=verify_source)
     output_dir.mkdir(parents=True, exist_ok=True)
     print("pass 1: indexing trajectories", flush=True)
-    index = index_source(source.extensions, batch_rows)
+    index = index_source(source.extensions, batch_rows, chain_rule)
+    print(f"  chain rule {chain_rule}: {index.links:,} links published, {index.off_chain:,} off the chains", flush=True)
     last = _ms_to_datetime(int(index.first_ms.max()))
     period = period or f"{default_period(index)}_{last:%Y%m}"
     output = output_dir / f"limosat_eloftr_{period}.nc"
@@ -721,7 +794,7 @@ def build(source_dir: Path, output_dir: Path, release_id: str, period: str | Non
     finally:
         shutil.rmtree(spill_dir, ignore_errors=True)
     entry.update({"period": period, "file": output.name, "bytes": output.stat().st_size, "sha256": sha256(output),
-                  "links_rejected_not_published": index.rejected})
+                  "links_rejected_not_published": index.rejected, "links_off_chain_not_published": index.off_chain})
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "product": PRODUCT,
@@ -730,6 +803,8 @@ def build(source_dir: Path, output_dir: Path, release_id: str, period: str | Non
         "format": FORMAT,
         "crs": CRS,
         "flag_bits": FLAG_BITS,
+        "chain_rule": {"rule": chain_rule, "definition": "one chain per trajectory: the path from the first observation to the latest "
+                       "observation (rule latest) or to the observation with the most links above it (rule deepest)"},
         "columns": columns_spec(),
         "compression": {"codec": "zlib", "level": COMPRESSION_LEVEL, "shuffle": True, "chunk_observations": CHUNK},
         "layout": {"dimensions": {"trajectory": "trajectories", "obs": "observations", "scene": "Sentinel-1 scene names"},
@@ -805,11 +880,6 @@ def validate(source_dir: Path, output_dir: Path, sample_modulus: int = 50, batch
         d.set_auto_chartostring(False)
         chars = np.ascontiguousarray(d["scene_name"][:])
         names_all = np.array([row.rstrip(b"\x00").decode("ascii") for row in chars.view(f"S{chars.shape[1]}").reshape(-1)], dtype=object)
-        sp = d["source_point_index"][:]
-        step = pidx > 0
-        if np.any(sp[step] < 0) or np.any(sp[step] >= pidx[step]) or not (sp[~step] == -1).all():
-            raise ValueError(f"{output.name}: source_point_index is not an earlier point_index of the trajectory (and -1 at the first observation)")
-        del step
 
         def get(name, rows):
             """Values of one variable at the given observation rows (reads the variable once, keeps nothing)."""
@@ -832,6 +902,9 @@ def validate(source_dir: Path, output_dir: Path, sample_modulus: int = 50, batch
         table = pa.concat_tables([t for _, t in pieces])
         order = np.lexsort((_epoch_ms_array(table["end_time_utc"]), keys))
         table, keys = table.take(pa.array(order)), keys[order]
+        # the chain of every sampled trajectory, chosen again from all its links
+        on_chain, _ = select_chain(keys, _epoch_ms_array(table["start_time_utc"]), _epoch_ms_array(table["end_time_utc"]), manifest["chain_rule"]["rule"])
+        table, keys = table.filter(pa.array(on_chain)), keys[on_chain]
         src = {"start": _epoch_ms_array(table["start_time_utc"]), "end": _epoch_ms_array(table["end_time_utc"])}
         starts = np.r_[0, np.flatnonzero(keys[1:] != keys[:-1]) + 1]
         sizes = np.diff(np.r_[starts, len(keys)])
@@ -867,8 +940,8 @@ def validate(source_dir: Path, output_dir: Path, sample_modulus: int = 50, batch
             _same(get("maximum_residual_m", rows), _floats(table["maximum_residual_m"], np.float32), "maximum_residual_m", name)
             _same(get("quality_flags", rows), _flags(table), "quality_flags", name)
             _same(scene_names[get("scene_index", rows)], np.array(_array(table["target_image_id"]).to_pylist(), dtype=object), "scenes", name)
-        # the observation a displacement starts at (source_point_index) is the source of the link: position, time, scene
-        prev_row = np.repeat(offset[mapped], sizes) + sp[link_file_row]
+        # the observation before each displacement is the source of the link: position, time, scene
+        prev_row = link_file_row - 1
         _same(get("x_m", prev_row), _floats(table["x0_m"]), "source x", name)
         _same(get("y_m", prev_row), _floats(table["y0_m"]), "source y", name)
         _same(time[prev_row], src["start"], "source times", name)
@@ -907,6 +980,8 @@ def _parser() -> argparse.ArgumentParser:
             command.add_argument("--overwrite", action="store_true")
             command.add_argument("--skip-source-checksum", action="store_true", help="do not hash the extensions table against its manifest")
             command.add_argument("--no-validate", action="store_true", help="skip the validation that normally follows the build")
+            command.add_argument("--chain-rule", choices=CHAIN_RULES, default="latest",
+                                 help="which observation ends the published chain of a trajectory (default: its latest)")
             command.add_argument("--tmp-dir", type=Path, help="scratch folder for the spilled observations (about 80 bytes per observation)")
             command.add_argument("--bucket-observations", type=int, default=BUCKET_OBSERVATIONS,
                                  help="observations per scratch bucket and so per in-memory sort (about 150 bytes each)")
@@ -918,7 +993,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "build":
         metadata = json.loads(args.metadata.read_text()) if args.metadata else None
         result = build(args.source, args.output_dir, args.release_id, args.period, args.overwrite, not args.skip_source_checksum, metadata,
-                       not args.no_validate, args.sample_modulus, args.tmp_dir, args.bucket_observations, args.batch_rows)["totals"]
+                       not args.no_validate, args.sample_modulus, args.tmp_dir, args.bucket_observations, args.batch_rows, args.chain_rule)["totals"]
     else:
         result = validate(args.source, args.output_dir, args.sample_modulus, args.batch_rows)
     print(json.dumps(result, indent=2, sort_keys=True, default=str))
