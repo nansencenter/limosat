@@ -13,6 +13,8 @@ dependencies:
   - pytorch
   - kornia
   - pyyaml
+  - pyarrow
+  - netcdf4
   - pytest
   - pip:
       - -e .
