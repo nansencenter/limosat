@@ -87,39 +87,46 @@ def read(out):
     return manifest, ds
 
 
-def test_build_writes_a_valid_cf_trajectory_file_of_chains(tmp_path):
+def test_default_publishes_the_whole_tree_with_source_point_index(tmp_path):
     source, out, manifest = build(tmp_path)
     manifest, ds = read(out)
     try:
         assert ds.featureType == "trajectory" and "CF-1.8" in ds.Conventions
-        # trajectories 2, 5, 8, 9 are published (7 has only a rejected link); trajectory 5 is cut to the chain R -> b1
-        assert list(ds["rowsize"][:]) == [2, 2, 2, 3]
-        assert ds.dimensions["obs"].size == 9
-        assert manifest["totals"] == {"rows": 9, "trajectories": 4, "displacements": 5}
+        # trajectories 2, 5, 8, 9 are published (7 has only a rejected link); trajectory 5 is a tree of four links from R
+        assert list(ds["rowsize"][:]) == [2, 5, 2, 3]
+        assert manifest["totals"] == {"rows": 12, "trajectories": 4, "displacements": 8}
         entry = manifest["files"][0]
-        assert entry["links_rejected_not_published"] == 2 and entry["links_off_chain_not_published"] == 3
-        assert manifest["chain_rule"]["rule"] == "latest" and "chain_rule" in ds.ncattrs()
+        assert entry["links_rejected_not_published"] == 2 and entry["links_off_chain_not_published"] == 0
+        assert manifest["chain_rule"]["rule"] == "none" and ds.chain_rule.startswith("none")
         # ordered by start time: 2 (-3 h), 5 (0 h), 8 (2 h), 9 (5 h)
         assert list(ds["time_start"][:]) == [(T0 + timedelta(hours=h)).timestamp() for h in (-3, 0, 2, 5)]
         assert list(ds["trajectory_id"][:]) == [0, 1, 2, 3]
-        assert list(ds["point_index"][:]) == [0, 1, 0, 1, 0, 1, 0, 1, 2]
-        assert "source_point_index" not in ds.variables
+        assert list(ds["point_index"][:]) == [0, 1, 0, 1, 2, 3, 4, 0, 1, 0, 1, 2]
+        # trajectory 5: R (0 h), a1 (2 h), a2 (5 h), a3 (8 h), b1 (30 h); b1 starts at R, not at the previous row a3
+        assert list(ds["source_point_index"][:]) == [-1, 0, -1, 0, 1, 2, 0, -1, 0, -1, 0, 1]
+        offset = np.r_[0, np.cumsum(ds["rowsize"][:])]
+        x, dx = ds["x_m"][:], ds["dx_m"][:]
+        assert x[offset[1] + 4] == 5000.0 and dx[offset[1] + 4] == pytest.approx(4000.0) and np.isnan(dx[offset[1]])
     finally:
         ds.close()
 
 
-def test_the_deepest_rule_keeps_the_longest_branch(tmp_path):
-    _, out, manifest = build(tmp_path, chain_rule="deepest")
-    _, ds = read(out)
+@pytest.mark.parametrize("rule, rowsize, off_chain", [("latest", [2, 2, 2, 3], 3), ("deepest", [2, 4, 2, 3], 1)])
+def test_chain_rules_publish_one_chain_per_trajectory(tmp_path, rule, rowsize, off_chain):
+    _, out, manifest = build(tmp_path, chain_rule=rule)
+    manifest, ds = read(out)
     try:
-        assert list(ds["rowsize"][:]) == [2, 4, 2, 3]
-        assert manifest["files"][0]["links_off_chain_not_published"] == 1
-        offset = np.r_[0, np.cumsum(ds["rowsize"][:])]
-        a = offset[1]
-        x, dx = ds["x_m"][:], ds["dx_m"][:]
-        assert list(x[a:a + 4]) == [1000.0, 1500.0, 1900.0, 2200.0]
-        assert dx[a + 3] == pytest.approx(300.0) and np.isnan(dx[a])
-        assert ds["quality_flags"][:][a + 2] == 1                             # the exceeds-configured-speed link is on this chain
+        assert list(ds["rowsize"][:]) == rowsize
+        assert manifest["files"][0]["links_off_chain_not_published"] == off_chain
+        assert manifest["chain_rule"]["rule"] == rule
+        pidx, source = ds["point_index"][:], ds["source_point_index"][:]
+        assert np.array_equal(source[pidx > 0], pidx[pidx > 0] - 1)           # every displacement starts at the previous row
+        if rule == "deepest":
+            offset = np.r_[0, np.cumsum(ds["rowsize"][:])]
+            assert list(ds["x_m"][:][offset[1]:offset[1] + 4]) == [1000.0, 1500.0, 1900.0, 2200.0]
+            assert ds["quality_flags"][:][offset[1] + 2] == 1
+        else:
+            assert 1500.0 not in ds["x_m"][:]                                  # a1 lies off the chain R -> b1
     finally:
         ds.close()
 
@@ -132,7 +139,8 @@ def test_flags_scenes_and_missing_values(tmp_path):
         offset = np.r_[0, np.cumsum(ds["rowsize"][:])]
         assert list(ds["quality_flags"].flag_masks) == [1, 2]
         assert flags[offset[0]] == 255 and flags[offset[0] + 1] == 2        # trajectory 2: local review
-        assert flags[offset[1] + 1] == 2                                      # trajectory 5, chain R -> b1: local review
+        assert flags[offset[1] + 2] == 1                                      # trajectory 5, link to a2: exceeds configured speed
+        assert flags[offset[1] + 4] == 2                                      # link to b1: local review
         assert flags[offset[2] + 1] == 0
         ds.set_auto_chartostring(False)
         chars = np.ascontiguousarray(ds["scene_name"][:])
@@ -145,15 +153,11 @@ def test_flags_scenes_and_missing_values(tmp_path):
         ds.close()
 
 
-def test_rejected_and_off_chain_links_are_not_published_but_counted(tmp_path):
+def test_rejected_links_are_not_published_but_counted(tmp_path):
     _, out, manifest = build(tmp_path)
     provenance = json.loads((tmp_path / "release.provenance.json").read_text())
     assert provenance["run_id"] == "test" and "source_directory" in provenance
-    _, ds = read(out)
-    try:
-        assert 1500.0 not in ds["x_m"][:]                                    # a1 lies off the chain R -> b1
-    finally:
-        ds.close()
+    assert manifest["files"][0]["links_rejected_not_published"] == 2
 
 
 def _brute_force_chain(links, rule):
@@ -217,13 +221,13 @@ def test_validation_detects_a_modified_value(tmp_path):
         publish.validate(source, out, 1)
 
 
-def test_a_displacement_that_does_not_start_at_the_previous_observation_stops_the_build(tmp_path):
+def test_a_displacement_that_does_not_start_at_an_observation_stops_the_build(tmp_path):
     records = rows()
     records[1] = link(5, 1, 2, 2, 5, 1501.0, 2100.0, 1900.0, 2300.0, exceeds=True)   # starts 1 m away from a1
     source = write_composition(tmp_path / "composition", records)
-    with pytest.raises(ValueError, match="does not start at the previous observation"):
+    with pytest.raises(ValueError, match="does not start at an earlier observation"):
         publish.build(source, tmp_path / "release", "test_v1", tmp_dir=tmp_path / "spill", validate_output=False,
-                      bucket_observations=4, batch_rows=4, chain_rule="deepest")   # the deepest chain runs through that link
+                      bucket_observations=4, batch_rows=4)
     assert not (tmp_path / "spill").exists()                                 # scratch files are removed on failure
     assert not list((tmp_path / "release").glob("*.tmp"))
 
@@ -242,7 +246,7 @@ def test_single_bucket_and_many_buckets_give_the_same_file(tmp_path):
     _, a = read(out_a)
     _, b = read(out_b)
     try:
-        for name in ("x_m", "y_m", "dx_m", "quality_flags", "scene_index", "time", "rowsize"):
+        for name in ("x_m", "y_m", "dx_m", "source_point_index", "quality_flags", "scene_index", "time", "rowsize"):
             assert np.array_equal(a[name][:], b[name][:], equal_nan=a[name][:].dtype.kind == "f")
     finally:
         a.close()

@@ -12,16 +12,18 @@ same layout as the ORB release of LiMOSAT (``limosat.publish`` of the ``olivia``
 * ``rowsize(trajectory)`` carries ``sample_dimension = "obs"`` and gives the number of observations of each trajectory, so
   trajectory *i* is the slice ``offset[i]:offset[i] + rowsize[i]`` of every ``obs`` variable;
 * trajectories are ordered by start time (``time_start``) and the observations of a trajectory by ``point_index``;
-* a row of the observation table is one observation of a feature in one scene, carrying the displacement from the previous
-  observation of the trajectory (dx, dy, speed) and the tracker's own statistics at the position (selected matches, support radius,
-  maximum residual) and the review flags. A trajectory does not have an observation on every scene, so the time step between
-  observations varies.
+* a row of the observation table is one observation of a feature in one scene, carrying the displacement from the observation it
+  starts at (dx, dy, speed; ``source_point_index`` says which row that is) and the tracker's own statistics at the position
+  (selected matches, support radius, maximum residual) and the review flags. A trajectory does not have an observation on every
+  scene, so the time step between observations varies.
 
 The composition stores a trajectory as a tree, not a chain: when no scene pair leads from a trajectory's latest observation to a new
-scene, the trajectory continues from an older observation, and the observation it skipped is left without a continuation. The
-release publishes one chain per trajectory, the path from the first observation to the trajectory's latest one (``select_chain``;
-the default rule ``latest`` keeps the branch that continues furthest in time), so that every displacement starts at the previous
-row. Links off that path (about 19% of the links of a month) are not published; their number is recorded in the manifest.
+scene, the trajectory continues from an older observation, and the observation it skipped is left without a continuation (a side
+observation). **By default the release publishes the whole tree** (rule ``none``): every accepted displacement, each with the row it
+starts at in ``source_point_index`` (``point_index - 1`` in a simple chain, about 80% of the links; smaller otherwise). Whether
+reducing every trajectory to one chain helps downstream users is still open; ``--chain-rule latest`` or ``deepest`` publishes the
+path from the first observation to the trajectory's latest (most links) one instead (``select_chain``), so that every displacement
+starts at the previous row, and drops about 19% of the links of a month, which is counted in the manifest.
 
 No value is rounded or packed: positions, times and displacements are float64 exactly as in the composition, the three match
 statistics float32 (a float32 of the composition's float64), and nulls become the variable's ``_FillValue``. Compression is lossless
@@ -85,18 +87,21 @@ COLUMNS = (
            "Trajectory identifier, the running number of the trajectory in the file (0, 1, 2, ...). A trajectory is the track of one "
            "feature through Sentinel-1 scenes."),
     Column("point_index", "int32", False, "",
-           "Position along the trajectory in time order: 0 for its first observation, then 1, 2, ... Every displacement "
-           "starts at the observation with the previous point_index."),
+           "Position along the trajectory in time order: 0 for its first observation, then 1, 2, ..."),
+    Column("source_point_index", "int32", True, "",
+           "point_index of the observation of the same trajectory at which the displacement arriving here starts. Usually "
+           "point_index - 1; it is smaller where the trajectory continued from an earlier observation because no scene pair "
+           "reached this scene from the latest one (then an observation between them has no continuation). Null at point_index 0."),
     Column("time", "timestamp_s_utc", False, "UTC", "Acquisition time of the Sentinel-1 scene of this observation."),
     Column("scene", "string", False, "", "Sentinel-1 product name of the scene this observation belongs to."),
     Column("x_m", "float64", False, "m", "Position, EPSG:3413 x."),
     Column("y_m", "float64", False, "m", "Position, EPSG:3413 y."),
     Column("dx_m", "float64", True, "m",
-           "Displacement in x from the previous observation of the trajectory. Null at point_index 0."),
+           "Displacement in x from the observation source_point_index of the trajectory. Null at point_index 0."),
     Column("dy_m", "float64", True, "m",
-           "Displacement in y from the previous observation of the trajectory. Null at point_index 0."),
+           "Displacement in y from the observation source_point_index of the trajectory. Null at point_index 0."),
     Column("speed_m_per_day", "float64", True, "m/day",
-           "Distance from the previous observation divided by the elapsed time. Null at point_index 0."),
+           "Distance from the source observation divided by the elapsed time since it. Null at point_index 0."),
     Column("selected_matches", "float32", True, "1",
            "Number of feature matches that support the displacement field at this position: the count at each of the three "
            "surrounding field nodes, weighted by the position's barycentric weights (so not an integer). Null at point_index 0."),
@@ -130,7 +135,7 @@ DEFAULT_METADATA: dict[str, Any] = {
     "title": "LiMOSAT-EfficientLoFTR: Lagrangian sea-ice trajectories from Sentinel-1",
     "summary": ("Trajectories of features on the Arctic sea ice tracked through Sentinel-1 EW scenes with the LiMOSAT "
                 "algorithm and the EfficientLoFTR matcher. One observation per feature and scene; the displacement from the "
-                "previous observation of the trajectory is stored with it. A trajectory continues through any later scene pair "
+                "observation it starts at is stored with it (see source_point_index). A trajectory continues through any later scene pair "
                 "that supports it, so it does not have an observation on every scene."),
     "keywords": "sea ice drift, Lagrangian trajectories, Sentinel-1, SAR, Arctic",
     "institution": "Nansen Environmental and Remote Sensing Centre",
@@ -295,6 +300,7 @@ def _id_keys(column) -> tuple[np.ndarray, np.ndarray]:
 
 
 CHAIN_RULES = ("latest", "deepest")
+PUBLISH_RULES = ("none",) + CHAIN_RULES   # none: publish the whole tree (default)
 _MIX = np.uint64(1000003)
 
 
@@ -369,10 +375,10 @@ class Index:
     rejected: int              # extensions rejected by the composition (not published)
     off_chain: int = 0         # accepted extensions off the published chain (not published)
     keep_rows: np.ndarray | None = None  # over the accepted extensions in file order: True = published
-    chain_rule: str = "latest"
+    chain_rule: str = "none"
 
 
-def index_source(extensions: Path, batch_rows: int = BATCH_ROWS, chain_rule: str = "latest") -> Index:
+def index_source(extensions: Path, batch_rows: int = BATCH_ROWS, chain_rule: str = "none") -> Index:
     """Pass 1: choose the published chain of every trajectory, then per trajectory the number of links and its first start time;
     fixes the order of the file."""
     pa, pc, pq = _pyarrow()
@@ -395,7 +401,10 @@ def index_source(extensions: Path, batch_rows: int = BATCH_ROWS, chain_rule: str
     if not len(keys):
         raise ValueError("no accepted extensions to publish")
     accepted_links = len(keys)
-    keep_rows, _ = select_chain(keys, starts, ends, chain_rule)
+    if chain_rule == "none":
+        keep_rows = np.ones(len(keys), dtype=bool)          # the whole tree
+    else:
+        keep_rows, _ = select_chain(keys, starts, ends, chain_rule)
     del ends
     keys, tails, starts = keys[keep_rows], tails[keep_rows], starts[keep_rows]
     order = np.argsort(keys, kind="stable")
@@ -611,6 +620,8 @@ def write_netcdf(path: Path, index: Index, spill: Spill, period: str, release_id
             v.standard_name, v.long_name, v.units, v.grid_mapping, v.coordinates = std, describe[name].description, "m", "crs", coords
         v_pidx = ds.createVariable("point_index", "i4", ("obs",), **kw)
         v_pidx.long_name, v_pidx.coordinates = describe["point_index"].description, coords
+        v_src = ds.createVariable("source_point_index", "i4", ("obs",), fill_value=np.int32(-1), **kw)
+        v_src.long_name, v_src.coordinates = describe["source_point_index"].description + " (-1 where null)", coords
         v_disp = {}
         for name, units in (("dx_m", "m"), ("dy_m", "m"), ("speed_m_per_day", "m day-1")):
             v_disp[name] = ds.createVariable(name, "f8", ("obs",), fill_value=np.nan, **kw)
@@ -656,18 +667,30 @@ def write_netcdf(path: Path, index: Index, spill: Spill, period: str, release_id
                 raise ValueError(f"bucket {bucket}: first observations are not the first links' sources")
             step = ~is_first
             ms, x, y = records["ms"], records["x"], records["y"]
-            # a chain: every displacement starts at the previous observation of its trajectory (time, position)
+            # the observation every displacement starts at: same trajectory, time = end time - elapsed, position = end - displacement
+            span = int(ms.max() - ms.min()) + 1
+            key_all = (rank - lo) * span + (ms - ms.min())
+            if np.any(np.diff(key_all) <= 0):
+                raise ValueError(f"bucket {bucket}: two observations of a trajectory have the same time")
             rows = np.flatnonzero(step)
-            if (ms[rows - 1] != ms[rows] - records["el"][rows].astype(np.int64) * 1000).any() \
-                    or (np.abs(x[rows - 1] - (x[rows] - records["dx"][rows])) > 1e-6).any() \
-                    or (np.abs(y[rows - 1] - (y[rows] - records["dy"][rows])) > 1e-6).any():
-                raise ValueError(f"bucket {bucket}: a displacement does not start at the previous observation of its trajectory")
+            src_ms = ms[rows] - records["el"][rows].astype(np.int64) * 1000
+            key_src = (rank[rows] - lo) * span + (src_ms - ms.min())
+            found = np.searchsorted(key_all, key_src)
+            found = np.minimum(found, len(key_all) - 1)
+            if (key_all[found] != key_src).any() or (found >= rows).any() \
+                    or (np.abs(x[found] - (x[rows] - records["dx"][rows])) > 1e-6).any() \
+                    or (np.abs(y[found] - (y[rows] - records["dy"][rows])) > 1e-6).any():
+                raise ValueError(f"bucket {bucket}: a displacement does not start at an earlier observation of its trajectory")
+            source_index = np.full(len(rank), -1, dtype=np.int32)
+            source_index[rows] = pidx[found]
+            if index.chain_rule != "none" and (source_index[rows] != pidx[rows] - 1).any():
+                raise ValueError(f"bucket {bucket}: a chain has a displacement that does not start at the previous observation")
             if (flags_bad := (records["flags"][step] & ~np.uint8(KNOWN_FLAG_MASK)) != 0).any():
                 raise ValueError(f"bucket {bucket}: {int(flags_bad.sum())} flag values carry unknown bits")
             sl = slice(written, written + len(rank))
             time[sl] = ms / 1000.0
             lon, lat = _lonlat(x, y)
-            v_lat[sl], v_lon[sl], v_x[sl], v_y[sl], v_pidx[sl] = lat, lon, x, y, pidx
+            v_lat[sl], v_lon[sl], v_x[sl], v_y[sl], v_pidx[sl], v_src[sl] = lat, lon, x, y, pidx, source_index
             for name, key in (("dx_m", "dx"), ("dy_m", "dy"), ("speed_m_per_day", "speed")):
                 v_disp[name][sl] = records[key]
             for name, key in (("selected_matches", "sel"), ("support_radius_m", "sup"), ("maximum_residual_m", "res")):
@@ -719,8 +742,10 @@ def write_netcdf(path: Path, index: Index, spill: Spill, period: str, release_id
         ds.geospatial_lat_min, ds.geospatial_lat_max = stats["lat_min"], stats["lat_max"]
         ds.geospatial_lon_min, ds.geospatial_lon_max = stats["lon_min"], stats["lon_max"]
         ds.observations, ds.trajectories, ds.displacements = np.int64(n), np.int64(ntraj), np.int64(n - ntraj)
-        ds.chain_rule = (f"one chain per trajectory: the path from its first observation to its {'latest' if index.chain_rule == 'latest' else 'deepest'} "
-                         "observation; observations and displacements off that path are not published")
+        ds.chain_rule = ("none: the whole tree of each trajectory is published; source_point_index gives the observation each displacement starts at"
+                         if index.chain_rule == "none" else
+                         f"one chain per trajectory: the path from its first observation to its {index.chain_rule} observation; observations and "
+                         "displacements off that path are not published")
         ds.qc_policy = ("displacements above the hard speed limit are not published; displacements flagged for review are published "
                         "with quality_flags: " + "; ".join(f"{k}: {v}" for k, v in qc.items()))
         ds.history = f"{datetime.now(timezone.utc):%Y-%m-%d}: written by limosat.publish from the primary composition, release {release_id}"
@@ -762,14 +787,14 @@ def default_period(index: Index) -> str:
 def build(source_dir: Path, output_dir: Path, release_id: str, period: str | None = None, overwrite: bool = False,
           verify_source: bool = True, metadata: dict[str, Any] | None = None, validate_output: bool = True,
           sample_modulus: int = 50, tmp_dir: Path | None = None, bucket_observations: int = BUCKET_OBSERVATIONS,
-          batch_rows: int = BATCH_ROWS, chain_rule: str = "latest") -> dict[str, Any]:
+          batch_rows: int = BATCH_ROWS, chain_rule: str = "none") -> dict[str, Any]:
     """Publish a primary composition into one NetCDF file plus manifest.json in the output directory and validate it."""
     source_dir, output_dir = Path(source_dir), Path(output_dir)
     source = inspect_source(source_dir, verify_checksum=verify_source)
     output_dir.mkdir(parents=True, exist_ok=True)
     print("pass 1: indexing trajectories", flush=True)
     index = index_source(source.extensions, batch_rows, chain_rule)
-    print(f"  chain rule {chain_rule}: {index.links:,} links published, {index.off_chain:,} off the chains", flush=True)
+    print(f"  chain rule {chain_rule}: {index.links:,} links published, {index.off_chain:,} off the chains (not published)", flush=True)
     last = _ms_to_datetime(int(index.first_ms.max()))
     period = period or f"{default_period(index)}_{last:%Y%m}"
     output = output_dir / f"limosat_eloftr_{period}.nc"
@@ -803,8 +828,9 @@ def build(source_dir: Path, output_dir: Path, release_id: str, period: str | Non
         "format": FORMAT,
         "crs": CRS,
         "flag_bits": FLAG_BITS,
-        "chain_rule": {"rule": chain_rule, "definition": "one chain per trajectory: the path from the first observation to the latest "
-                       "observation (rule latest) or to the observation with the most links above it (rule deepest)"},
+        "chain_rule": {"rule": chain_rule, "definition": "none: the whole tree of every trajectory is published, source_point_index gives "
+                       "the observation each displacement starts at; latest or deepest: one chain per trajectory, the path from the "
+                       "first observation to the latest observation or to the observation with the most links above it"},
         "columns": columns_spec(),
         "compression": {"codec": "zlib", "level": COMPRESSION_LEVEL, "shuffle": True, "chunk_observations": CHUNK},
         "layout": {"dimensions": {"trajectory": "trajectories", "obs": "observations", "scene": "Sentinel-1 scene names"},
@@ -865,6 +891,13 @@ def validate(source_dir: Path, output_dir: Path, sample_modulus: int = 50, batch
         pidx = d["point_index"][:]
         if np.any(pidx != np.arange(n) - np.repeat(offset[:-1], rowsize)):
             raise ValueError(f"{output.name}: point_index is not 0..n-1 within every trajectory")
+        sp = d["source_point_index"][:]
+        step_rows = pidx > 0
+        if np.any(sp[step_rows] < 0) or np.any(sp[step_rows] >= pidx[step_rows]) or not (sp[~step_rows] == -1).all():
+            raise ValueError(f"{output.name}: source_point_index is not an earlier point_index of the trajectory (and -1 at the first observation)")
+        if manifest["chain_rule"]["rule"] != "none" and np.any(sp[step_rows] != pidx[step_rows] - 1):
+            raise ValueError(f"{output.name}: a chain file has a displacement that does not start at the previous observation")
+        del step_rows
         time = np.rint(d["time"][:] * 1000).astype(np.int64)
         tstart, tend = d["time_start"][:], d["time_end"][:]
         if np.any(np.diff(tstart) < 0) or not np.array_equal(np.rint(tstart * 1000).astype(np.int64), time[offset[:-1]]) \
@@ -902,9 +935,10 @@ def validate(source_dir: Path, output_dir: Path, sample_modulus: int = 50, batch
         table = pa.concat_tables([t for _, t in pieces])
         order = np.lexsort((_epoch_ms_array(table["end_time_utc"]), keys))
         table, keys = table.take(pa.array(order)), keys[order]
-        # the chain of every sampled trajectory, chosen again from all its links
-        on_chain, _ = select_chain(keys, _epoch_ms_array(table["start_time_utc"]), _epoch_ms_array(table["end_time_utc"]), manifest["chain_rule"]["rule"])
-        table, keys = table.filter(pa.array(on_chain)), keys[on_chain]
+        if manifest["chain_rule"]["rule"] != "none":
+            # the chain of every sampled trajectory, chosen again from all its links
+            on_chain, _ = select_chain(keys, _epoch_ms_array(table["start_time_utc"]), _epoch_ms_array(table["end_time_utc"]), manifest["chain_rule"]["rule"])
+            table, keys = table.filter(pa.array(on_chain)), keys[on_chain]
         src = {"start": _epoch_ms_array(table["start_time_utc"]), "end": _epoch_ms_array(table["end_time_utc"])}
         starts = np.r_[0, np.flatnonzero(keys[1:] != keys[:-1]) + 1]
         sizes = np.diff(np.r_[starts, len(keys)])
@@ -940,8 +974,8 @@ def validate(source_dir: Path, output_dir: Path, sample_modulus: int = 50, batch
             _same(get("maximum_residual_m", rows), _floats(table["maximum_residual_m"], np.float32), "maximum_residual_m", name)
             _same(get("quality_flags", rows), _flags(table), "quality_flags", name)
             _same(scene_names[get("scene_index", rows)], np.array(_array(table["target_image_id"]).to_pylist(), dtype=object), "scenes", name)
-        # the observation before each displacement is the source of the link: position, time, scene
-        prev_row = link_file_row - 1
+        # the observation a displacement starts at (source_point_index) is the source of the link: position, time, scene
+        prev_row = np.repeat(offset[mapped], sizes) + sp[link_file_row]
         _same(get("x_m", prev_row), _floats(table["x0_m"]), "source x", name)
         _same(get("y_m", prev_row), _floats(table["y0_m"]), "source y", name)
         _same(time[prev_row], src["start"], "source times", name)
@@ -980,8 +1014,9 @@ def _parser() -> argparse.ArgumentParser:
             command.add_argument("--overwrite", action="store_true")
             command.add_argument("--skip-source-checksum", action="store_true", help="do not hash the extensions table against its manifest")
             command.add_argument("--no-validate", action="store_true", help="skip the validation that normally follows the build")
-            command.add_argument("--chain-rule", choices=CHAIN_RULES, default="latest",
-                                 help="which observation ends the published chain of a trajectory (default: its latest)")
+            command.add_argument("--chain-rule", choices=PUBLISH_RULES, default="none",
+                                 help="none (default): publish the whole tree with source_point_index; latest or deepest: publish one "
+                                 "chain per trajectory, ending at its latest observation or at the one with the most links")
             command.add_argument("--tmp-dir", type=Path, help="scratch folder for the spilled observations (about 80 bytes per observation)")
             command.add_argument("--bucket-observations", type=int, default=BUCKET_OBSERVATIONS,
                                  help="observations per scratch bucket and so per in-memory sort (about 150 bytes each)")
