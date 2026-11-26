@@ -28,6 +28,7 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest"]
 parquet = ["pyarrow"]
+publish = ["pyarrow", "netCDF4"]
 
 [project.scripts]
 limosat = "limosat.cli:main"

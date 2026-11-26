@@ -65,9 +65,14 @@ completed pairs without recomputing them. CUDA runs use one process per batch an
 (which writes the production configuration) and `scripts/submit_chain_olivia.sh`
 (prepare -> primary-pairs GPU array -> primary-compose).
 
+A composition is published as one CF NetCDF trajectory file with
+`python -m limosat.publish build --source COMPOSITION_DIRECTORY --output-dir OUT --release-id ID`
+(needs the `publish` extra); see [published trajectories](docs/published_trajectories.md).
+
 See [operations](docs/operations.md) for planning, matching, pair sharing and
-running, [composition](docs/composition.md) for trajectories and QC, and
-[schemas](docs/schemas.md) for the stored products.
+running, [composition](docs/composition.md) for trajectories and QC,
+[schemas](docs/schemas.md) for the stored products and
+[published trajectories](docs/published_trajectories.md) for the public NetCDF release.
 
 ## Scientific semantics
 
